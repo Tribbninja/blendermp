@@ -78,11 +78,15 @@ class BMP_PT_main(bpy.types.Panel):
         box.prop(settings, "sync_transforms")
         box.prop(settings, "sync_mesh")
         box.prop(settings, "sync_materials")
+        box.prop(settings, "sync_modifiers")
         box.prop(settings, "paused")
         box.prop(settings, "follow_host")
         row = box.row(align=True)
         row.operator("bmp.track_mesh", text="Track selected", icon="MESH_DATA")
         row.operator("bmp.untrack_mesh", text="", icon="X")
+        lock_row = box.row(align=True)
+        lock_row.operator("bmp.request_edit", text="Request edit", icon="UNLOCKED")
+        lock_row.operator("bmp.grant_edit", text="Grant", icon="LOCKED")
 
         if settings.state != "offline":
             box = layout.box()

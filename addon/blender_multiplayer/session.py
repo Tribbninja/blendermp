@@ -587,6 +587,15 @@ class SessionService:
             self._emit("material_update", message)
             return
 
+        if frame.type == MessageType.MODIFIER_STACK:
+            body = self._json(frame, 64 * 1024)
+            message = self._sanitize_modifiers(body)
+            if message is None:
+                raise Violation("invalid modifier stack")
+            self._broadcast(protocol.json_frame(MessageType.MODIFIER_STACK, message), exclude=peer.peer_id)
+            self._emit("modifier_stack", message)
+            return
+
         raise Violation(f"message type {frame.type} is not accepted by the host")
 
     async def _accept_hello(self, peer: Peer, frame: Frame) -> None:
@@ -645,16 +654,45 @@ class SessionService:
             raise Violation("invalid lease key") from exc
         if action == "acquire":
             if not self._leases.acquire(key, peer.name, now):
+                owner = self._leases.owner_of(key, now)
                 peer.enqueue(
                     protocol.encode(
                         protocol.json_frame(
                             MessageType.LEASE,
-                            {"key": key, "owner": self._leases.owner_of(key, now), "action": "denied"},
+                            {"key": key, "owner": owner, "action": "denied"},
                         )
                     ),
                     critical=True,
                 )
+                self._leases.request(key, peer.name, now)
+                if owner:
+                    for other in self._peers.values():
+                        if other.name == owner:
+                            other.enqueue(
+                                protocol.encode(
+                                    protocol.json_frame(
+                                        MessageType.LEASE,
+                                        {"key": key, "owner": owner, "action": "requested", "requester": peer.name},
+                                    )
+                                ),
+                                critical=True,
+                            )
+                            break
                 return
+        elif action == "grant":
+            requester = clean_name(body.get("requester"), "")
+            if not requester or self._leases.owner_of(key, now) != peer.name:
+                raise Violation("only the lease owner can grant it")
+            if not self._leases.resolve_request(key, requester, grant=True, now=now):
+                self._leases.force(key, requester, now)
+            peer_name = requester
+            snapshot = self._leases.snapshot(now)
+            self._broadcast(
+                protocol.json_frame(
+                    MessageType.LEASE, {"key": key, "owner": requester, "action": "grant", "leases": snapshot}
+                )
+            )
+            return
         elif action == "release":
             self._leases.release(key, peer.name)
         elif action == "force":
@@ -693,6 +731,62 @@ class SessionService:
                 chunker.validate_positions(payload, MAX_VERTICES)
         except ValueError as exc:
             raise Violation(str(exc)) from exc
+
+    def _sanitize_modifiers(self, body: dict) -> dict[str, Any] | None:
+        try:
+            uid = str(uuidlib.UUID(str(body.get("uuid"))))
+        except ValueError:
+            return None
+        modifiers = body.get("modifiers")
+        if not isinstance(modifiers, list) or len(modifiers) > 64:
+            return None
+        result = []
+        for item in modifiers:
+            if not isinstance(item, dict):
+                return None
+            type_ = clean_text(item.get("type"), 32)
+            name = clean_text(item.get("name"), 64) or type_
+            if not type_:
+                return None
+            props_in = item.get("props") or {}
+            if not isinstance(props_in, dict) or len(props_in) > 32:
+                return None
+            props: dict[str, Any] = {}
+            for key, value in props_in.items():
+                if not isinstance(key, str) or len(key) > 32:
+                    return None
+                if isinstance(value, bool):
+                    props[key] = value
+                elif isinstance(value, int):
+                    props[key] = max(-1_000_000_000, min(1_000_000_000, value))
+                elif isinstance(value, float):
+                    if not math.isfinite(value):
+                        return None
+                    props[key] = value
+                elif isinstance(value, str):
+                    props[key] = value[:64]
+                elif isinstance(value, list) and len(value) <= 16:
+                    items: list[Any] = []
+                    for entry in value:
+                        if isinstance(entry, bool) or isinstance(entry, int):
+                            items.append(entry)
+                        elif isinstance(entry, float) and math.isfinite(entry):
+                            items.append(entry)
+                        else:
+                            return None
+                    props[key] = items
+                else:
+                    return None
+            result.append(
+                {
+                    "type": type_,
+                    "name": name,
+                    "show_viewport": bool(item.get("show_viewport", True)),
+                    "show_render": bool(item.get("show_render", True)),
+                    "props": props,
+                }
+            )
+        return {"uuid": uid, "modifiers": result}
 
     def _json(self, frame: Frame, limit: int = MAX_CONTROL) -> dict[str, Any]:
         if len(frame.payload) > limit:
@@ -921,6 +1015,12 @@ class SessionService:
                 self._emit("material_update", {"uuid": body.get("uuid"), "slot": slot, "material": payload})
             return
 
+        if frame.type == MessageType.MODIFIER_STACK:
+            message = self._sanitize_modifiers(self._json(frame, 64 * 1024))
+            if message is not None:
+                self._emit("modifier_stack", message)
+            return
+
         if frame.type == MessageType.ERROR:
             body = self._json(frame, 1024)
             self._emit("error", {"message": clean_text(body.get("message"), 200)})
@@ -1034,8 +1134,20 @@ class SessionService:
             protocol.json_frame(MessageType.MATERIAL_UPDATE, {"uuid": uid, "slot": int(slot), "material": payload})
         )
 
+    def send_modifier_stack(self, uid: str, modifiers: list) -> None:
+        message = self._sanitize_modifiers({"uuid": uid, "modifiers": modifiers})
+        if message is None:
+            return
+        self._enqueue(protocol.json_frame(MessageType.MODIFIER_STACK, message))
+
     def request_lease(self, key: str, action: str = "acquire") -> None:
         self._enqueue(protocol.json_frame(MessageType.LEASE, {"key": key, "action": action}))
+
+    def send_lease(self, key: str, action: str, requester: str | None = None) -> None:
+        body = {"key": key, "action": action}
+        if requester:
+            body["requester"] = requester
+        self._enqueue(protocol.json_frame(MessageType.LEASE, body))
 
     def stats(self) -> dict[str, Any]:
         peers = []

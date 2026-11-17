@@ -23,8 +23,10 @@ Clean-room, high-performance replacement for the Multi-user addon.
 - TLS 1.3 host/client, certificate pinning, host-authoritative validation, leases and roles.
 - LAN host/join, room codes, presence, chat, 3D pings, chat commands, pause sync, diagnostics.
 - Chunked mesh deltas, full geometry snapshots (topology, UVs, smooth flags, materials), multi-mesh tracking.
-- Object creation/deletion replication for meshes, empties, cameras and lights.
+- Object creation/deletion replication for meshes, empties, cameras, lights, curves and text.
 - Basic material sync (Principled BSDF colour, metallic, roughness, emission, viewport colour).
+- Modifier stack sync for common modifiers and geometry-nodes group references.
+- Lease requests/grants with owner notifications.
 - Self-hosted multiplexed relay for cross-network sessions; TLS stays end to end.
 - Tauri desktop shell with native Blender window embedding, control-file bridge, packaging scripts, verified Blender extension install.
 

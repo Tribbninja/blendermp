@@ -53,6 +53,7 @@ class MessageType(IntEnum):
     OBJECT_CREATE = 18
     OBJECT_DELETE = 19
     MATERIAL_UPDATE = 20
+    MODIFIER_STACK = 21
 
 
 class Channel(IntEnum):

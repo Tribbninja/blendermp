@@ -37,6 +37,10 @@ Untrusted input is rejected before it reaches Blender:
 * transform payloads: exactly 80 bytes, finite floats, bounded magnitude;
 * mesh payloads: ≤ 24 MB, ≤ 5,000,000 vertices, structural validation of delta
   headers, geometry snapshots and positions before relay;
+* object payloads: 16-byte UUID, bounded metadata, geometry only for mesh objects;
+* material payloads: bounded strings and colours, finite numbers in range;
+* modifier stacks: ≤ 64 modifiers, ≤ 32 properties each, scalar/vector values only,
+  no nested objects, names/lengths capped;
 * object leases: a peer cannot edit an object leased to someone else;
 * names and colours: assigned by the host after authentication, made unique, so
   a client cannot impersonate another participant;

@@ -26,13 +26,19 @@ video capture, so it keeps full GPU performance).
   deltas, int16 quantisation, `foreach_set` application with no geometry rebuild.
   Structural edits fall back to a full geometry snapshot (vertices, edges, loops,
   polygons, UVs, smooth flags, material indices).
-* **Object creation and deletion**: new mesh/empty/camera/light objects are sent
-  with a full geometry snapshot and appear on the other side; deleting sends a
-  UUID tombstone. Transforms stream at 30 Hz and multiple tracked meshes
-  round-robin at 12 Hz.
+* **Object creation and deletion**: new mesh/empty/camera/light/curve/text objects
+  are sent with a full geometry snapshot (mesh) and appear on the other side,
+  respecting the source collection name when it exists; deleting sends a UUID
+  tombstone. Transforms stream at 30 Hz and multiple tracked meshes round-robin
+  at 12 Hz.
 * **Basic material sync**: Principled BSDF base colour, metallic, roughness and
   emission, plus the viewport colour, for the active object. Node graphs and
   textures are not replicated yet.
+* **Modifier stack sync**: common modifiers (Subdivision, Mirror, Array, Solidify,
+  Bevel, Decimate, Triangulate, Smooth, Weld, Screw) and geometry-nodes group
+  references, with visibility flags, for the active object.
+* **Edit leases with request/grant**: request edit on the active object, the owner
+  gets a notification and can grant it from the panel or with `/grant <user>`.
 * **Presence, chat and 3D pings** between the addon UI and the desktop app, with
   latency and bandwidth telemetry, pause-sync, follow-host frame, and chat
   commands (`/who`, `/ping`, `/leave`, `/me`).
@@ -40,7 +46,7 @@ video capture, so it keeps full GPU performance).
   writes the control request, docks Blender into the stage, shows room code,
   participants, chat, diagnostics and a live verification code.
 
-The protocol and engine have **90 passing tests**, including a real TLS
+The protocol and engine have **93 passing tests**, including a real TLS
 host/client session, certificate-mismatch rejection, relay chat over a
 multiplexed tunnel, and 1,000-vertex delta round-trips under loss/reordering.
 
@@ -167,7 +173,7 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   `blender --command extension install-file`.
 * The app launches Blender, embeds its window, and reports the live room code,
   fingerprint and verification code.
-* `pytest`: 90 passed.
+* `pytest`: 93 passed.
 
 ## Limitations
 
@@ -175,7 +181,9 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   Direct LAN connections still bypass it.
 * Multiple tracked meshes share one 12 Hz polling budget, so many large meshes
   update more slowly.
-* Geometry nodes, images, animation and full node graphs are not replicated yet.
+* Geometry-node graphs, images, animation and full node graphs are not replicated yet.
+* Modifier sync covers the common parameter set; unsupported modifier types only
+  replicate type/name/visibility.
 * New objects are replicated for meshes, empties, cameras and lights; curves,
   font objects and modifiers are not, and collections/parenting are only
   partially covered.

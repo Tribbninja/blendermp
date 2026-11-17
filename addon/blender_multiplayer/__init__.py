@@ -69,6 +69,9 @@ runtime: dict = {
     "known_objects": set(),
     "applying_frame": False,
     "material_shadow": {},
+    "modifier_shadow": {},
+    "last_modifier": 0.0,
+    "lease_request": None,
     "last_material": 0.0,
     "last_presence": 0.0,
     "control_checked": 0.0,
@@ -111,6 +114,7 @@ class BMPState(PropertyGroup):
     chat_text: StringProperty()
     sync_mesh: BoolProperty(name="Sync active mesh", default=True)
     sync_materials: BoolProperty(name="Sync materials", default=True)
+    sync_modifiers: BoolProperty(name="Sync modifiers", default=True)
     use_relay: BoolProperty(name="Use relay", default=False)
     relay_host: StringProperty(name="Relay host", default="")
     relay_port: IntProperty(name="Relay port", default=7100, min=1024, max=65535)
@@ -326,6 +330,17 @@ def _handle_event(context, kind: str, body: dict) -> None:
                 context.scene.frame_current = int(body["frame"])
             finally:
                 runtime["applying_frame"] = False
+    elif kind == "lease":
+        action = body.get("action")
+        if action in {"denied", "held"}:
+            _push_message(context, "system", f"Locked by {body.get('owner', 'someone')}")
+        elif action == "requested":
+            runtime["lease_request"] = {"key": body.get("key"), "requester": body.get("requester")}
+            _push_message(context, "system", f"{body.get('requester', 'someone')} requested edit")
+        elif action == "grant":
+            _push_message(context, "system", f"Lease granted to {body.get('owner', 'someone')}")
+    elif kind == "modifier_stack":
+        _apply_modifier_stack(context, body)
     elif kind == "material_update":
         _apply_material(context, body)
     elif kind == "object_create":
@@ -589,6 +604,128 @@ def _apply_material(context, body: dict) -> None:
     runtime["material_shadow"][(body.get("uuid"), slot_index)] = _material_signature(data)
 
 
+# --------------------------------------------------------------------------- modifiers
+MODIFIER_PROPS = {
+    "SUBSURF": ("levels", "render_levels", "subdivision_type"),
+    "MIRROR": ("use_axis", "use_bisect_axis", "use_clip", "merge_threshold"),
+    "ARRAY": ("count", "use_relative_offset", "relative_offset_displace", "use_constant_offset", "constant_offset_displace"),
+    "SOLIDIFY": ("thickness", "offset", "use_even_offset"),
+    "BEVEL": ("width", "segments", "limit_method", "angle_limit"),
+    "DECIMATE": ("ratio", "decimate_type"),
+    "TRIANGULATE": ("quad_method", "ngon_method", "min_vertices"),
+    "SMOOTH": ("factor", "iterations"),
+    "WELD": ("merge_threshold", "mode"),
+    "SCREW": ("angle", "screw_offset", "steps", "render_steps"),
+}
+
+
+def modifier_snapshot(obj) -> list:
+    snapshot = []
+    for mod in list(obj.modifiers)[:32]:
+        props = {}
+        for key in MODIFIER_PROPS.get(mod.type, ()):
+            try:
+                value = getattr(mod, key)
+            except AttributeError:
+                continue
+            if isinstance(value, (bool, int, float, str)):
+                props[key] = value
+            elif isinstance(value, (list, tuple)):
+                props[key] = [item for item in value if isinstance(item, (bool, int, float, str))]
+        if mod.type == "NODES":
+            try:
+                props["node_group"] = mod.node_group.name if mod.node_group else ""
+            except AttributeError:
+                props["node_group"] = ""
+        snapshot.append(
+            {
+                "type": mod.type,
+                "name": mod.name,
+                "show_viewport": bool(mod.show_viewport),
+                "show_render": bool(mod.show_render),
+                "props": props,
+            }
+        )
+    return snapshot
+
+
+def _modifier_signature(snapshot: list) -> str:
+    return json.dumps(snapshot, sort_keys=True, default=str)
+
+
+def _sync_modifiers(context) -> None:
+    session: SessionService | None = runtime.get("session")
+    settings = context.window_manager.bmp
+    if session is None or settings.paused or not settings.sync_modifiers:
+        return
+    now = time.monotonic()
+    if now - runtime["last_modifier"] < 0.5:
+        return
+    runtime["last_modifier"] = now
+    obj = context.active_object
+    if obj is None or not hasattr(obj, "modifiers"):
+        return
+    uid = obj.get("bmp_uuid")
+    if not uid:
+        return
+    snapshot = modifier_snapshot(obj)
+    signature = _modifier_signature(snapshot)
+    if runtime["modifier_shadow"].get(uid) == signature:
+        return
+    runtime["modifier_shadow"][uid] = signature
+    session.send_modifier_stack(uid, snapshot)
+
+
+def _apply_modifier_stack(context, body: dict) -> None:
+    obj = obj_sync.find(body.get("uuid"))
+    snapshot = body.get("modifiers")
+    if obj is None or not hasattr(obj, "modifiers") or not isinstance(snapshot, list):
+        return
+    desired = {(str(item.get("name")), str(item.get("type"))) for item in snapshot if isinstance(item, dict)}
+    for mod in list(obj.modifiers):
+        if (mod.name, mod.type) not in desired:
+            try:
+                obj.modifiers.remove(mod)
+            except Exception:  # noqa: BLE001
+                pass
+    for item in snapshot:
+        if not isinstance(item, dict):
+            continue
+        type_ = str(item.get("type", ""))
+        name = str(item.get("name", type_))
+        mod = next((m for m in obj.modifiers if m.name == name and m.type == type_), None)
+        if mod is None:
+            existing = obj.modifiers.get(name)
+            if existing is not None:
+                try:
+                    obj.modifiers.remove(existing)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                mod = obj.modifiers.new(name, type_)
+            except Exception:  # noqa: BLE001
+                continue
+        try:
+            mod.show_viewport = bool(item.get("show_viewport", True))
+            mod.show_render = bool(item.get("show_render", True))
+        except Exception:  # noqa: BLE001
+            pass
+        for key, value in (item.get("props") or {}).items():
+            if key == "node_group":
+                group = bpy.data.node_groups.get(str(value))
+                if group is not None:
+                    try:
+                        mod.node_group = group
+                    except Exception:  # noqa: BLE001
+                        pass
+                continue
+            try:
+                setattr(mod, key, value)
+            except Exception:  # noqa: BLE001
+                pass
+    runtime["modifier_shadow"][body.get("uuid")] = _modifier_signature(snapshot)
+
+
 # --------------------------------------------------------------------------- bpy timer
 def _poll_control(context) -> None:
     now = time.monotonic()
@@ -717,6 +854,24 @@ def _apply_object_create(context, body: dict) -> None:
             obj = bpy.data.objects.new(name, data)
             if isinstance(meta.get("lens"), (int, float)):
                 data.lens = max(1.0, min(500.0, float(meta["lens"])))
+        elif kind == object_payload.KIND_CURVE:
+            data = bpy.data.curves.new(name, type="CURVE")
+            dimension = meta.get("dimensions")
+            if dimension in {"2D", "3D"}:
+                data.dimensions = dimension
+            obj = bpy.data.objects.new(name, data)
+        elif kind == object_payload.KIND_FONT:
+            data = bpy.data.curves.new(name, type="FONT")
+            body_text = meta.get("body")
+            if isinstance(body_text, str):
+                data.body = body_text[:512]
+            if isinstance(meta.get("size"), (int, float)):
+                data.size = max(0.001, min(1000.0, float(meta["size"])))
+            if meta.get("align_x") in {"LEFT", "CENTER", "RIGHT", "JUSTIFY", "FLUSH"}:
+                data.align_x = meta["align_x"]
+            if meta.get("align_y") in {"TOP_BASELINE", "TOP", "CENTER", "BOTTOM_BASELINE", "BOTTOM"}:
+                data.align_y = meta["align_y"]
+            obj = bpy.data.objects.new(name, data)
         elif kind == object_payload.KIND_LIGHT:
             light_type = meta.get("light_type")
             if light_type not in {"POINT", "SUN", "SPOT", "AREA"}:
@@ -734,7 +889,13 @@ def _apply_object_create(context, body: dict) -> None:
         traceback.print_exc()
         return
 
-    context.scene.collection.objects.link(obj)
+    target = context.scene.collection
+    collection_name = meta.get("collection")
+    if isinstance(collection_name, str) and collection_name:
+        collection = bpy.data.collections.get(collection_name)
+        if collection is not None:
+            target = collection
+    target.objects.link(obj)
     obj["bmp_uuid"] = uid
     runtime["known_objects"].add(uid)
     obj_sync.apply(uid, meta.get("matrix", []))
@@ -950,6 +1111,7 @@ def bmp_tick():
             _sync_transforms(context)
             _sync_mesh(context)
             _sync_materials(context)
+            _sync_modifiers(context)
             _send_presence(context)
             _write_status(context)
             if session.failed:
@@ -1041,10 +1203,26 @@ class BMP_OT_send_chat(Operator):
             command = command.lower()
             settings.chat_text = ""
             if command == "/help":
-                _push_message(context, "system", "Commands: /who /ping /leave /me <text>")
+                _push_message(context, "system", "Commands: /who /ping /lock /grant <user> /leave /me <text>")
             elif command == "/who":
                 names = ", ".join(user.name for user in settings.users) or "nobody"
                 _push_message(context, "system", f"In the room: {names}")
+            elif command == "/lock":
+                obj = context.active_object
+                uid = obj.get("bmp_uuid") if obj else None
+                if session and uid:
+                    session.send_lease(uid, "acquire")
+                    _push_message(context, "system", "Edit requested")
+                else:
+                    _push_message(context, "system", "Select a tracked object first")
+            elif command == "/grant":
+                obj = context.active_object
+                uid = obj.get("bmp_uuid") if obj else None
+                requester = argument.strip()
+                if session and uid and requester:
+                    session.send_lease(uid, "grant", requester)
+                else:
+                    _push_message(context, "system", "Usage: /grant <user> with the object selected")
             elif command == "/ping":
                 if session:
                     session.send_ping()
@@ -1115,6 +1293,40 @@ class BMP_OT_untrack_mesh(Operator):
         return {"FINISHED"}
 
 
+class BMP_OT_request_edit(Operator):
+    bl_idname = "bmp.request_edit"
+    bl_label = "Request Edit"
+    bl_description = "Ask the current owner for the edit lease on the active object"
+
+    def execute(self, context):
+        session: SessionService | None = runtime.get("session")
+        obj = context.active_object
+        uid = obj.get("bmp_uuid") if obj else None
+        if session is None or not uid:
+            self.report({"ERROR"}, "Select a tracked object in a session")
+            return {"CANCELLED"}
+        session.send_lease(uid, "acquire")
+        self.report({"INFO"}, "Edit requested")
+        return {"FINISHED"}
+
+
+class BMP_OT_grant_edit(Operator):
+    bl_idname = "bmp.grant_edit"
+    bl_label = "Grant Edit"
+    bl_description = "Grant the pending edit request to its requester"
+
+    def execute(self, context):
+        session: SessionService | None = runtime.get("session")
+        request = runtime.get("lease_request")
+        if session is None or not request:
+            self.report({"ERROR"}, "No pending request")
+            return {"CANCELLED"}
+        session.send_lease(request["key"], "grant", request.get("requester"))
+        runtime["lease_request"] = None
+        self.report({"INFO"}, f"Granted to {request.get('requester')}")
+        return {"FINISHED"}
+
+
 class BMP_OT_ping(Operator):
     bl_idname = "bmp.ping"
     bl_label = "Ping"
@@ -1182,6 +1394,8 @@ classes = (
     BMP_OT_untrack_mesh,
     BMP_OT_ping,
     BMP_OT_ping_mark,
+    BMP_OT_request_edit,
+    BMP_OT_grant_edit,
     BMP_OT_export_log,
 )
 
