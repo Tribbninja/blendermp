@@ -5,10 +5,13 @@ name = "Blendermp"
 tagline = "Low-latency collaborative Blender sessions over TLS"
 maintainer = "Blendermp"
 type = "add-on"
-tags = ["Network", "Collaboration", "3D View"]
+tags = ["System", "Pipeline", "User Interface"]
 blender_version_min = "5.0.0"
 license = ["SPDX:MIT"]
-permissions = ["network", "files", "clipboard"]
+[permissions]
+network = "Connect to session hosts and relays"
+files = "Read and write the local session control files"
+clipboard = "Copy room codes and diagnostics"
 
 [build]
 paths_exclude_pattern = [

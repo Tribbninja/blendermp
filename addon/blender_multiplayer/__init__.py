@@ -62,6 +62,8 @@ runtime: dict = {
     "last_control_nonce": None,
     "last_status": 0.0,
     "last_mesh": 0.0,
+    "mesh_cursor": 0,
+    "pings": [],
     "last_presence": 0.0,
     "control_checked": 0.0,
     "started": 0.0,
@@ -102,6 +104,10 @@ class BMPState(PropertyGroup):
     verify_code: StringProperty()
     chat_text: StringProperty()
     sync_mesh: BoolProperty(name="Sync active mesh", default=True)
+    use_relay: BoolProperty(name="Use relay", default=False)
+    relay_host: StringProperty(name="Relay host", default="")
+    relay_port: IntProperty(name="Relay port", default=7100, min=1024, max=65535)
+    paused: BoolProperty(name="Pause sync", default=False)
     sync_transforms: BoolProperty(name="Sync object transforms", default=True)
     users: CollectionProperty(type=BMPUser)
     messages: CollectionProperty(type=BMPMessage)
@@ -159,11 +165,26 @@ def _local_ip() -> str:
 def start_host(context, code: str | None = None, port: int | None = None) -> None:
     stop_session(context)
     settings = context.window_manager.bmp
-    port = port or settings.port
-    if not code:
-        from .core.roomcode import encode_room
+    from .core.roomcode import FLAG_RELAY, encode_room
 
-        code = encode_room(_local_ip(), port)
+    relay: tuple[str, int] | None = None
+    if code is None and settings.use_relay:
+        host = settings.relay_host.strip()
+        if not host:
+            raise ValueError("Relay host is not set")
+        try:
+            import ipaddress
+
+            ipaddress.IPv4Address(host)
+        except ValueError as exc:
+            raise ValueError("Relay host must be an IPv4 address") from exc
+        relay = (host, settings.relay_port)
+        code = encode_room(host, settings.relay_port, FLAG_RELAY)
+        port = 0
+    else:
+        port = port or settings.port
+        if not code:
+            code = encode_room(_local_ip(), port)
     settings.code = code
     settings.is_host = True
     settings.state = "hosting"
@@ -178,6 +199,7 @@ def start_host(context, code: str | None = None, port: int | None = None) -> Non
         color=tuple(settings.color),
         port=port,
         pin=settings.pin,
+        relay=relay,
     )
     session.start()
     runtime["session"] = session
@@ -262,6 +284,10 @@ def _handle_event(context, kind: str, body: dict) -> None:
             _upsert_user(context, peer.get("name", "?"), peer.get("color", (1, 1, 1, 1)))
         # send our full mesh for tracked objects so the newcomer sees them
         _send_snapshots(context)
+    elif kind == "relay":
+        _push_message(context, "system", body.get("message", "Relay connected"))
+    elif kind == "relay_error":
+        settings.last_error = str(body.get("message", "relay error"))[:180]
     elif kind == "peer_join":
         _upsert_user(context, body.get("name", "?"), body.get("color", (1, 1, 1, 1)))
         _push_message(context, "system", f"{body.get('name', 'someone')} joined")
@@ -277,6 +303,13 @@ def _handle_event(context, kind: str, body: dict) -> None:
                 user.mode = body.get("mode", "")
                 if body.get("name") == settings.name:
                     user.ping_ms = settings.rtt_ms
+    elif kind == "ping_mark":
+        body_pos = body.get("pos") or []
+        name = body.get("name", "?")
+        color = body.get("color") or (1.0, 0.5, 0.2, 1.0)
+        if len(color) == 3:
+            color = tuple(color) + (1.0,)
+        _spawn_ping(context, body_pos, name, color)
     elif kind == "chat":
         _push_message(context, body.get("name", "?"), body.get("text", ""))
     elif kind == "rtt":
@@ -319,6 +352,8 @@ def _apply_mesh_snapshot(context, body: dict) -> None:
     obj = obj_sync.find(uid)
     if obj is None or obj.type != "MESH":
         return
+    if context.active_object == obj and context.mode in {"EDIT_MESH", "SCULPT"}:
+        return  # never rebuild the mesh the user is editing
     mirror = runtime["mirrors"].setdefault(uid, MeshMirror())
     try:
         mirror.apply_snapshot(obj.data, bytes(payload))
@@ -330,15 +365,87 @@ def _send_snapshots(context) -> None:
     session: SessionService | None = runtime.get("session")
     if session is None:
         return
-    for obj in context.scene.objects:
-        if obj.type != "MESH" or obj.name not in runtime["tracked"]:
+    for name in sorted(runtime["tracked"]):
+        obj = bpy.data.objects.get(name)
+        if obj is None or obj.type != "MESH":
             continue
-        mirror = runtime["mirrors"].setdefault(obj.name, MeshMirror())
+        uid = obj.get("bmp_uuid") or str(uuid.uuid4())
+        obj["bmp_uuid"] = uid
+        mirror = MeshMirror()
+        runtime["mirrors"][uid] = mirror
         try:
             payload = mirror.full_snapshot(obj.data)
             session.send_mesh(obj, "snapshot", payload, 0)
         except Exception:  # noqa: BLE001
             traceback.print_exc()
+
+
+# --------------------------------------------------------------------------- pings
+PING_LIFETIME = 3.0
+
+
+def _ping_material(name: str, color):
+    material = bpy.data.materials.get(f"BMP Ping {name}")
+    if material is None:
+        material = bpy.data.materials.new(f"BMP Ping {name}")
+        material.use_nodes = True
+        material.diffuse_color = tuple(color)
+        bsdf = material.node_tree.nodes.get("Principled BSDF") if material.node_tree else None
+        if bsdf is not None:
+            for key in ("Emission Color", "Emission"):
+                if key in bsdf.inputs:
+                    bsdf.inputs[key].default_value = tuple(color)
+                    break
+            if "Emission Strength" in bsdf.inputs:
+                bsdf.inputs["Emission Strength"].default_value = 6.0
+    return material
+
+
+def _spawn_ping(context, position, name: str, color) -> None:
+    if not isinstance(position, (list, tuple)) or len(position) != 3:
+        return
+    try:
+        location = tuple(float(v) for v in position)
+    except (TypeError, ValueError):
+        return
+    collection = bpy.data.collections.get("Blendermp Pings")
+    if collection is None:
+        collection = bpy.data.collections.new("Blendermp Pings")
+        context.scene.collection.children.link(collection)
+        collection.hide_render = True
+        collection.hide_select = True
+
+    radius = 0.12
+    vertices = [(0, 0, radius), (0, 0, -radius), (radius, 0, 0), (-radius, 0, 0), (0, radius, 0), (0, -radius, 0)]
+    faces = [(0, 2, 4), (4, 2, 1), (1, 2, 3), (3, 2, 0), (0, 4, 3), (4, 1, 3)]
+    mesh = bpy.data.meshes.new(f"BMP Ping {name}")
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update()
+    mesh.materials.append(_ping_material(name, color))
+
+    obj = bpy.data.objects.new(f"Ping {name}", mesh)
+    obj.location = location
+    obj.color = tuple(color)
+    obj.show_in_front = True
+    obj["bmp_ping"] = True
+    collection.objects.link(obj)
+    runtime["pings"].append((obj, time.monotonic() + PING_LIFETIME))
+
+
+def _expire_pings(context) -> None:
+    now = time.monotonic()
+    for item in list(runtime["pings"]):
+        obj, expiry = item
+        if now < expiry:
+            continue
+        runtime["pings"].remove(item)
+        mesh = obj.data
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+            if mesh is not None and mesh.users == 0:
+                bpy.data.meshes.remove(mesh)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # --------------------------------------------------------------------------- bpy timer
@@ -363,6 +470,12 @@ def _poll_control(context) -> None:
         settings.fingerprint = request["fingerprint"]
     if "pin" in request:
         settings.pin = request["pin"]
+    if request.get("relay"):
+        host, port_text = request["relay"].rsplit(":", 1)
+        settings.relay_host = host
+        settings.relay_port = int(port_text)
+    if "use_relay" in request:
+        settings.use_relay = bool(request["use_relay"])
     action = request.get("action")
     try:
         if action == "host":
@@ -388,11 +501,14 @@ def _poll_control(context) -> None:
 
 def _sync_transforms(context) -> None:
     session: SessionService | None = runtime.get("session")
-    if session is None or not context.window_manager.bmp.sync_transforms:
+    settings = context.window_manager.bmp
+    if session is None or not settings.sync_transforms or settings.paused:
         return
     shadow: dict = runtime["object_shadow"]
     seen = set()
     for obj in context.scene.objects:
+        if obj.get("bmp_ping"):
+            continue
         uid = obj.get("bmp_uuid")
         if not uid:
             uid = str(uuid.uuid4())
@@ -414,18 +530,29 @@ def _sync_transforms(context) -> None:
 def _sync_mesh(context) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
-    if session is None or not settings.sync_mesh:
+    if session is None or not settings.sync_mesh or settings.paused:
         return
     now = time.monotonic()
     if now - runtime["last_mesh"] < MESH_POLL:
         return
     runtime["last_mesh"] = now
-    obj = context.active_object
-    if obj is None or obj.type != "MESH" or context.mode not in {"EDIT_MESH", "SCULPT"}:
+
+    active = context.active_object
+    if active is not None and active.type == "MESH" and context.mode in {"EDIT_MESH", "SCULPT"}:
+        runtime["tracked"].add(active.name)
+
+    names = sorted(name for name in runtime["tracked"] if name in bpy.data.objects)
+    if not names:
         return
+    cursor = runtime.get("mesh_cursor", 0) % len(names)
+    runtime["mesh_cursor"] = cursor + 1
+    obj = bpy.data.objects.get(names[cursor])
+    if obj is None or obj.type != "MESH":
+        runtime["tracked"].discard(names[cursor])
+        return
+
     uid = obj.get("bmp_uuid") or str(uuid.uuid4())
     obj["bmp_uuid"] = uid
-    runtime["tracked"].add(obj.name)
     mirror = runtime["mirrors"].get(uid)
     if mirror is None or not mirror.matches(obj.data):
         mirror = MeshMirror()
@@ -493,6 +620,7 @@ def _write_status(context) -> None:
             "fingerprint": settings.fingerprint,
             "verify_code": settings.verify_code,
             "last_error": settings.last_error,
+            "relay": bool(stats.get("relay", False)),
             "rtt_ms": stats.get("rtt_ms", 0),
             "bytes_in": stats.get("bytes_in", 0),
             "bytes_out": stats.get("bytes_out", 0),
@@ -513,6 +641,7 @@ def bmp_tick():
         _poll_control(context)
         session: SessionService | None = runtime.get("session")
         inbox = runtime["inbox"]
+        _expire_pings(context)
         while True:
             try:
                 kind, body = inbox.get_nowait()
@@ -608,6 +737,28 @@ class BMP_OT_send_chat(Operator):
         if not text:
             return {"CANCELLED"}
         session: SessionService | None = runtime.get("session")
+        if text.startswith("/"):
+            command, _, argument = text.partition(" ")
+            command = command.lower()
+            settings.chat_text = ""
+            if command == "/help":
+                _push_message(context, "system", "Commands: /who /ping /leave /me <text>")
+            elif command == "/who":
+                names = ", ".join(user.name for user in settings.users) or "nobody"
+                _push_message(context, "system", f"In the room: {names}")
+            elif command == "/ping":
+                if session:
+                    session.send_ping()
+                    _push_message(context, "system", "Ping sent")
+            elif command == "/leave":
+                stop_session(context)
+            elif command == "/me":
+                if session and argument.strip():
+                    session.send_chat(f"* {settings.name} {argument.strip()}")
+                    _push_message(context, "*", f"{settings.name} {argument.strip()}")
+            else:
+                _push_message(context, "system", f"Unknown command: {command}")
+            return {"FINISHED"}
         if session is None:
             self.report({"ERROR"}, "Not connected")
             return {"CANCELLED"}
@@ -619,23 +770,49 @@ class BMP_OT_send_chat(Operator):
 
 class BMP_OT_track_mesh(Operator):
     bl_idname = "bmp.track_mesh"
-    bl_label = "Track Active Mesh"
-    bl_description = "Stream the active mesh to the session"
+    bl_label = "Track Meshes"
+    bl_description = "Stream the selected meshes to the session"
+    bl_options = {"REGISTER"}
 
     def execute(self, context):
-        obj = context.active_object
-        if obj is None or obj.type != "MESH":
-            self.report({"ERROR"}, "Select a mesh object")
+        objects = [obj for obj in context.selected_objects if obj.type == "MESH"]
+        if not objects and context.active_object and context.active_object.type == "MESH":
+            objects = [context.active_object]
+        if not objects:
+            self.report({"ERROR"}, "Select one or more mesh objects")
             return {"CANCELLED"}
-        runtime["tracked"].add(obj.name)
-        uid = obj.get("bmp_uuid") or str(uuid.uuid4())
-        obj["bmp_uuid"] = uid
-        mirror = MeshMirror()
-        runtime["mirrors"][uid] = mirror
         session: SessionService | None = runtime.get("session")
-        if session:
-            session.send_mesh(obj, "snapshot", mirror.full_snapshot(obj.data), 0)
-        self.report({"INFO"}, f"Tracking {obj.name}")
+        for obj in objects:
+            runtime["tracked"].add(obj.name)
+            uid = obj.get("bmp_uuid") or str(uuid.uuid4())
+            obj["bmp_uuid"] = uid
+            mirror = MeshMirror()
+            runtime["mirrors"][uid] = mirror
+            if session:
+                try:
+                    session.send_mesh(obj, "snapshot", mirror.full_snapshot(obj.data), 0)
+                except Exception:  # noqa: BLE001
+                    traceback.print_exc()
+        self.report({"INFO"}, f"Tracking {len(objects)} mesh(es)")
+        return {"FINISHED"}
+
+
+class BMP_OT_untrack_mesh(Operator):
+    bl_idname = "bmp.untrack_mesh"
+    bl_label = "Untrack Meshes"
+    bl_description = "Stop streaming the selected meshes"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        objects = [obj for obj in context.selected_objects if obj.type == "MESH"]
+        if not objects and context.active_object and context.active_object.type == "MESH":
+            objects = [context.active_object]
+        for obj in objects:
+            runtime["tracked"].discard(obj.name)
+            uid = obj.get("bmp_uuid")
+            if uid:
+                runtime["mirrors"].pop(uid, None)
+        self.report({"INFO"}, f"Untracked {len(objects)} mesh(es)")
         return {"FINISHED"}
 
 
@@ -649,6 +826,22 @@ class BMP_OT_ping(Operator):
         if session is None:
             return {"CANCELLED"}
         session.send_ping()
+        return {"FINISHED"}
+
+
+class BMP_OT_ping_mark(Operator):
+    bl_idname = "bmp.ping_mark"
+    bl_label = "Ping Cursor"
+    bl_description = "Drop a short-lived marker for everyone at the 3D cursor"
+
+    def execute(self, context):
+        session: SessionService | None = runtime.get("session")
+        if session is None:
+            self.report({"ERROR"}, "Not connected")
+            return {"CANCELLED"}
+        position = context.scene.cursor.location
+        session.send_ping_mark((position.x, position.y, position.z))
+        _spawn_ping(context, (position.x, position.y, position.z), context.window_manager.bmp.name, tuple(context.window_manager.bmp.color))
         return {"FINISHED"}
 
 
@@ -687,12 +880,18 @@ classes = (
     BMP_OT_copy_code,
     BMP_OT_send_chat,
     BMP_OT_track_mesh,
+    BMP_OT_untrack_mesh,
     BMP_OT_ping,
+    BMP_OT_ping_mark,
     BMP_OT_export_log,
 )
 
 
 def register() -> None:
+    if getattr(bpy, "_blendermp_active", False):
+        print("Blendermp: another copy is already active; skipping duplicate registration")
+        return
+    bpy._blendermp_active = True
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.WindowManager.bmp = bpy.props.PointerProperty(type=BMPState)
@@ -702,6 +901,9 @@ def register() -> None:
 
 
 def unregister() -> None:
+    if not getattr(bpy, "_blendermp_active", False):
+        return
+    bpy._blendermp_active = False
     try:
         bpy.app.timers.unregister(bmp_tick)
     except ValueError:

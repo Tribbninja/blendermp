@@ -12,6 +12,7 @@ the short code stays human-sized.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import struct
 import zlib
@@ -75,6 +76,11 @@ def _from_base32(text: str) -> bytes:
     elif leftover < 0:
         raise RoomCodeError("room code is too short")
     return bits.to_bytes(PAYLOAD_SIZE, "big")
+
+
+def room_id(code: str) -> str:
+    """Stable relay room key derived from the room code (not a secret)."""
+    return hashlib.sha256(normalize(code).encode("ascii")).hexdigest()[:16]
 
 
 def normalize(code: str) -> str:

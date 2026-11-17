@@ -11,6 +11,7 @@ accepted. The app never sends executable content.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -116,6 +117,24 @@ def read_session() -> dict[str, Any] | None:
         except RoomCodeError:
             return None
         result["code"] = normalized
+
+    relay = body.get("relay")
+    if relay is not None:
+        if not isinstance(relay, str):
+            return None
+        try:
+            host, port_text = relay.rsplit(":", 1)
+            ipaddress.IPv4Address(host)
+            port = int(port_text)
+            if not 1024 <= port <= 65535:
+                raise ValueError
+        except (ValueError, ipaddress.AddressValueError):
+            return None
+        result["relay"] = f"{host}:{port}"
+
+    use_relay = body.get("use_relay")
+    if isinstance(use_relay, bool):
+        result["use_relay"] = use_relay
 
     if action == "chat":
         text = body.get("text")

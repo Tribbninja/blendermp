@@ -10,6 +10,11 @@ provide and the ones it does not provide yet.
 * **Transport security is standard TLS 1.3** using Python's `ssl` module. There
   is no application-level encryption and no bespoke cryptography in this
   project.
+* **The relay only forwards ciphertext.** In relay mode the host keeps an
+  outbound TCP tunnel; clients reach the host's TLS listener through a local
+  loopback bridge. The relay sees IP addresses, room ids (a hash of the code),
+  timing and byte counts, but never plaintext. It cannot impersonate a host
+  without the host's private key.
 * **The host certificate is pinned.** The host generates a self-signed
   certificate in `%LOCALAPPDATA%\Blendermp\certs` (owner-only permissions).
   Joiners pin its SHA-256 fingerprint on first connection (TOFU) and compare the
@@ -30,8 +35,8 @@ Untrusted input is rejected before it reaches Blender:
 * JSON payload size (control ≤ 64 KB) and shape;
 * chat length (≤ 2,000 chars) and control-character stripping;
 * transform payloads: exactly 80 bytes, finite floats, bounded magnitude;
-* mesh payloads: ≤ 8 MB, ≤ 5,000,000 vertices, structural validation of delta
-  headers and snapshot lengths before relay;
+* mesh payloads: ≤ 24 MB, ≤ 5,000,000 vertices, structural validation of delta
+  headers, geometry snapshots and positions before relay;
 * object leases: a peer cannot edit an object leased to someone else;
 * names and colours: assigned by the host after authentication, made unique, so
   a client cannot impersonate another participant;
@@ -69,10 +74,10 @@ The desktop app drives the addon through two JSON files in
   impersonate the host. Verify the code for untrusted networks.
 * **The host sees the scene.** This is cooperative editing, not
   zero-knowledge sharing.
+* **The relay sees metadata.** IP addresses, room ids, timing and traffic volume
+  are visible to the relay operator. Run your own relay if that matters.
 * **LAN discovery leaks the code and display name to the local subnet.** That is
   inherent to zero-config discovery; use a non-LAN room if that matters.
-* **No relay yet.** Cross-network sessions currently need a reachable host
-  (port forward, IPv6, or a VPN overlay). A self-hosted relay is on the roadmap.
 * **No certificate rotation UI.** Certificates rotate automatically after 30
   days; peers must re-verify the new code.
 * **No independent security audit.** Do not use this for sensitive production

@@ -269,3 +269,126 @@ def validate_positions(payload: bytes, max_vertices: int = 5_000_000) -> tuple[i
     if len(payload) != 4 + count * 12:
         raise ValueError("snapshot payload length does not match its header")
     return (count,)
+
+# --------------------------------------------------------------------------- geometry
+GEO_MAGIC = b"GEO1"
+GEO_HEADER = struct.Struct("<4s6I")
+
+
+def encode_geometry(
+    positions,
+    edges,
+    loops,
+    loop_starts,
+    loop_totals,
+    smooth,
+    materials,
+    uv_name: str | None = None,
+    uvs=None,
+) -> bytes:
+    """Full mesh snapshot: positions plus connectivity, enough to rebuild."""
+    positions = as_positions(positions)
+    edges = np.asarray(edges, dtype=np.uint32).ravel()
+    loops = np.asarray(loops, dtype=np.uint32).ravel()
+    starts = np.asarray(loop_starts, dtype=np.uint32).ravel()
+    totals = np.asarray(loop_totals, dtype=np.uint32).ravel()
+    smooth = np.asarray(smooth, dtype=np.uint8).ravel()
+    materials = np.asarray(materials, dtype=np.uint32).ravel()
+
+    nv, ne, nl, npoly = positions.shape[0], edges.size // 2, loops.size, starts.size
+    if totals.size != npoly or smooth.size != npoly or materials.size != npoly:
+        raise ValueError("polygon arrays must have the same length")
+    if edges.size % 2:
+        raise ValueError("edge array must contain pairs")
+    if edges.size and int(edges.max()) >= nv:
+        raise ValueError("edge references a vertex outside the mesh")
+    if loops.size and int(loops.max()) >= nv:
+        raise ValueError("loop references a vertex outside the mesh")
+    if int(totals.sum()) != nl:
+        raise ValueError("polygon loop totals do not match the loop count")
+
+    name = (uv_name or "").encode("utf-8")[:64]
+    has_uv = 1 if uvs is not None else 0
+    if has_uv:
+        uvs = np.asarray(uvs, dtype=np.float32)
+        if uvs.size != nl * 2:
+            raise ValueError("UV array must have two values per loop")
+        uvs = uvs.ravel()
+    else:
+        uvs = np.zeros(0, dtype=np.float32)
+
+    header = GEO_HEADER.pack(GEO_MAGIC, nv, ne, nl, npoly, npoly, has_uv)
+    payload = bytearray(header)
+    payload += struct.pack("<H", len(name)) + name
+    payload += np.asarray(positions, dtype="<f4").tobytes()
+    payload += edges.astype("<u4").tobytes()
+    payload += loops.astype("<u4").tobytes()
+    payload += starts.astype("<u4").tobytes()
+    payload += totals.astype("<u4").tobytes()
+    payload += smooth.astype("u1").tobytes()
+    payload += materials.astype("<u4").tobytes()
+    if has_uv:
+        payload += uvs.astype("<f4").tobytes()
+    return bytes(payload)
+
+
+def decode_geometry(payload: bytes) -> dict:
+    if len(payload) < GEO_HEADER.size:
+        raise ValueError("geometry payload is truncated")
+    magic, nv, ne, nl, npoly, npoly2, has_uv = GEO_HEADER.unpack_from(payload, 0)
+    if magic != GEO_MAGIC or npoly != npoly2:
+        raise ValueError("invalid geometry header")
+    offset = GEO_HEADER.size
+    if len(payload) < offset + 2:
+        raise ValueError("geometry payload is missing the UV name")
+    (name_len,) = struct.unpack_from("<H", payload, offset)
+    offset += 2
+    if name_len > 64 or len(payload) < offset + name_len:
+        raise ValueError("invalid UV layer name")
+    uv_name = payload[offset : offset + name_len].decode("utf-8", "replace")
+    offset += name_len
+
+    def take(count, dtype):
+        nonlocal offset
+        size = np.dtype(dtype).itemsize * count
+        if len(payload) < offset + size:
+            raise ValueError("geometry payload is truncated")
+        value = np.frombuffer(payload, dtype=dtype, count=count, offset=offset).copy()
+        offset += size
+        return value
+
+    positions = take(nv * 3, "<f4").reshape(-1, 3)
+    edges = take(ne * 2, "<u4").reshape(-1, 2)
+    loops = take(nl, "<u4")
+    starts = take(npoly, "<u4")
+    totals = take(npoly, "<u4")
+    smooth = take(npoly, "u1")
+    materials = take(npoly, "<u4")
+    uvs = take(nl * 2, "<f4") if has_uv else np.zeros(0, dtype=np.float32)
+    if offset != len(payload):
+        raise ValueError("geometry payload has trailing bytes")
+    return {
+        "positions": positions,
+        "edges": edges,
+        "loops": loops,
+        "loop_starts": starts,
+        "loop_totals": totals,
+        "smooth": smooth,
+        "materials": materials,
+        "uv_name": uv_name,
+        "uvs": uvs.reshape(-1, 2),
+    }
+
+
+def validate_geometry(payload: bytes, max_vertices: int = 5_000_000) -> tuple[int, int, int, int]:
+    geometry = decode_geometry(payload)
+    nv = geometry["positions"].shape[0]
+    if nv > max_vertices:
+        raise ValueError("geometry exceeds the vertex limit")
+    loops = geometry["loops"]
+    if loops.size and int(loops.max()) >= nv:
+        raise ValueError("loop references a vertex outside the mesh")
+    edges = geometry["edges"]
+    if edges.size and int(edges.max()) >= nv:
+        raise ValueError("edge references a vertex outside the mesh")
+    return nv, edges.shape[0], loops.size, geometry["loop_starts"].size

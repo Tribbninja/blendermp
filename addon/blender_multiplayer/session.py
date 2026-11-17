@@ -36,17 +36,19 @@ if __package__:
     from . import control
     from .core import protocol, tls
     from .core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, Frame, MessageType
-    from .core.roomcode import decode_room
+    from .core.roomcode import FLAG_RELAY, decode_room, room_id
+    from .net.relay import RelayClientAgent, RelayHostAgent
     from .sync.leases import LeaseManager
 else:  # pragma: no cover - allows importing the module standalone (tests)
     import control
     from core import protocol, tls
     from core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, Frame, MessageType
-    from core.roomcode import decode_room
+    from core.roomcode import FLAG_RELAY, decode_room, room_id
+    from net.relay import RelayClientAgent, RelayHostAgent
     from sync.leases import LeaseManager
 
 MAX_CONTROL = 64 * 1024
-MAX_MESH = 8 * 1024 * 1024
+MAX_MESH = 24 * 1024 * 1024
 MAX_VERTICES = 5_000_000
 MAX_CHAT = 2_000
 MAX_NAME = 48
@@ -192,6 +194,7 @@ class SessionService:
         port: int = 0,
         fingerprint: str | None = None,
         pin: str = "",
+        relay: tuple[str, int] | None = None,
     ):
         self.inbox = inbox
         self.is_host = host
@@ -201,6 +204,21 @@ class SessionService:
         self.port = int(port or 0)
         self.expected_fingerprint = fingerprint
         self.pin = pin[:64]
+
+        self.relay_addr: tuple[str, int] | None = None
+        self.relay_mode = False
+        try:
+            info = decode_room(self.code)
+        except Exception:  # noqa: BLE001 - validated later
+            info = None
+        if relay is not None:
+            self.relay_addr = relay
+            self.relay_mode = True
+        elif info is not None and (info.flags & FLAG_RELAY):
+            self.relay_addr = (info.ip, info.port)
+            self.relay_mode = True
+        self._relay_host: RelayHostAgent | None = None
+        self._relay_client: RelayClientAgent | None = None
 
         self.failed = False
         self.failure_reason = ""
@@ -254,6 +272,9 @@ class SessionService:
             if self.is_host:
                 await self._start_host()
             else:
+                if self.relay_mode and self.relay_addr:
+                    self._relay_client = RelayClientAgent(self.relay_addr, room_id(self.code))
+                    await self._relay_client.start()
                 tasks.append(asyncio.create_task(self._client_loop()))
             tasks.append(asyncio.create_task(self._tick_loop()))
             await self._stop_event.wait()
@@ -268,6 +289,18 @@ class SessionService:
             await self._shutdown()
 
     async def _shutdown(self) -> None:
+        if self._relay_client:
+            try:
+                await self._relay_client.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._relay_client = None
+        if self._relay_host:
+            try:
+                await self._relay_host.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._relay_host = None
         if self._server:
             self._server.close()
             try:
@@ -329,17 +362,22 @@ class SessionService:
             return
 
         self.fingerprint = fingerprint
-        port = self.port
-        if not port:
-            try:
-                port = decode_room(self.code).port
-            except Exception:  # noqa: BLE001
-                self._fail("invalid room code")
-                return
+        if self.relay_mode:
+            bind_host = "127.0.0.1"
+            port = 0
+        else:
+            bind_host = "0.0.0.0"
+            port = self.port
+            if not port:
+                try:
+                    port = decode_room(self.code).port
+                except Exception:  # noqa: BLE001
+                    self._fail("invalid room code")
+                    return
         try:
             self._server = await asyncio.start_server(
                 self._on_client,
-                host="0.0.0.0",
+                host=bind_host,
                 port=port,
                 ssl=context,
                 backlog=16,
@@ -349,11 +387,27 @@ class SessionService:
             self._fail(f"cannot listen on port {port}: {exc}")
             return
 
-        self.bound_port = port
+        sockets = self._server.sockets or []
+        self.bound_port = sockets[0].getsockname()[1] if sockets else port
+        if self.relay_mode and self.relay_addr:
+            self._relay_host = RelayHostAgent(
+                self.relay_addr,
+                room_id(self.code),
+                self.bound_port,
+                on_event=lambda kind, text: self._emit(kind, {"message": text}),
+            )
+            await self._relay_host.start()
+
         self._set_state("hosting")
         self._emit(
             "host_ready",
-            {"code": self.code, "port": port, "fingerprint": fingerprint, "short": tls.short_fingerprint(fingerprint)},
+            {
+                "code": self.code,
+                "port": self.bound_port,
+                "fingerprint": fingerprint,
+                "short": tls.short_fingerprint(fingerprint),
+                "relay": self.relay_mode,
+            },
         )
 
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -464,6 +518,19 @@ class SessionService:
             self._handle_lease(peer, frame, now)
             return
 
+        if frame.type == MessageType.PING_MARK:
+            body = self._json(frame, 4096)
+            position = body.get("pos")
+            if not isinstance(position, list) or len(position) != 3:
+                raise Violation("ping marker needs a position")
+            values = [float(v) for v in position]
+            if not all(math.isfinite(v) and abs(v) < 1e7 for v in values):
+                raise Violation("ping marker position is invalid")
+            message = {"name": peer.name, "color": list(peer.color), "pos": values}
+            self._broadcast(protocol.json_frame(MessageType.PING_MARK, message), exclude=peer.peer_id)
+            self._emit("ping_mark", message)
+            return
+
         raise Violation(f"message type {frame.type} is not accepted by the host")
 
     async def _accept_hello(self, peer: Peer, frame: Frame) -> None:
@@ -564,6 +631,8 @@ class SessionService:
         try:
             if type_ == MessageType.MESH_DELTA:
                 chunker.validate_delta(payload, MAX_VERTICES)
+            elif payload[:4] == chunker.GEO_MAGIC:
+                chunker.validate_geometry(payload, MAX_VERTICES)
             else:
                 chunker.validate_positions(payload, MAX_VERTICES)
         except ValueError as exc:
@@ -632,10 +701,14 @@ class SessionService:
 
         self._set_state("joining")
         context = tls.client_context()
+        if self.relay_mode and self._relay_client is not None:
+            host, port = "127.0.0.1", self._relay_client.port
+        else:
+            host, port = info.ip, info.port
         try:
             reader, writer = await asyncio.open_connection(
-                info.ip,
-                info.port,
+                host,
+                port,
                 ssl=context,
                 server_hostname="blendermp",
                 limit=MAX_MESH + HEADER_SIZE,
@@ -659,6 +732,7 @@ class SessionService:
             return
 
         self._fingerprint = actual or ""
+        self.fingerprint = actual or ""
         self._reader = reader
         self._writer = writer
         writer.write(
@@ -755,6 +829,20 @@ class SessionService:
             self._emit("lease", body)
             return
 
+        if frame.type == MessageType.PING_MARK:
+            body = self._json(frame, 4096)
+            position = body.get("pos")
+            if isinstance(position, list) and len(position) == 3:
+                self._emit(
+                    "ping_mark",
+                    {
+                        "name": clean_text(body.get("name"), MAX_NAME),
+                        "color": clean_color(body.get("color")),
+                        "pos": [float(v) for v in position],
+                    },
+                )
+            return
+
         if frame.type == MessageType.ERROR:
             body = self._json(frame, 1024)
             self._emit("error", {"message": clean_text(body.get("message"), 200)})
@@ -835,6 +923,15 @@ class SessionService:
     def send_ping(self) -> None:
         self._enqueue(protocol.json_frame(MessageType.PING, {"t": time.time()}))
 
+    def send_ping_mark(self, position) -> None:
+        try:
+            values = [float(v) for v in position]
+        except (TypeError, ValueError):
+            return
+        if len(values) != 3 or not all(math.isfinite(v) and abs(v) < 1e7 for v in values):
+            return
+        self._enqueue(protocol.json_frame(MessageType.PING_MARK, {"pos": values}))
+
     def request_lease(self, key: str, action: str = "acquire") -> None:
         self._enqueue(protocol.json_frame(MessageType.LEASE, {"key": key, "action": action}))
 
@@ -854,4 +951,5 @@ class SessionService:
             "peers": peers,
             "fingerprint": self.fingerprint,
             "port": self.bound_port,
+            "relay": self.relay_mode,
         }

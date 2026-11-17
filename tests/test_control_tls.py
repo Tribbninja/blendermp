@@ -44,6 +44,30 @@ def test_invalid_requests_are_ignored(appdir):
         assert control.read_session() is None, body
 
 
+def test_relay_request(appdir):
+    write_session(
+        appdir,
+        {
+            "action": "host",
+            "nonce": "r" * 16,
+            "name": "ada",
+            "port": 51999,
+            "use_relay": True,
+            "relay": "203.0.113.5:7100",
+        },
+    )
+    request = control.read_session()
+    assert request["use_relay"] is True
+    assert request["relay"] == "203.0.113.5:7100"
+
+    for bad in ("not-an-address", "203.0.113.5:99", "host.example:7100", "203.0.113.5"):
+        write_session(
+            appdir,
+            {"action": "host", "nonce": "r" * 16, "use_relay": True, "relay": bad},
+        )
+        assert control.read_session() is None, bad
+
+
 def test_oversized_control_file_rejected(appdir):
     write_session(appdir, {"action": "host", "nonce": "x" * 16, "pad": "z" * 10000})
     assert control.read_session() is None

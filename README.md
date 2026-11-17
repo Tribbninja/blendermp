@@ -15,24 +15,40 @@ video capture, so it keeps full GPU performance).
 
 * **Zero-config LAN sessions.** The host's machine is the server; room codes
   encode the endpoint, so there is no external service.
+* **Cross-network sessions through a self-hosted relay** (`docs/RELAY.md`). The
+  host keeps one outbound tunnel, clients join with the same code, and TLS stays
+  end-to-end so the relay only forwards ciphertext.
 * **TLS 1.3 everywhere**, self-signed host certificate, SHA-256 fingerprint
   pinning and a short verification code (no custom crypto).
 * **Host-authoritative protocol**: validated message types, size/rate limits,
   finite transform checks, mesh bounds, lease ownership, host-assigned names.
 * **Chunked mesh deltas** for dense meshes: per-chunk XOR hashing, changed-vertex
   deltas, int16 quantisation, `foreach_set` application with no geometry rebuild.
-  The engine is tested up to 1M-vertex-shaped buffers.
-* **Object transforms** stream at 30 Hz; the active sculpt/edit mesh streams at
-  12 Hz while you sculpt.
-* **Presence and chat** between the addon UI and the desktop app, with latency
-  and bandwidth telemetry.
+  Structural edits fall back to a full geometry snapshot (vertices, edges, loops,
+  polygons, UVs, smooth flags, material indices).
+* **Object transforms and multiple tracked meshes**: the addon round-robins
+  tracked meshes at 12 Hz and streams transforms at 30 Hz.
+* **Presence, chat and 3D pings** between the addon UI and the desktop app, with
+  latency and bandwidth telemetry, pause-sync and chat commands (`/who`, `/ping`,
+  `/leave`, `/me`).
 * **Desktop shell** (Tauri 2, Rust + static HTML/CSS/JS): launches Blender,
   writes the control request, docks Blender into the stage, shows room code,
   participants, chat, diagnostics and a live verification code.
 
-The protocol and engine have **66 passing tests**, including a real TLS
-host/client session, certificate-mismatch rejection and a 1,000-vertex delta
-round-trip under loss/reordering.
+The protocol and engine have **74 passing tests**, including a real TLS
+host/client session, certificate-mismatch rejection, relay chat over a
+multiplexed tunnel, and 1,000-vertex delta round-trips under loss/reordering.
+
+## Cross-network
+
+```bash
+# on a VPS or spare machine
+python -m server.relay --host 0.0.0.0 --port 7100
+```
+
+Set **Relay** to `your-host:7100` in Settings and enable **Host through the
+relay**. Room codes then point at the relay; joining is unchanged and the TLS
+certificate is still pinned to the host. See [docs/RELAY.md](docs/RELAY.md).
 
 ## Quick start (Windows)
 
@@ -57,6 +73,20 @@ scripts/dev.ps1 -Autohost
 Joining: enter the host's code (or paste the invite code) under **Join with
 code**. The first connection pins the host certificate and shows a verification
 code; compare it with the host's.
+
+### Packaged build
+
+```powershell
+scripts/package.ps1
+```
+
+Produces `dist/blender_multiplayer-<version>.zip` (validated Blender extension)
+and `dist/blendermp-windows-x64-<version>.zip` (release app, addon and docs). The
+extension can be installed with:
+
+```powershell
+scripts/install_extension.ps1
+```
 
 ## Build details
 
@@ -86,16 +116,17 @@ error instead of crashing.
 ```
 addon/blender_multiplayer/     Blender 5.x extension (importable package)
   core/  protocol, varint, room codes, chunker, TLS/certificate pinning
-  net/   UDP transport + reliable link, LAN discovery
+  net/   UDP transport + reliable link, LAN discovery, relay agents
   sync/  mesh mirror, object transforms, leases
   session.py  host/client state machine, validation, leases
   control.py  validated local control files shared with the app
   ui.py       N-panel
 desktop/ui/                    static UI (no bundler)
 desktop/src-tauri/             Tauri 2 shell + Win32 embedding
-tests/                         protocol, chunker, leases, TLS, live session
-tools/                         icon generator, headless smoke client
-scripts/                       bootstrap + dev launcher
+server/relay.py                self-hosted cross-network relay
+tests/                         protocol, chunker, leases, TLS, relay, live session
+tools/                         icon generator, mesh round-trip, smoke client
+scripts/                       bootstrap, dev launcher, packaging
 ```
 
 ## How the sync works
@@ -108,9 +139,14 @@ scripts/                       bootstrap + dev launcher
    and only changed chunks are diffed. Deltas carry varint index jumps and either
    float32 or int16-quantised coordinates. Receivers write the shadow buffer and
    `foreach_set` once, with no `clear_geometry`.
-3. **Presence/chat** are JSON control frames; the host rewrites identities so
-   names cannot be spoofed.
-4. **The app and addon talk through validated JSON files** in
+3. **Structural edits**: when counts change or a mesh is newly tracked, the addon
+   sends a full geometry snapshot. Receivers rebuild vertices, edges, loops,
+   polygons, UVs, smooth flags and material indices, then resume deltas.
+4. **Presence/chat/pings** are JSON control frames; the host rewrites identities
+   so names cannot be spoofed.
+5. **Relay mode** wraps the same TLS connection in a multiplexed tunnel; the host
+   keeps one outbound connection, so no public port is needed.
+6. **The app and addon talk through validated JSON files** in
    `%LOCALAPPDATA%\Blendermp`, which keeps the integration dependency-free.
 
 See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
@@ -119,18 +155,26 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
 
 * Blender 5.3 loads the addon headlessly and hosts on a real TLS listener.
 * A headless client joins, exchanges presence and chat, and leaves cleanly.
+* The same chat path works through the relay (`tests/test_relay.py`).
+* A geometry snapshot round-trips through Blender's mesh API (vertices, edges,
+  loops, UVs, smooth flags).
+* The packaged extension validates and installs with
+  `blender --command extension install-file`.
 * The app launches Blender, embeds its window, and reports the live room code,
   fingerprint and verification code.
-* `pytest`: 66 passed.
+* `pytest`: 74 passed.
 
 ## Limitations
 
-* **LAN only for now.** Cross-network rooms need a reachable host (port forward,
-  IPv6 or a VPN overlay) until the self-hosted relay lands.
-* Edit-mode **topology** changes are not streamed yet; position-only deltas are.
-* One tracked mesh (the active object) is streamed at a time.
-* No multires, images, materials or animation sync in this slice.
+* **No NAT hole punching.** Cross-network sessions need the relay (or a VPN).
+  Direct LAN connections still bypass it.
+* Multiple tracked meshes share one 12 Hz polling budget, so many large meshes
+  update more slowly.
+* Materials, geometry nodes, images and animation are not replicated yet.
+* One tracked mesh is streamed at a time per tick; objects must already exist in
+  both scenes (no object creation replication yet).
 * Windows-only window embedding; other platforms run Blender in its own window.
+* Multires is not supported.
 * Alpha software: back up work before a session.
 
 ## Security

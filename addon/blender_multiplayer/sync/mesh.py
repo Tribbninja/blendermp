@@ -1,11 +1,9 @@
 """Blender mesh mirror.
 
-The mirror reads positions with ``foreach_get``, hashes them in chunks, and sends
-only changed vertices. Application is the fast path: write the shadow buffer,
-``foreach_set`` once, ``mesh.update()``. No ``clear_geometry``, no rebuilding.
-
-This module imports ``bpy`` lazily so the rest of the package (protocol, tests)
-works outside Blender.
+Positions follow the fast path: chunked hashing, changed-vertex deltas and a
+single ``foreach_set``. Structural edits fall back to a full geometry snapshot
+that rebuilds vertices, edges, loops and polygons, including UVs and material
+indices. That rebuild only runs when topology actually changed, not per tick.
 """
 
 from __future__ import annotations
@@ -13,6 +11,7 @@ from __future__ import annotations
 import numpy as np
 
 from ..core import chunker
+from ..core.chunker import GEO_MAGIC
 
 
 def _require_bpy():
@@ -45,16 +44,64 @@ class MeshMirror:
         mesh.vertices.foreach_get("co", buffer)
         return buffer.reshape(-1, 3)
 
+    @staticmethod
+    def read_geometry(mesh) -> dict:
+        positions = MeshMirror.read_positions(mesh)
+        edges = np.empty(len(mesh.edges) * 2, dtype=np.int32)
+        if edges.size:
+            mesh.edges.foreach_get("vertices", edges)
+        loops = np.empty(len(mesh.loops), dtype=np.int32)
+        if loops.size:
+            mesh.loops.foreach_get("vertex_index", loops)
+        starts = np.empty(len(mesh.polygons), dtype=np.int32)
+        totals = np.empty(len(mesh.polygons), dtype=np.int32)
+        smooth = np.empty(len(mesh.polygons), dtype=bool)
+        materials = np.empty(len(mesh.polygons), dtype=np.int32)
+        if len(mesh.polygons):
+            mesh.polygons.foreach_get("loop_start", starts)
+            mesh.polygons.foreach_get("loop_total", totals)
+            mesh.polygons.foreach_get("use_smooth", smooth)
+            mesh.polygons.foreach_get("material_index", materials)
+
+        uv_name = ""
+        uvs = np.zeros(0, dtype=np.float32)
+        layer = mesh.uv_layers.active
+        if layer is not None and len(mesh.loops):
+            uvs = np.empty(len(mesh.loops) * 2, dtype=np.float32)
+            layer.data.foreach_get("uv", uvs)
+            uv_name = layer.name
+
+        return {
+            "positions": positions,
+            "edges": edges.reshape(-1, 2),
+            "loops": loops,
+            "loop_starts": starts,
+            "loop_totals": totals,
+            "smooth": smooth.astype(np.uint8),
+            "materials": materials.astype(np.uint32),
+            "uv_name": uv_name,
+            "uvs": uvs.reshape(-1, 2),
+        }
+
     def full_snapshot(self, mesh) -> bytes:
-        positions = self.read_positions(mesh)
-        self.shadow = positions.copy()
+        geometry = self.read_geometry(mesh)
+        self.shadow = geometry["positions"].copy()
         self.counts = self.counts_of(mesh)
         self.hashes = chunker.chunk_hashes(self.shadow)
         self.rev = 0
-        return chunker.encode_positions(positions)
+        return chunker.encode_geometry(
+            geometry["positions"],
+            geometry["edges"],
+            geometry["loops"],
+            geometry["loop_starts"],
+            geometry["loop_totals"],
+            geometry["smooth"],
+            geometry["materials"],
+            geometry["uv_name"] or None,
+            geometry["uvs"] if geometry["uvs"].size else None,
+        )
 
     def poll(self, mesh, epsilon: float = 1e-5) -> tuple[int, bytes] | None:
-        """Return ``(rev, delta)`` when positions changed, else ``None``."""
         if not self.matches(mesh):
             return None
         positions = self.read_positions(mesh)
@@ -89,10 +136,11 @@ class MeshMirror:
 
     def apply_snapshot(self, mesh, payload: bytes) -> None:
         _require_bpy()
+        if payload[:4] == GEO_MAGIC:
+            self._apply_geometry(mesh, payload)
+            return
         positions = chunker.decode_positions(payload)
         if positions.shape[0] != len(mesh.vertices):
-            # Topology differs. A full geometry rebuild is a later milestone;
-            # refusing is safer than writing a mismatched buffer.
             return
         self.shadow = positions.copy()
         self.counts = self.counts_of(mesh)
@@ -100,8 +148,44 @@ class MeshMirror:
         mesh.update()
         self.hashes = chunker.chunk_hashes(self.shadow)
 
+    def _apply_geometry(self, mesh, payload: bytes) -> None:
+        geometry = chunker.decode_geometry(payload)
+        positions = geometry["positions"]
+        edges = geometry["edges"]
+        loops = geometry["loops"]
+        starts = geometry["loop_starts"]
+        totals = geometry["loop_totals"]
+        polygons = starts.size
+
+        mesh.clear_geometry()
+        mesh.vertices.add(positions.shape[0])
+        mesh.edges.add(edges.shape[0])
+        mesh.loops.add(loops.size)
+        mesh.polygons.add(polygons)
+        if positions.size:
+            mesh.vertices.foreach_set("co", positions.ravel())
+        if edges.size:
+            mesh.edges.foreach_set("vertices", edges.ravel())
+        if loops.size:
+            mesh.loops.foreach_set("vertex_index", loops)
+        if polygons:
+            mesh.polygons.foreach_set("loop_start", starts)
+            mesh.polygons.foreach_set("loop_total", totals)
+            mesh.polygons.foreach_set("use_smooth", geometry["smooth"].astype(bool))
+            mesh.polygons.foreach_set("material_index", geometry["materials"].astype(np.int32))
+        if geometry["uvs"].size:
+            layer = mesh.uv_layers.active
+            if layer is None:
+                layer = mesh.uv_layers.new(name=geometry["uv_name"] or "UVMap")
+            layer.data.foreach_set("uv", geometry["uvs"].ravel())
+
+        self.shadow = positions.copy()
+        self.counts = self.counts_of(mesh)
+        self.hashes = chunker.chunk_hashes(self.shadow)
+        self.rev = 0
+        mesh.update()
+
     def remember(self, mesh) -> None:
-        """Adopt the current mesh state without sending anything."""
         self.shadow = self.read_positions(mesh)
         self.counts = self.counts_of(mesh)
         self.hashes = chunker.chunk_hashes(self.shadow)

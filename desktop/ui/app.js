@@ -1,4 +1,4 @@
-﻿/* Blendermp desktop shell.
+/* Blendermp desktop shell.
  *
  * No framework and no bundler: the webview loads this file directly, which keeps
  * the attack surface small (strict CSP, no inline script) and the install tiny.
@@ -63,6 +63,8 @@ const settings = {
   name: store.get("name", `user-${Math.random().toString(36).slice(2, 6)}`),
   port: Number(store.get("port", 51999)),
   pin: store.get("pin", ""),
+  relay: store.get("relay", ""),
+  useRelay: store.get("useRelay", "0") === "1",
   blender: store.get("blender", ""),
   chatOpen: store.get("chatOpen", "1") === "1",
 };
@@ -187,6 +189,8 @@ function setPanel(name) {
     $("setName").value = settings.name;
     $("setPort").value = settings.port;
     $("setPin").value = settings.pin;
+    $("setRelay").value = settings.relay;
+    $("setUseRelay").checked = settings.useRelay;
     $("setBlender").value = settings.blender;
   }
 }
@@ -283,7 +287,7 @@ function renderState(status) {
   $("statusRight").textContent = blender ? `Blender ${blender}` : "v0.1.0";
   $("stageMode").textContent = state.embedded ? "embedded Â· native" : active ? "Blender separate" : "no Blender window";
   $("statusLeft").textContent = active ? `${labels[value]} Â· ${code || "no code"}` : "Ready";
-  $("statusMid").textContent = state.embedded ? "GPU passthrough" : "";
+  $("statusMid").textContent = status?.relay ? "relay mode" : state.embedded ? "GPU passthrough" : "";
   $("stageHint").textContent = settings.blender ? "Blender is ready to launch." : "Blender not detected â€” set the path in Settings.";
 
   if (!active) {
@@ -524,6 +528,8 @@ async function hostRoom() {
       name: settings.name,
       port: settings.port,
       pin: settings.pin || null,
+      relay: settings.useRelay ? settings.relay : null,
+      use_relay: settings.useRelay,
     });
     toast("Room startingâ€¦", "ok");
     await launchBlender();
@@ -684,10 +690,14 @@ function wire() {
     settings.name = $("setName").value.trim() || settings.name;
     settings.port = Math.max(1024, Math.min(65535, Number($("setPort").value) || 51999));
     settings.pin = $("setPin").value;
+    settings.relay = $("setRelay").value.trim();
+    settings.useRelay = $("setUseRelay").checked;
     settings.blender = $("setBlender").value.trim();
     store.set("name", settings.name);
     store.set("port", settings.port);
     store.set("pin", settings.pin);
+    store.set("relay", settings.relay);
+    store.set("useRelay", settings.useRelay ? "1" : "0");
     store.set("blender", settings.blender);
     $("meAvatar").textContent = initials(settings.name);
     toast("Settings saved", "ok");
@@ -738,6 +748,8 @@ async function boot() {
   $("setName").value = settings.name;
   $("setPort").value = settings.port;
   $("setPin").value = settings.pin;
+  $("setRelay").value = settings.relay;
+  $("setUseRelay").checked = settings.useRelay;
   $("setBlender").value = settings.blender;
 
   if (state.demo) {

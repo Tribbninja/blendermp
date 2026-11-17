@@ -16,6 +16,25 @@ Clean-room, high-performance replacement for the Multi-user addon.
 
 ---
 
+## Implementation status
+
+**Shipped in the first vertical slice**
+
+- TLS 1.3 host/client, certificate pinning, host-authoritative validation, leases and roles.
+- LAN host/join, room codes, presence, chat, 3D pings, chat commands, pause sync, diagnostics.
+- Chunked mesh deltas, full geometry snapshots (topology, UVs, smooth flags, materials), multi-mesh tracking.
+- Self-hosted multiplexed relay for cross-network sessions; TLS stays end to end.
+- Tauri desktop shell with native Blender window embedding, control-file bridge, packaging scripts, verified Blender extension install.
+
+**Still ahead**
+
+- NAT hole punching and direct-route selection before relay fallback.
+- Replication for materials, geometry nodes, images and animation; object creation/deletion.
+- Multires; non-Windows embedding.
+- The remaining quality-of-life list in section 9.
+
+---
+
 ## 1. Why a rebuild (measured against upstream)
 
 Upstream analysed: `slumber/multi-user` 0.5-dev (GPLv3). Ideas only are reused; no code.

@@ -37,6 +37,8 @@ struct SessionRequest {
     pin: Option<String>,
     fingerprint: Option<String>,
     text: Option<String>,
+    relay: Option<String>,
+    use_relay: Option<bool>,
 }
 
 fn data_dir() -> PathBuf {
@@ -342,6 +344,16 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
             return Err("port must be 1024 or higher".into());
         }
     }
+    if let Some(relay) = &request.relay {
+        let (host, port) = relay
+            .rsplit_once(':')
+            .ok_or("relay must be IP:PORT")?;
+        host.parse::<std::net::Ipv4Addr>().map_err(|_| "relay host must be IPv4")?;
+        let port: u16 = port.parse().map_err(|_| "relay port is invalid")?;
+        if port < 1024 {
+            return Err("relay port must be 1024 or higher".into());
+        }
+    }
 
     let code = match request.action {
         Action::Leave | Action::Chat => None,
@@ -375,6 +387,8 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
         "pin": request.pin,
         "fingerprint": request.fingerprint,
         "text": text,
+        "relay": request.relay,
+        "use_relay": request.use_relay,
         "nonce": format!("{:x}-{:x}", std::process::id(), stamp),
     });
 

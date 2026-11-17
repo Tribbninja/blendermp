@@ -49,6 +49,7 @@ class MessageType(IntEnum):
     ERROR = 14
     AUTH = 15
     BYE = 16
+    PING_MARK = 17
 
 
 class Channel(IntEnum):

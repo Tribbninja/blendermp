@@ -55,6 +55,7 @@ class BMP_PT_main(bpy.types.Panel):
             row.operator("bmp.leave", text="Leave", icon="PANEL_CLOSE")
             if settings.state == "connected":
                 row.operator("bmp.ping", text="Ping", icon="SORTTIME")
+            row.operator("bmp.ping_mark", text="Ping cursor", icon="CURSOR")
 
         if settings.last_error:
             error = layout.box()
@@ -76,8 +77,10 @@ class BMP_PT_main(bpy.types.Panel):
         box.label(text="Sync", icon="MODIFIER")
         box.prop(settings, "sync_transforms")
         box.prop(settings, "sync_mesh")
+        box.prop(settings, "paused")
         row = box.row(align=True)
-        row.operator("bmp.track_mesh", text="Track active mesh", icon="MESH_DATA")
+        row.operator("bmp.track_mesh", text="Track selected", icon="MESH_DATA")
+        row.operator("bmp.untrack_mesh", text="", icon="X")
 
         if settings.state != "offline":
             box = layout.box()
@@ -94,6 +97,10 @@ class BMP_PT_main(bpy.types.Panel):
         box.prop(settings, "port")
         box.prop(settings, "pin")
         box.prop(settings, "name")
+        box.prop(settings, "use_relay")
+        if settings.use_relay:
+            box.prop(settings, "relay_host")
+            box.prop(settings, "relay_port")
         if settings.fingerprint:
             box.label(text="Host certificate", icon="LOCKED")
             box.label(text=settings.fingerprint[:32])
