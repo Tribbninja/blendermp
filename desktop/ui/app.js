@@ -68,25 +68,6 @@ const settings = {
   blender: store.get("blender", ""),
 };
 
-const layout = {
-  left: Math.min(460, Math.max(220, Number(store.get("leftW", 300)))),
-  right: Math.min(460, Math.max(240, Number(store.get("rightW", 300)))),
-  leftOpen: store.get("leftOpen", "1") === "1",
-  rightOpen: store.get("rightOpen", "1") === "1",
-};
-
-function clamp(value, low, high) {
-  return Math.max(low, Math.min(high, value));
-}
-
-function applyLayout() {
-  const root = document.documentElement;
-  root.style.setProperty("--left-w", `${layout.left}px`);
-  root.style.setProperty("--right-w", `${layout.right}px`);
-  app.classList.toggle("left-closed", !layout.leftOpen);
-  app.classList.toggle("right-closed", !layout.rightOpen);
-}
-
 const state = {
   status: null,
   embedded: false,
@@ -192,11 +173,8 @@ function setPanel(name) {
   for (const key of ["session", "join", "settings"]) {
     $(`panel-${key}`).hidden = key !== name;
   }
-  document.querySelectorAll(".rail-btn").forEach((button) => {
-    const view = button.dataset.view;
-    const active = view === name || (view === "chat" && layout.rightOpen && name === "session");
-    button.classList.toggle("active", active);
-  });
+  if (name !== "session") window.BMPLayout?.ensureTile("session");
+  window.BMPLayout?.refreshRail();
   if (name === "join") {
     $("joinCode").value = "";
     $("joinName").value = settings.name;
@@ -214,17 +192,7 @@ function setPanel(name) {
 }
 
 function toggleChat(open) {
-  layout.rightOpen = open;
-  store.set("rightOpen", open ? "1" : "0");
-  applyLayout();
-  scheduleBounds();
-}
-
-function setLeft(open) {
-  layout.leftOpen = open;
-  store.set("leftOpen", open ? "1" : "0");
-  applyLayout();
-  scheduleBounds();
+  window.BMPLayout?.setTile("chat", open);
 }
 
 function scheduleBounds() {
@@ -744,19 +712,11 @@ function wire() {
   $("embedChip").addEventListener("click", embedNow);
   $("detachChip").addEventListener("click", detachNow);
   $("focusBtn").addEventListener("click", () => invoke("focus_blender").catch(() => {}));
-  $("focusView").addEventListener("click", () => {
-    const bothOpen = layout.leftOpen && layout.rightOpen;
-    layout.leftOpen = !bothOpen;
-    layout.rightOpen = !bothOpen;
-    store.set("leftOpen", bothOpen ? "0" : "1");
-    store.set("rightOpen", bothOpen ? "0" : "1");
-    applyLayout();
-    scheduleBounds();
-  });
+  $("focusView").addEventListener("click", () => window.BMPLayout?.focusView());
   $("copyBtn").addEventListener("click", copyCode);
   $("chatForm").addEventListener("submit", sendChat);
-  $("chatClose").addEventListener("click", () => toggleChat(false));
-  $("collapseLeft").addEventListener("click", () => setLeft(false));
+  $("chatClose").addEventListener("click", () => window.BMPLayout?.setTile("chat", false));
+  $("collapseLeft").addEventListener("click", () => window.BMPLayout?.setTile("session", false));
   $("refreshBtn").addEventListener("click", poll);
   $("detectBtn").addEventListener("click", detectBlender);
   $("saveSettings").addEventListener("click", () => {
@@ -777,23 +737,6 @@ function wire() {
     setPanel("session");
   });
 
-  document.querySelectorAll(".rail-btn").forEach((button) => {
-    button.addEventListener("click", () => {
-      const view = button.dataset.view;
-      if (view === "chat") {
-        toggleChat(!layout.rightOpen);
-        return;
-      }
-      if (view === "settings") {
-        setLeft(true);
-        setPanel("settings");
-        return;
-      }
-      setLeft(true);
-      setPanel("session");
-    });
-  });
-
   $("joinCode").addEventListener("input", (event) => {
     const caret = event.target.selectionStart;
     event.target.value = groupCode(event.target.value);
@@ -811,46 +754,21 @@ function wire() {
   });
 
   window.addEventListener("resize", scheduleBounds);
-  wireSplitter($("splitLeft"), "left");
-  wireSplitter($("splitRight"), "right");
-  applyLayout();
-}
-
-function wireSplitter(element, side) {
-  if (!element) return;
-  element.addEventListener("pointerdown", (event) => {
-    event.preventDefault();
-    const startX = event.clientX;
-    const start = side === "left" ? layout.left : layout.right;
-    const onMove = (moveEvent) => {
-      const delta = moveEvent.clientX - startX;
-      if (side === "left") layout.left = clamp(start + delta, 200, 480);
-      else layout.right = clamp(start - delta, 240, 480);
-      applyLayout();
-      scheduleBounds();
-    };
-    const onUp = () => {
-      document.body.classList.remove("resizing");
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-      store.set(side === "left" ? "leftW" : "rightW", side === "left" ? layout.left : layout.right);
-      updateBounds();
-    };
-    document.body.classList.add("resizing");
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-  });
-  element.addEventListener("dblclick", () => {
-    if (side === "left") layout.left = 300;
-    else layout.right = 300;
-    applyLayout();
-    store.set(side === "left" ? "leftW" : "rightW", 300);
-    updateBounds();
-  });
 }
 
 async function boot() {
   wire();
+  window.BMPLayout?.init({
+    content: {
+      session: $("tileSession"),
+      viewport: $("tileViewport"),
+      chat: $("tileChat"),
+    },
+    onBounds: scheduleBounds,
+    setBlenderVisible: (visible) => invoke("set_blender_visible", { visible }).catch(() => {}),
+    getPanel: () => state.panel,
+    setPanel,
+  });
   markBridge();
   setPanel("session");
   $("meAvatar").textContent = initials(settings.name);

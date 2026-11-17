@@ -9,6 +9,7 @@ fn main() {
                 "set_embed_bounds",
                 "detach_blender",
                 "focus_blender",
+                "set_blender_visible",
                 "read_status",
                 "startup_flags",
                 "write_session",

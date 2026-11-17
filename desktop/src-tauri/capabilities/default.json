@@ -12,6 +12,7 @@
     "allow-set-embed-bounds",
     "allow-detach-blender",
     "allow-focus-blender",
+    "allow-set-blender-visible",
     "allow-read-status",
     "allow-startup-flags",
     "allow-write-session",

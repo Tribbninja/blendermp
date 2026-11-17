@@ -17,7 +17,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetForegroundWindow, SetParent,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, GetWindowRect, GetClassNameW, PostMessageW, WM_CLOSE,
     BringWindowToTop,
-    GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SWP_NOACTIVATE, SWP_ASYNCWINDOWPOS, SW_SHOW,
+    GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SWP_NOACTIVATE, SWP_ASYNCWINDOWPOS, SW_SHOW, SW_HIDE,
     WS_CAPTION, WS_CHILD, WS_POPUP, WS_THICKFRAME,
 };
 
@@ -263,8 +263,19 @@ pub fn dismiss_splash(pid: u32) -> usize {
     search.count
 }
 
-pub fn focus(info: &EmbedInfo) {
+pub fn set_visible(info: &EmbedInfo, visible: bool) {
+    let child = info.hwnd as HWND;
     unsafe {
-        let _ = SetForegroundWindow(info.hwnd as HWND);
+        let _ = ShowWindow(child, if visible { SW_SHOW } else { SW_HIDE });
+    }
+}
+
+pub fn focus(info: &EmbedInfo) {
+    let child = info.hwnd as HWND;
+    let parent = info.parent as HWND;
+    unsafe {
+        let _ = SetForegroundWindow(parent);
+        let _ = BringWindowToTop(child);
+        let _ = SetFocus(child);
     }
 }

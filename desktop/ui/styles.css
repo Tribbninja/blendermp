@@ -49,38 +49,142 @@ svg {
 }
 
 .workspace {
-  display: grid;
-  grid-template-columns: var(--left-w) 5px minmax(0, 1fr) 5px var(--right-w);
+  display: flex;
   min-width: 0;
   min-height: 0;
   height: 100vh;
+  overflow: hidden;
 }
 
-.splitter {
-  position: relative;
-  cursor: col-resize;
-  touch-action: none;
-  background: transparent;
+.split {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
 }
-.splitter::after {
-  content: "";
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 2px;
-  right: 2px;
+.split.row { flex-direction: row; }
+.split.col { flex-direction: column; }
+.split-bar {
+  flex: 0 0 5px;
   background: #131316;
+  cursor: col-resize;
   transition: background .12s ease;
 }
-.splitter:hover::after, body.resizing .splitter::after { background: #3a3a42; }
-
-.app.left-closed .workspace { grid-template-columns: minmax(0, 1fr) 5px var(--right-w); }
-.app.right-closed .workspace { grid-template-columns: var(--left-w) 5px minmax(0, 1fr); }
-.app.left-closed.right-closed .workspace { grid-template-columns: minmax(0, 1fr); }
-.app.left-closed .sidebar, .app.left-closed #splitLeft { display: none; }
-.app.right-closed .chatpanel, .app.right-closed #splitRight { display: none; }
+.split.col > .split-bar { cursor: row-resize; }
+.split-bar:hover, body.resizing .split-bar { background: #3a3a42; }
 body.resizing { cursor: col-resize; user-select: none; }
 
+.tile {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  flex: 1 1 0;
+}
+.tile > .sidebar,
+.tile > .stage,
+.tile > .chatpanel,
+.tile > .diagnostics-content {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+.tile-bar {
+  position: absolute;
+  z-index: 20;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 26px;
+  display: none;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+  background: rgba(10, 10, 12, 0.94);
+  border-bottom: 1px solid var(--line);
+  font-size: 9.5px;
+  letter-spacing: .6px;
+  text-transform: uppercase;
+  color: var(--faint);
+  cursor: grab;
+  user-select: none;
+}
+.layout-editing .tile-bar { display: flex; }
+.layout-editing .tile { outline: 1px dashed #2b2b33; outline-offset: -1px; }
+.layout-editing #chatClose, .layout-editing #collapseLeft { display: none; }
+.layout-editing .tile > .sidebar,
+.layout-editing .tile > .stage,
+.layout-editing .tile > .chatpanel,
+.layout-editing .tile > .diagnostics-content { margin-top: 26px; }
+.layout-editing .stage-body::after {
+  content: "Blender hidden while arranging";
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--faint);
+  font-size: 11px;
+  pointer-events: none;
+}
+.tile-grip {
+  width: 10px;
+  height: 10px;
+  background-image: radial-gradient(circle, #5b5b65 1px, transparent 1px);
+  background-size: 4px 4px;
+}
+.tile-close {
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: var(--faint);
+  font-size: 12px;
+  line-height: 1;
+  padding: 2px 4px;
+}
+.tile-close:hover { color: var(--text); }
+.tile-ghost {
+  position: fixed;
+  z-index: 1000;
+  pointer-events: none;
+  padding: 6px 10px;
+  border: 1px solid #34343c;
+  background: #17171b;
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--text);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, .4);
+  opacity: .94;
+}
+.drop-preview {
+  position: fixed;
+  z-index: 900;
+  pointer-events: none;
+  background: rgba(143, 227, 176, .12);
+  border: 1px solid rgba(143, 227, 176, .5);
+  border-radius: 4px;
+  transition: left .12s ease, top .12s ease, width .12s ease, height .12s ease;
+}
+.layout-hint {
+  position: fixed;
+  z-index: 950;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  background: #121216;
+  border-radius: 7px;
+  font-size: 10.5px;
+  color: var(--muted);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, .35);
+}
+.diagnostics-content { padding: 16px; overflow-y: auto; }
+.diagnostics-content .section { border-top: 0; padding-top: 0; }
 /* rail ------------------------------------------------------------------ */
 .rail {
   display: flex;

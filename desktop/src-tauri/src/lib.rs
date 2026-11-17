@@ -283,6 +283,23 @@ fn detach_blender(state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn set_blender_visible(state: State<AppState>, visible: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let guard = state.embedded.lock().map_err(|_| "state lock poisoned".to_string())?;
+        if let Some(info) = guard.as_ref() {
+            win_embed::set_visible(info, visible);
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (state, visible);
+        Ok(())
+    }
+}
+
+#[tauri::command]
 fn focus_blender(state: State<AppState>) -> Result<(), String> {
     #[cfg(windows)]
     {
@@ -461,6 +478,7 @@ pub fn run() {
             embed_blender,
             set_embed_bounds,
             detach_blender,
+            set_blender_visible,
             focus_blender,
             read_status,
             log_client,
