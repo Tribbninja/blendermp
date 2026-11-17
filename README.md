@@ -104,8 +104,11 @@ scripts/package.ps1
 
 Produces:
 
-* `dist/Blendermp-<version>-Setup.exe` — **Windows installer** (per-user, Start
-  menu/desktop shortcuts, uninstaller, bundled addon).
+* `dist/Blendermp-<version>-Setup.exe` - **Windows installer** (per-user, Start
+  menu/desktop shortcuts, uninstaller, bundled addon). It checks for Blender;
+  if none is found it offers to download the official Blender 5.3 MSI from
+  blender.org, verifies the pinned SHA-256, installs it silently, and then
+  installs Blendermp. Silent setup (`/S`) installs Blendermp only.
 * `dist/blendermp-windows-x64-<version>.zip` — portable app + addon + docs.
 * `dist/blender_multiplayer-<version>.zip` — Blender extension (validated),
   optional if you want to launch Blender outside the app.

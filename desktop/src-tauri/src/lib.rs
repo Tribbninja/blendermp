@@ -2,7 +2,7 @@ mod win_embed;
 
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -106,6 +106,28 @@ fn addon_root() -> Option<PathBuf> {
     None
 }
 
+fn blender_version(path: &Path) -> Vec<u32> {
+    // Parent folders look like "Blender 5.3" or "blender-5.3.0-windows-x64".
+    let Some(name) = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+    else {
+        return Vec::new();
+    };
+    let mut best: Vec<u32> = Vec::new();
+    for token in name.split(|ch: char| !(ch.is_ascii_digit() || ch == '.')) {
+        if !token.contains('.') {
+            continue;
+        }
+        let parts: Vec<u32> = token.split('.').filter_map(|part| part.parse().ok()).collect();
+        if parts.len() >= 2 && parts.len() > best.len() {
+            best = parts;
+        }
+    }
+    best
+}
+
 fn newest_blender() -> Option<PathBuf> {
     if let Some(value) = std::env::var_os("BMP_BLENDER") {
         let path = PathBuf::from(value);
@@ -118,6 +140,12 @@ fn newest_blender() -> Option<PathBuf> {
         PathBuf::from(r"C:\Program Files\Blender Foundation"),
         PathBuf::from(r"C:\Program Files (x86)\Blender Foundation"),
     ];
+    if let Some(program_files) = std::env::var_os("ProgramFiles") {
+        roots.push(PathBuf::from(program_files).join("Blender Foundation"));
+    }
+    if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)") {
+        roots.push(PathBuf::from(program_files_x86).join("Blender Foundation"));
+    }
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
         roots.push(PathBuf::from(local).join("Programs").join("Blender Foundation"));
     }
@@ -134,7 +162,28 @@ fn newest_blender() -> Option<PathBuf> {
             }
         }
     }
-    candidates.sort();
+
+    // Steam installs Blender as ...\steamapps\common\Blender\blender.exe.
+    for key in ["ProgramFiles(x86)", "ProgramFiles"] {
+        let Some(base) = std::env::var_os(key) else {
+            continue;
+        };
+        let exe = PathBuf::from(base)
+            .join("Steam")
+            .join("steamapps")
+            .join("common")
+            .join("Blender")
+            .join("blender.exe");
+        if exe.is_file() {
+            candidates.push(exe);
+        }
+    }
+
+    candidates.sort_by(|a, b| {
+        blender_version(a)
+            .cmp(&blender_version(b))
+            .then_with(|| a.cmp(b))
+    });
     candidates.pop()
 }
 

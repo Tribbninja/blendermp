@@ -25,6 +25,13 @@ provide and the ones it does not provide yet.
 * **An optional PIN** is verified server-side in constant time, with rate
   limiting. It is held in memory for the session and never written to disk.
 
+## Installer downloads
+
+The Windows setup only downloads Blender when no local installation is found and
+the user accepts the prompt. The URL is pinned to `download.blender.org` and the
+MSI's SHA-256 is checked before it is passed to `msiexec`. A mismatch aborts the
+Blender step; Blendermp is still installed and no unverified binary is executed.
+
 ## What the host validates
 
 Untrusted input is rejected before it reaches Blender:
