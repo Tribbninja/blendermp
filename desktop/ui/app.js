@@ -173,7 +173,7 @@ function setPanel(name) {
   for (const key of ["session", "join", "settings"]) {
     $(`panel-${key}`).hidden = key !== name;
   }
-  if (name !== "session") window.BMPLayout?.ensureTile("session");
+  window.BMPLayout?.setTile("session", true);
   window.BMPLayout?.refreshRail();
   if (name === "join") {
     $("joinCode").value = "";
@@ -189,10 +189,6 @@ function setPanel(name) {
     $("setUseRelay").checked = settings.useRelay;
     $("setBlender").value = settings.blender;
   }
-}
-
-function toggleChat(open) {
-  window.BMPLayout?.setTile("chat", open);
 }
 
 function scheduleBounds() {

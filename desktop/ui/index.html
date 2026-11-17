@@ -35,6 +35,7 @@
     </nav>
 
     <div class="workspace" id="workspace">
+    <section class="zone" data-zone="left" id="zoneLeft">
     <aside class="sidebar" id="tileSession">
       <header class="brand">
         <div>
@@ -190,7 +191,9 @@
         </section>
       </div>
     </aside>
-
+    </section>
+    <div class="splitter" id="splitLeft" title="Drag to resize"></div>
+    <section class="zone" data-zone="main" id="zoneMain">
     <main class="stage" id="tileViewport">
       <div class="stage-chrome">
         <div class="crumbs">
@@ -203,6 +206,7 @@
           <span class="bridge-pill" id="bridgePill">bridge: checking</span>
           <button class="chip" id="focusBtn" hidden>Focus</button>
           <button class="chip" id="layoutBtn" title="Arrange tiles">Layout</button>
+          <button class="chip" id="layoutReset" title="Restore the default layout">Reset</button>
           <button class="chip" id="focusView" title="Hide or show both side panels">Focus view</button>
           <button class="chip" id="embedChip">Embed</button>
           <button class="chip" id="detachChip" hidden>Detach</button>
@@ -230,7 +234,9 @@
         <span id="statusRight">v0.1.0</span>
       </div>
     </main>
-
+    </section>
+    <div class="splitter" id="splitRight" title="Drag to resize"></div>
+    <section class="zone" data-zone="right" id="zoneRight">
     <aside class="chatpanel" id="tileChat">
       <header class="chat-head">
         <div>
@@ -251,10 +257,14 @@
         </button>
       </form>
     </aside>
+    </section>
+    <div class="splitter" id="splitBottom" title="Drag to resize"></div>
+    <section class="zone" data-zone="bottom" id="zoneBottom"></section>
     </div>
     <div class="layout-hint" id="layoutHint" hidden>
-      <span>Drag tiles by their top bar. Drop on an edge to split, or the center to swap.</span>
+      <span>Drag a panel onto Left, Right or Bottom. Release to place it.</span>
       <button class="chip" id="layoutDone">Done</button>
+      <button class="chip" id="layoutResetHint">Reset</button>
     </div>
   </div>
 

@@ -47,11 +47,15 @@ video capture, so it keeps full GPU performance).
 * **Desktop shell** (Tauri 2, Rust + static HTML/CSS/JS): launches Blender,
   writes the control request, docks Blender into the stage, shows room code,
   participants, chat, diagnostics and a live verification code.
-* **Modular tile workspace**: click **Layout** to enter tile edit mode, drag a
-  tile by its top bar, and drop it on a tile edge to split or in the center to
-  swap. Splitters resize areas, the rail toggles Session/Chat/Diagnostics, and
-  the layout persists. Blender is hidden while arranging and snaps back into the
-  viewport tile when you press Done or Escape.
+* **Modular tile workspace with fixed docks**: click **Layout** to enter edit
+  mode, then drag Session, Chat or Diagnostics by its top bar onto the **Left**,
+  **Right** or **Bottom** dock. Panels reflow live as you hover a dock, swap
+  cleanly when a dock is occupied, and settle with smooth transition when you
+  release. The **viewport always stays in the main area**. Splitters resize each
+  dock, the rail toggles panels, and every arrangement is saved. **Reset**
+  restores the default layout (Session left, Chat right, empty bottom) with the
+  same animated transition. Blender is hidden while arranging and returns to the
+  viewport when you press Done or Escape.
 
 The protocol and engine have **97 passing tests**, including a real TLS
 host/client session, certificate-mismatch rejection, relay chat over a
