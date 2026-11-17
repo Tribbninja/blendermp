@@ -200,10 +200,10 @@ fn find_blender_window(state: State<AppState>) -> Result<Option<i64>, String> {
 #[tauri::command]
 fn embed_blender(
     state: State<AppState>,
-    left_px: f64,
-    top_px: f64,
-    right_px: f64,
-    bottom_px: f64,
+    x_px: f64,
+    y_px: f64,
+    width_px: f64,
+    height_px: f64,
     viewport_w: f64,
     viewport_h: f64,
 ) -> Result<(), String> {
@@ -216,10 +216,10 @@ fn embed_blender(
         let info = win_embed::embed(
             child,
             parent,
-            left_px.max(0.0).round() as i32,
-            top_px.max(0.0).round() as i32,
-            right_px.max(0.0).round() as i32,
-            bottom_px.max(0.0).round() as i32,
+            x_px.max(0.0).round() as i32,
+            y_px.max(0.0).round() as i32,
+            width_px.max(40.0).round() as i32,
+            height_px.max(30.0).round() as i32,
             viewport_w,
             viewport_h,
         )?;
@@ -229,7 +229,7 @@ fn embed_blender(
     }
     #[cfg(not(windows))]
     {
-        let _ = (state, left_px, top_px, right_px, bottom_px, viewport_w, viewport_h);
+        let _ = (state, x_px, y_px, width_px, height_px, viewport_w, viewport_h);
         Err("native embedding is Windows-only; Blender runs in its own window".into())
     }
 }
@@ -237,10 +237,10 @@ fn embed_blender(
 #[tauri::command]
 fn set_embed_bounds(
     state: State<AppState>,
-    left_px: f64,
-    top_px: f64,
-    right_px: f64,
-    bottom_px: f64,
+    x_px: f64,
+    y_px: f64,
+    width_px: f64,
+    height_px: f64,
     viewport_w: f64,
     viewport_h: f64,
 ) -> Result<(), String> {
@@ -250,17 +250,17 @@ fn set_embed_bounds(
         let info = guard.as_ref().ok_or_else(|| "Blender is not embedded".to_string())?;
         win_embed::resize(
             info,
-            left_px.max(0.0).round() as i32,
-            top_px.max(0.0).round() as i32,
-            right_px.max(0.0).round() as i32,
-            bottom_px.max(0.0).round() as i32,
+            x_px.max(0.0).round() as i32,
+            y_px.max(0.0).round() as i32,
+            width_px.max(40.0).round() as i32,
+            height_px.max(30.0).round() as i32,
             viewport_w,
             viewport_h,
         )
     }
     #[cfg(not(windows))]
     {
-        let _ = (state, left_px, top_px, right_px, bottom_px, viewport_w, viewport_h);
+        let _ = (state, x_px, y_px, width_px, height_px, viewport_w, viewport_h);
         Ok(())
     }
 }

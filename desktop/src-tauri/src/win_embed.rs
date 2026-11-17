@@ -11,10 +11,12 @@
 //! * The original window style is restored on detach.
 
 use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClientRect, GetWindow, GetWindowLongPtrW, GetWindowTextLengthW,
     GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetForegroundWindow, SetParent,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, GetWindowRect, GetClassNameW, PostMessageW, WM_CLOSE,
+    BringWindowToTop,
     GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOW,
     WS_CAPTION, WS_CHILD, WS_POPUP, WS_THICKFRAME,
 };
@@ -99,10 +101,10 @@ pub struct EmbedInfo {
 pub fn embed(
     child_handle: isize,
     parent_handle: isize,
-    left_px: i32,
-    top_px: i32,
-    right_px: i32,
-    bottom_px: i32,
+    x_px: i32,
+    y_px: i32,
+    width_px: i32,
+    height_px: i32,
     viewport_w: f64,
     viewport_h: f64,
 ) -> Result<EmbedInfo, String> {
@@ -117,6 +119,9 @@ pub fn embed(
 
     let style = unsafe { GetWindowLongPtrW(child, GWL_STYLE) };
     let exstyle = unsafe { GetWindowLongPtrW(child, GWL_EXSTYLE) };
+    unsafe {
+        let _ = EnableWindow(child, 1);
+    }
     let strip = (WS_POPUP | WS_CAPTION | WS_THICKFRAME) as isize;
     let new_style = (style & !strip) | WS_CHILD as isize;
     unsafe {
@@ -133,7 +138,7 @@ pub fn embed(
         }
     }
 
-    position(child, parent, left_px, top_px, right_px, bottom_px, viewport_w, viewport_h)?;
+    position(child, parent, x_px, y_px, width_px, height_px, viewport_w, viewport_h)?;
     unsafe {
         let _ = ShowWindow(child, SW_SHOW);
     }
@@ -149,10 +154,10 @@ pub fn embed(
 fn position(
     child: HWND,
     parent: HWND,
-    left_px: i32,
-    top_px: i32,
-    right_px: i32,
-    bottom_px: i32,
+    x_px: i32,
+    y_px: i32,
+    width_px: i32,
+    height_px: i32,
     viewport_w: f64,
     viewport_h: f64,
 ) -> Result<(), String> {
@@ -164,22 +169,20 @@ fn position(
     let client_h = (rect.bottom - rect.top) as f64;
     let scale_x = (client_w / viewport_w.max(1.0)).clamp(0.25, 4.0);
     let scale_y = (client_h / viewport_h.max(1.0)).clamp(0.25, 4.0);
-    let left = ((left_px.max(0) as f64) * scale_x).round() as i32;
-    let top = ((top_px.max(0) as f64) * scale_y).round() as i32;
-    let right = ((right_px.max(0) as f64) * scale_x).round() as i32;
-    let bottom = ((bottom_px.max(0) as f64) * scale_y).round() as i32;
-    let width = (rect.right - rect.left - left - right).max(320);
-    let height = (rect.bottom - rect.top - top - bottom).max(240);
+    let x = ((x_px.max(0) as f64) * scale_x).round() as i32;
+    let y = ((y_px.max(0) as f64) * scale_y).round() as i32;
+    let width = ((width_px.max(40) as f64) * scale_x).round() as i32;
+    let height = ((height_px.max(30) as f64) * scale_y).round() as i32;
 
     let ok = unsafe {
         SetWindowPos(
             child,
             std::ptr::null_mut(),
-            left,
-            top,
+            x,
+            y,
             width,
             height,
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
         )
     };
     if ok == 0 {
@@ -190,10 +193,10 @@ fn position(
 
 pub fn resize(
     info: &EmbedInfo,
-    left_px: i32,
-    top_px: i32,
-    right_px: i32,
-    bottom_px: i32,
+    x_px: i32,
+    y_px: i32,
+    width_px: i32,
+    height_px: i32,
     viewport_w: f64,
     viewport_h: f64,
 ) -> Result<(), String> {
@@ -202,7 +205,7 @@ pub fn resize(
     if unsafe { IsWindow(child) } == 0 || unsafe { IsWindow(parent) } == 0 {
         return Err(format!("window was closed (child={}, parent={})", info.hwnd, info.parent));
     }
-    position(child, parent, left_px, top_px, right_px, bottom_px, viewport_w, viewport_h)
+    position(child, parent, x_px, y_px, width_px, height_px, viewport_w, viewport_h)
 }
 
 pub fn detach(info: &EmbedInfo) {

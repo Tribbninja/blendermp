@@ -47,6 +47,8 @@ video capture, so it keeps full GPU performance).
 * **Desktop shell** (Tauri 2, Rust + static HTML/CSS/JS): launches Blender,
   writes the control request, docks Blender into the stage, shows room code,
   participants, chat, diagnostics and a live verification code.
+* **Resizable tile workspace**: draggable splitters, collapsible session/chat
+  areas, focus-view mode and a saved layout, like Blender areas.
 
 The protocol and engine have **97 passing tests**, including a real TLS
 host/client session, certificate-mismatch rejection, relay chat over a

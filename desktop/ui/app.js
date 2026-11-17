@@ -66,8 +66,26 @@ const settings = {
   relay: store.get("relay", ""),
   useRelay: store.get("useRelay", "0") === "1",
   blender: store.get("blender", ""),
-  chatOpen: store.get("chatOpen", "1") === "1",
 };
+
+const layout = {
+  left: Math.min(460, Math.max(220, Number(store.get("leftW", 300)))),
+  right: Math.min(460, Math.max(240, Number(store.get("rightW", 300)))),
+  leftOpen: store.get("leftOpen", "1") === "1",
+  rightOpen: store.get("rightOpen", "1") === "1",
+};
+
+function clamp(value, low, high) {
+  return Math.max(low, Math.min(high, value));
+}
+
+function applyLayout() {
+  const root = document.documentElement;
+  root.style.setProperty("--left-w", `${layout.left}px`);
+  root.style.setProperty("--right-w", `${layout.right}px`);
+  app.classList.toggle("left-closed", !layout.leftOpen);
+  app.classList.toggle("right-closed", !layout.rightOpen);
+}
 
 const state = {
   status: null,
@@ -176,7 +194,7 @@ function setPanel(name) {
   }
   document.querySelectorAll(".rail-btn").forEach((button) => {
     const view = button.dataset.view;
-    const active = view === name || (view === "chat" && state.chatOpen && name === "session");
+    const active = view === name || (view === "chat" && layout.rightOpen && name === "session");
     button.classList.toggle("active", active);
   });
   if (name === "join") {
@@ -196,15 +214,25 @@ function setPanel(name) {
 }
 
 function toggleChat(open) {
-  state.chatOpen = open;
-  app.classList.toggle("chat-closed", !open);
-  store.set("chatOpen", open ? "1" : "0");
+  layout.rightOpen = open;
+  store.set("rightOpen", open ? "1" : "0");
+  applyLayout();
+  scheduleBounds();
+}
+
+function setLeft(open) {
+  layout.leftOpen = open;
+  store.set("leftOpen", open ? "1" : "0");
+  applyLayout();
   scheduleBounds();
 }
 
 function scheduleBounds() {
-  clearTimeout(scheduleBounds.timer);
-  scheduleBounds.timer = setTimeout(() => updateBounds(), 80);
+  if (scheduleBounds.raf) return;
+  scheduleBounds.raf = requestAnimationFrame(() => {
+    scheduleBounds.raf = 0;
+    updateBounds();
+  });
 }
 
 async function updateBounds() {
@@ -212,10 +240,10 @@ async function updateBounds() {
   try {
     const box = insets();
     await invoke("set_embed_bounds", {
-      leftPx: box.left,
-      topPx: box.top,
-      rightPx: box.right,
-      bottomPx: box.bottom,
+      xPx: box.x,
+      yPx: box.y,
+      widthPx: box.width,
+      heightPx: box.height,
       viewportW: box.viewportW,
       viewportH: box.viewportH,
     });
@@ -227,19 +255,12 @@ async function updateBounds() {
 }
 
 function insets() {
-  const sidebar = document.querySelector(".sidebar").getBoundingClientRect();
-  const chrome = document.querySelector(".stage-chrome").getBoundingClientRect();
-  const bar = document.querySelector(".statusbar").getBoundingClientRect();
-  const chat = document.querySelector(".chatpanel");
-  const chatVisible = chat && chat.offsetWidth > 0 && !app.classList.contains("chat-closed");
-  // CSS pixels plus the CSS viewport size. The native side converts to physical
-  // pixels using the real client-size / viewport ratio, so it is correct whether
-  // or not the process is DPI aware.
+  const rect = document.querySelector(".stage-body").getBoundingClientRect();
   return {
-    left: Math.round(sidebar.right),
-    top: Math.round(chrome.bottom),
-    right: Math.round(chatVisible ? window.innerWidth - chat.getBoundingClientRect().left : 0),
-    bottom: Math.round(window.innerHeight - bar.top),
+    x: Math.round(rect.left),
+    y: Math.round(rect.top),
+    width: Math.round(rect.width),
+    height: Math.round(rect.height),
     viewportW: window.innerWidth,
     viewportH: window.innerHeight,
   };
@@ -424,7 +445,7 @@ function drawSpark() {
   const canvas = $("spark");
   const ratio = window.devicePixelRatio || 1;
   const width = canvas.clientWidth || 280;
-  const height = 52;
+  const height = 36;
   if (canvas.width !== Math.round(width * ratio)) {
     canvas.width = Math.round(width * ratio);
     canvas.height = Math.round(height * ratio);
@@ -589,10 +610,10 @@ async function embedNow() {
   try {
     const box = insets();
     await invoke("embed_blender", {
-      leftPx: box.left,
-      topPx: box.top,
-      rightPx: box.right,
-      bottomPx: box.bottom,
+      xPx: box.x,
+      yPx: box.y,
+      widthPx: box.width,
+      heightPx: box.height,
       viewportW: box.viewportW,
       viewportH: box.viewportH,
     });
@@ -672,10 +693,10 @@ async function embedLoop() {
     if (!found) return;
     const box = insets();
     await invoke("embed_blender", {
-      leftPx: box.left,
-      topPx: box.top,
-      rightPx: box.right,
-      bottomPx: box.bottom,
+      xPx: box.x,
+      yPx: box.y,
+      widthPx: box.width,
+      heightPx: box.height,
       viewportW: box.viewportW,
       viewportH: box.viewportH,
     });
@@ -709,9 +730,19 @@ function wire() {
   $("embedChip").addEventListener("click", embedNow);
   $("detachChip").addEventListener("click", detachNow);
   $("focusBtn").addEventListener("click", () => invoke("focus_blender").catch(() => {}));
+  $("focusView").addEventListener("click", () => {
+    const bothOpen = layout.leftOpen && layout.rightOpen;
+    layout.leftOpen = !bothOpen;
+    layout.rightOpen = !bothOpen;
+    store.set("leftOpen", bothOpen ? "0" : "1");
+    store.set("rightOpen", bothOpen ? "0" : "1");
+    applyLayout();
+    scheduleBounds();
+  });
   $("copyBtn").addEventListener("click", copyCode);
   $("chatForm").addEventListener("submit", sendChat);
   $("chatClose").addEventListener("click", () => toggleChat(false));
+  $("collapseLeft").addEventListener("click", () => setLeft(false));
   $("refreshBtn").addEventListener("click", poll);
   $("detectBtn").addEventListener("click", detectBlender);
   $("saveSettings").addEventListener("click", () => {
@@ -736,13 +767,15 @@ function wire() {
     button.addEventListener("click", () => {
       const view = button.dataset.view;
       if (view === "chat") {
-        toggleChat(!state.chatOpen);
+        toggleChat(!layout.rightOpen);
         return;
       }
       if (view === "settings") {
+        setLeft(true);
         setPanel("settings");
         return;
       }
+      setLeft(true);
       setPanel("session");
     });
   });
@@ -764,7 +797,42 @@ function wire() {
   });
 
   window.addEventListener("resize", scheduleBounds);
-  toggleChat(settings.chatOpen);
+  wireSplitter($("splitLeft"), "left");
+  wireSplitter($("splitRight"), "right");
+  applyLayout();
+}
+
+function wireSplitter(element, side) {
+  if (!element) return;
+  element.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const start = side === "left" ? layout.left : layout.right;
+    const onMove = (moveEvent) => {
+      const delta = moveEvent.clientX - startX;
+      if (side === "left") layout.left = clamp(start + delta, 200, 480);
+      else layout.right = clamp(start - delta, 240, 480);
+      applyLayout();
+      scheduleBounds();
+    };
+    const onUp = () => {
+      document.body.classList.remove("resizing");
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      store.set(side === "left" ? "leftW" : "rightW", side === "left" ? layout.left : layout.right);
+      updateBounds();
+    };
+    document.body.classList.add("resizing");
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  });
+  element.addEventListener("dblclick", () => {
+    if (side === "left") layout.left = 300;
+    else layout.right = 300;
+    applyLayout();
+    store.set(side === "left" ? "leftW" : "rightW", 300);
+    updateBounds();
+  });
 }
 
 async function boot() {
