@@ -54,6 +54,7 @@ class MessageType(IntEnum):
     OBJECT_DELETE = 19
     MATERIAL_UPDATE = 20
     MODIFIER_STACK = 21
+    IMAGE_ASSET = 22
 
 
 class Channel(IntEnum):

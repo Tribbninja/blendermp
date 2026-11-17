@@ -26,6 +26,7 @@ Clean-room, high-performance replacement for the Multi-user addon.
 - Object creation/deletion replication for meshes, empties, cameras, lights, curves and text.
 - Basic material sync (Principled BSDF colour, metallic, roughness, emission, viewport colour).
 - Modifier stack sync for common modifiers and geometry-nodes group references.
+- Manual image sharing for images used by the active object (packed on arrival).
 - Lease requests/grants with owner notifications.
 - Self-hosted multiplexed relay for cross-network sessions; TLS stays end to end.
 - Tauri desktop shell with native Blender window embedding, control-file bridge, packaging scripts, verified Blender extension install.

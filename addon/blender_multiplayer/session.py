@@ -34,6 +34,7 @@ from typing import Any
 
 if __package__:
     from . import control
+    from .core import image_payload
     from .core import material as material_payload
     from .core import object_payload, protocol, tls
     from .core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, Frame, MessageType
@@ -42,6 +43,7 @@ if __package__:
     from .sync.leases import LeaseManager
 else:  # pragma: no cover - allows importing the module standalone (tests)
     import control
+    from core import image_payload
     from core import material as material_payload
     from core import object_payload, protocol, tls
     from core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, Frame, MessageType
@@ -596,6 +598,16 @@ class SessionService:
             self._emit("modifier_stack", message)
             return
 
+        if frame.type == MessageType.IMAGE_ASSET:
+            try:
+                body = image_payload.decode(frame.payload)
+            except image_payload.ImagePayloadError as exc:
+                raise Violation(str(exc)) from exc
+            body["name"] = clean_name(body.get("name"), "Image")
+            self._broadcast(frame, exclude=peer.peer_id, critical=True)
+            self._emit("image_asset", body)
+            return
+
         raise Violation(f"message type {frame.type} is not accepted by the host")
 
     async def _accept_hello(self, peer: Peer, frame: Frame) -> None:
@@ -1021,6 +1033,13 @@ class SessionService:
                 self._emit("modifier_stack", message)
             return
 
+        if frame.type == MessageType.IMAGE_ASSET:
+            try:
+                self._emit("image_asset", image_payload.decode(frame.payload))
+            except image_payload.ImagePayloadError:
+                pass
+            return
+
         if frame.type == MessageType.ERROR:
             body = self._json(frame, 1024)
             self._emit("error", {"message": clean_text(body.get("message"), 200)})
@@ -1139,6 +1158,15 @@ class SessionService:
         if message is None:
             return
         self._enqueue(protocol.json_frame(MessageType.MODIFIER_STACK, message))
+
+    def send_image(self, name: str, format_hint: str, data: bytes) -> None:
+        try:
+            payload = image_payload.encode(name, format_hint, data)
+        except image_payload.ImagePayloadError:
+            return
+        if len(payload) > MAX_MESH:
+            return
+        self._enqueue(Frame(type=MessageType.IMAGE_ASSET, channel=Channel.BULK, payload=payload))
 
     def request_lease(self, key: str, action: str = "acquire") -> None:
         self._enqueue(protocol.json_frame(MessageType.LEASE, {"key": key, "action": action}))

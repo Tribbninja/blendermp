@@ -21,6 +21,7 @@ if _VENDOR.is_dir() and str(_VENDOR) not in sys.path:
 import json
 import queue
 import socket
+import tempfile
 import time
 import traceback
 import uuid
@@ -33,6 +34,7 @@ from bpy.types import Operator, Panel, PropertyGroup
 from bpy_extras.io_utils import ExportHelper
 
 from . import control, ui
+from .core import image_payload
 from .core import material as material_payload
 from .core import object_payload
 from .session import MAX_MESH, SessionService
@@ -339,6 +341,8 @@ def _handle_event(context, kind: str, body: dict) -> None:
             _push_message(context, "system", f"{body.get('requester', 'someone')} requested edit")
         elif action == "grant":
             _push_message(context, "system", f"Lease granted to {body.get('owner', 'someone')}")
+    elif kind == "image_asset":
+        _apply_image(context, body)
     elif kind == "modifier_stack":
         _apply_modifier_stack(context, body)
     elif kind == "material_update":
@@ -724,6 +728,104 @@ def _apply_modifier_stack(context, body: dict) -> None:
             except Exception:  # noqa: BLE001
                 pass
     runtime["modifier_shadow"][body.get("uuid")] = _modifier_signature(snapshot)
+
+
+# --------------------------------------------------------------------------- images
+IMAGE_FORMATS = {
+    "PNG": "png",
+    "JPEG": "jpg",
+    "BMP": "bmp",
+    "TARGA": "tga",
+    "TIFF": "tif",
+    "OPEN_EXR": "exr",
+    "HDR": "hdr",
+    "WEBP": "webp",
+    "GIF": "gif",
+    "PSD": "psd",
+}
+
+
+def _image_bytes(context, image):
+    format_hint = IMAGE_FORMATS.get(image.file_format, "png")
+    try:
+        if image.packed_file is not None:
+            return bytes(image.packed_file.data), format_hint
+        if image.source == "FILE" and image.filepath:
+            path = bpy.path.abspath(image.filepath)
+            if os.path.isfile(path):
+                with open(path, "rb") as handle:
+                    data = handle.read()
+                extension = os.path.splitext(path)[1].lstrip(".").lower()
+                if extension in image_payload.ALLOWED:
+                    format_hint = extension
+                return data, format_hint
+        handle, path = tempfile.mkstemp(suffix=".png")
+        os.close(handle)
+        try:
+            image.save_render(path, scene=context.scene)
+            with open(path, "rb") as reader:
+                return reader.read(), "png"
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+    return b"", "png"
+
+
+def _apply_image(context, body: dict) -> None:
+    data = body.get("data")
+    if not isinstance(data, (bytes, bytearray)) or not data or len(data) > image_payload.MAX_IMAGE:
+        return
+    format_hint = str(body.get("format", "png")).lower()
+    if format_hint not in image_payload.ALLOWED:
+        format_hint = "png"
+    name = str(body.get("name", "Image"))[:64] or "Image"
+    handle, path = tempfile.mkstemp(suffix="." + format_hint)
+    try:
+        with os.fdopen(handle, "wb") as writer:
+            writer.write(bytes(data))
+        image = bpy.data.images.load(path, check_existing=False)
+        if bpy.data.images.get(name) is not None:
+            index = 1
+            while bpy.data.images.get(f"{name}.{index:03d}") is not None:
+                index += 1
+            name = f"{name}.{index:03d}"
+        image.name = name
+        image.pack()
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def share_active_images(context) -> int:
+    session: SessionService | None = runtime.get("session")
+    if session is None:
+        return 0
+    images = {}
+    obj = context.active_object
+    if obj is not None:
+        for slot in getattr(obj, "material_slots", []) or []:
+            material = slot.material
+            if material is None or not material.use_nodes or material.node_tree is None:
+                continue
+            for node in material.node_tree.nodes:
+                if node.type == "TEX_IMAGE" and node.image is not None:
+                    images[node.image.name] = node.image
+    count = 0
+    for image in images.values():
+        data, format_hint = _image_bytes(context, image)
+        if not data or len(data) > image_payload.MAX_IMAGE:
+            continue
+        session.send_image(image.name, format_hint, data)
+        count += 1
+    return count
 
 
 # --------------------------------------------------------------------------- bpy timer
@@ -1293,6 +1395,20 @@ class BMP_OT_untrack_mesh(Operator):
         return {"FINISHED"}
 
 
+class BMP_OT_share_images(Operator):
+    bl_idname = "bmp.share_images"
+    bl_label = "Share Images"
+    bl_description = "Send images used by the active object's materials to the room"
+
+    def execute(self, context):
+        count = share_active_images(context)
+        if count == 0:
+            self.report({"WARNING"}, "No shareable images on the active object")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Shared {count} image(s)")
+        return {"FINISHED"}
+
+
 class BMP_OT_request_edit(Operator):
     bl_idname = "bmp.request_edit"
     bl_label = "Request Edit"
@@ -1394,6 +1510,7 @@ classes = (
     BMP_OT_untrack_mesh,
     BMP_OT_ping,
     BMP_OT_ping_mark,
+    BMP_OT_share_images,
     BMP_OT_request_edit,
     BMP_OT_grant_edit,
     BMP_OT_export_log,

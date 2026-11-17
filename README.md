@@ -37,6 +37,8 @@ video capture, so it keeps full GPU performance).
 * **Modifier stack sync**: common modifiers (Subdivision, Mirror, Array, Solidify,
   Bevel, Decimate, Triangulate, Smooth, Weld, Screw) and geometry-nodes group
   references, with visibility flags, for the active object.
+* **Image sharing**: send the images used by the active object materials as packed
+  PNG/JPEG/EXR/etc. assets; receivers get a packed image datablock.
 * **Edit leases with request/grant**: request edit on the active object, the owner
   gets a notification and can grant it from the panel or with `/grant <user>`.
 * **Presence, chat and 3D pings** between the addon UI and the desktop app, with
@@ -46,7 +48,7 @@ video capture, so it keeps full GPU performance).
   writes the control request, docks Blender into the stage, shows room code,
   participants, chat, diagnostics and a live verification code.
 
-The protocol and engine have **93 passing tests**, including a real TLS
+The protocol and engine have **97 passing tests**, including a real TLS
 host/client session, certificate-mismatch rejection, relay chat over a
 multiplexed tunnel, and 1,000-vertex delta round-trips under loss/reordering.
 
@@ -91,9 +93,21 @@ code; compare it with the host's.
 scripts/package.ps1
 ```
 
-Produces `dist/blender_multiplayer-<version>.zip` (validated Blender extension)
-and `dist/blendermp-windows-x64-<version>.zip` (release app, addon and docs). The
-extension can be installed with:
+Produces:
+
+* `dist/Blendermp-<version>-Setup.exe` — **Windows installer** (per-user, Start
+  menu/desktop shortcuts, uninstaller, bundled addon).
+* `dist/blendermp-windows-x64-<version>.zip` — portable app + addon + docs.
+* `dist/blender_multiplayer-<version>.zip` — Blender extension (validated),
+  optional if you want to launch Blender outside the app.
+
+Silent install: `Blendermp-0.1.0-Setup.exe /S`.
+
+The installer places the addon next to the app, so **you do not need to install
+the Blender extension** when using the desktop app. Install the extension only if
+you want the addon available in a normal Blender window.
+
+Extension install:
 
 ```powershell
 scripts/install_extension.ps1
@@ -173,7 +187,7 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   `blender --command extension install-file`.
 * The app launches Blender, embeds its window, and reports the live room code,
   fingerprint and verification code.
-* `pytest`: 93 passed.
+* `pytest`: 97 passed.
 
 ## Limitations
 

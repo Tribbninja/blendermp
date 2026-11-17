@@ -87,6 +87,7 @@ class BMP_PT_main(bpy.types.Panel):
         lock_row = box.row(align=True)
         lock_row.operator("bmp.request_edit", text="Request edit", icon="UNLOCKED")
         lock_row.operator("bmp.grant_edit", text="Grant", icon="LOCKED")
+        box.operator("bmp.share_images", text="Share images", icon="IMAGE_DATA")
 
         if settings.state != "offline":
             box = layout.box()
