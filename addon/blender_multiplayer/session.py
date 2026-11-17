@@ -34,14 +34,16 @@ from typing import Any
 
 if __package__:
     from . import control
-    from .core import protocol, tls
+    from .core import material as material_payload
+    from .core import object_payload, protocol, tls
     from .core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, Frame, MessageType
     from .core.roomcode import FLAG_RELAY, decode_room, room_id
     from .net.relay import RelayClientAgent, RelayHostAgent
     from .sync.leases import LeaseManager
 else:  # pragma: no cover - allows importing the module standalone (tests)
     import control
-    from core import protocol, tls
+    from core import material as material_payload
+    from core import object_payload, protocol, tls
     from core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, Frame, MessageType
     from core.roomcode import FLAG_RELAY, decode_room, room_id
     from net.relay import RelayClientAgent, RelayHostAgent
@@ -531,6 +533,60 @@ class SessionService:
             self._emit("ping_mark", message)
             return
 
+        if frame.type == MessageType.OBJECT_CREATE:
+            try:
+                body = object_payload.decode_create(frame.payload)
+            except object_payload.ObjectPayloadError as exc:
+                raise Violation(str(exc)) from exc
+            meta = body["meta"]
+            matrix = meta.get("matrix")
+            if not isinstance(matrix, list) or len(matrix) != 16:
+                raise Violation("object create needs a transform")
+            values = [float(v) for v in matrix]
+            if not all(math.isfinite(v) and abs(v) < 1e12 for v in values):
+                raise Violation("object transform is invalid")
+            meta["matrix"] = values
+            meta["name"] = clean_name(meta.get("name"), "Object")
+            geometry = body["geometry"]
+            if body["kind"] == object_payload.KIND_MESH and geometry:
+                from .core import chunker
+
+                try:
+                    chunker.validate_geometry(geometry, MAX_VERTICES)
+                except ValueError as exc:
+                    raise Violation(str(exc)) from exc
+            elif geometry:
+                raise Violation("only mesh objects may carry geometry")
+            self._broadcast(frame, exclude=peer.peer_id)
+            self._emit("object_create", body)
+            return
+
+        if frame.type == MessageType.OBJECT_DELETE:
+            try:
+                uid = object_payload.decode_delete(frame.payload)
+            except object_payload.ObjectPayloadError as exc:
+                raise Violation(str(exc)) from exc
+            self._broadcast(frame, exclude=peer.peer_id)
+            self._emit("object_delete", {"uuid": uid})
+            return
+
+        if frame.type == MessageType.MATERIAL_UPDATE:
+            body = self._json(frame, 16384)
+            try:
+                uid = str(uuidlib.UUID(str(body.get("uuid"))))
+            except ValueError as exc:
+                raise Violation("invalid material object id") from exc
+            slot = body.get("slot")
+            if not isinstance(slot, int) or isinstance(slot, bool) or not 0 <= slot <= 255:
+                raise Violation("invalid material slot")
+            payload = material_payload.sanitize(body.get("material"))
+            if payload is None:
+                raise Violation("invalid material payload")
+            message = {"uuid": uid, "slot": slot, "material": payload}
+            self._broadcast(protocol.json_frame(MessageType.MATERIAL_UPDATE, message), exclude=peer.peer_id)
+            self._emit("material_update", message)
+            return
+
         raise Violation(f"message type {frame.type} is not accepted by the host")
 
     async def _accept_hello(self, peer: Peer, frame: Frame) -> None:
@@ -843,6 +899,28 @@ class SessionService:
                 )
             return
 
+        if frame.type == MessageType.OBJECT_CREATE:
+            try:
+                self._emit("object_create", object_payload.decode_create(frame.payload))
+            except object_payload.ObjectPayloadError:
+                pass
+            return
+
+        if frame.type == MessageType.OBJECT_DELETE:
+            try:
+                self._emit("object_delete", {"uuid": object_payload.decode_delete(frame.payload)})
+            except object_payload.ObjectPayloadError:
+                pass
+            return
+
+        if frame.type == MessageType.MATERIAL_UPDATE:
+            body = self._json(frame, 16384)
+            payload = material_payload.sanitize(body.get("material"))
+            slot = body.get("slot")
+            if payload is not None and isinstance(slot, int) and 0 <= slot <= 255:
+                self._emit("material_update", {"uuid": body.get("uuid"), "slot": slot, "material": payload})
+            return
+
         if frame.type == MessageType.ERROR:
             body = self._json(frame, 1024)
             self._emit("error", {"message": clean_text(body.get("message"), 200)})
@@ -931,6 +1009,30 @@ class SessionService:
         if len(values) != 3 or not all(math.isfinite(v) and abs(v) < 1e7 for v in values):
             return
         self._enqueue(protocol.json_frame(MessageType.PING_MARK, {"pos": values}))
+
+    def send_object_create(self, uid: str, kind: int, meta: dict, geometry: bytes = b"") -> None:
+        try:
+            payload = object_payload.encode_create(uid, kind, meta, geometry)
+        except object_payload.ObjectPayloadError:
+            return
+        if len(payload) > MAX_MESH:
+            return
+        self._enqueue(Frame(type=MessageType.OBJECT_CREATE, channel=Channel.MESH, payload=payload))
+
+    def send_object_delete(self, uid: str) -> None:
+        try:
+            payload = object_payload.encode_delete(uid)
+        except object_payload.ObjectPayloadError:
+            return
+        self._enqueue(Frame(type=MessageType.OBJECT_DELETE, channel=Channel.CONTROL, payload=payload))
+
+    def send_material(self, uid: str, slot: int, material: dict) -> None:
+        payload = material_payload.sanitize(material)
+        if payload is None or not 0 <= int(slot) <= 255:
+            return
+        self._enqueue(
+            protocol.json_frame(MessageType.MATERIAL_UPDATE, {"uuid": uid, "slot": int(slot), "material": payload})
+        )
 
     def request_lease(self, key: str, action: str = "acquire") -> None:
         self._enqueue(protocol.json_frame(MessageType.LEASE, {"key": key, "action": action}))

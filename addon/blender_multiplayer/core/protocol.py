@@ -50,6 +50,9 @@ class MessageType(IntEnum):
     AUTH = 15
     BYE = 16
     PING_MARK = 17
+    OBJECT_CREATE = 18
+    OBJECT_DELETE = 19
+    MATERIAL_UPDATE = 20
 
 
 class Channel(IntEnum):

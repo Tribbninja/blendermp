@@ -26,16 +26,21 @@ video capture, so it keeps full GPU performance).
   deltas, int16 quantisation, `foreach_set` application with no geometry rebuild.
   Structural edits fall back to a full geometry snapshot (vertices, edges, loops,
   polygons, UVs, smooth flags, material indices).
-* **Object transforms and multiple tracked meshes**: the addon round-robins
-  tracked meshes at 12 Hz and streams transforms at 30 Hz.
+* **Object creation and deletion**: new mesh/empty/camera/light objects are sent
+  with a full geometry snapshot and appear on the other side; deleting sends a
+  UUID tombstone. Transforms stream at 30 Hz and multiple tracked meshes
+  round-robin at 12 Hz.
+* **Basic material sync**: Principled BSDF base colour, metallic, roughness and
+  emission, plus the viewport colour, for the active object. Node graphs and
+  textures are not replicated yet.
 * **Presence, chat and 3D pings** between the addon UI and the desktop app, with
-  latency and bandwidth telemetry, pause-sync and chat commands (`/who`, `/ping`,
-  `/leave`, `/me`).
+  latency and bandwidth telemetry, pause-sync, follow-host frame, and chat
+  commands (`/who`, `/ping`, `/leave`, `/me`).
 * **Desktop shell** (Tauri 2, Rust + static HTML/CSS/JS): launches Blender,
   writes the control request, docks Blender into the stage, shows room code,
   participants, chat, diagnostics and a live verification code.
 
-The protocol and engine have **74 passing tests**, including a real TLS
+The protocol and engine have **90 passing tests**, including a real TLS
 host/client session, certificate-mismatch rejection, relay chat over a
 multiplexed tunnel, and 1,000-vertex delta round-trips under loss/reordering.
 
@@ -162,7 +167,7 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   `blender --command extension install-file`.
 * The app launches Blender, embeds its window, and reports the live room code,
   fingerprint and verification code.
-* `pytest`: 74 passed.
+* `pytest`: 90 passed.
 
 ## Limitations
 
@@ -170,9 +175,10 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   Direct LAN connections still bypass it.
 * Multiple tracked meshes share one 12 Hz polling budget, so many large meshes
   update more slowly.
-* Materials, geometry nodes, images and animation are not replicated yet.
-* One tracked mesh is streamed at a time per tick; objects must already exist in
-  both scenes (no object creation replication yet).
+* Geometry nodes, images, animation and full node graphs are not replicated yet.
+* New objects are replicated for meshes, empties, cameras and lights; curves,
+  font objects and modifiers are not, and collections/parenting are only
+  partially covered.
 * Windows-only window embedding; other platforms run Blender in its own window.
 * Multires is not supported.
 * Alpha software: back up work before a session.

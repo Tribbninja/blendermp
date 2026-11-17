@@ -33,6 +33,8 @@ from bpy.types import Operator, Panel, PropertyGroup
 from bpy_extras.io_utils import ExportHelper
 
 from . import control, ui
+from .core import material as material_payload
+from .core import object_payload
 from .session import MAX_MESH, SessionService
 from .sync import objects as obj_sync
 from .sync.mesh import MeshMirror
@@ -64,6 +66,10 @@ runtime: dict = {
     "last_mesh": 0.0,
     "mesh_cursor": 0,
     "pings": [],
+    "known_objects": set(),
+    "applying_frame": False,
+    "material_shadow": {},
+    "last_material": 0.0,
     "last_presence": 0.0,
     "control_checked": 0.0,
     "started": 0.0,
@@ -104,10 +110,13 @@ class BMPState(PropertyGroup):
     verify_code: StringProperty()
     chat_text: StringProperty()
     sync_mesh: BoolProperty(name="Sync active mesh", default=True)
+    sync_materials: BoolProperty(name="Sync materials", default=True)
     use_relay: BoolProperty(name="Use relay", default=False)
     relay_host: StringProperty(name="Relay host", default="")
     relay_port: IntProperty(name="Relay port", default=7100, min=1024, max=65535)
     paused: BoolProperty(name="Pause sync", default=False)
+    follow_host: BoolProperty(name="Follow host frame", default=False)
+    host_name: StringProperty()
     sync_transforms: BoolProperty(name="Sync object transforms", default=True)
     users: CollectionProperty(type=BMPUser)
     messages: CollectionProperty(type=BMPMessage)
@@ -205,6 +214,7 @@ def start_host(context, code: str | None = None, port: int | None = None) -> Non
     runtime["session"] = session
     runtime["mirrors"].clear()
     runtime["object_shadow"].clear()
+    _prime_objects(context)
     _upsert_user(context, name, tuple(settings.color), host=True)
     _push_message(context, "system", f"Hosting room {code}")
     bpy.app.timers.register(bmp_tick, first_interval=0.05, persistent=True)
@@ -233,6 +243,7 @@ def start_join(context, code: str) -> None:
     runtime["session"] = session
     runtime["mirrors"].clear()
     runtime["object_shadow"].clear()
+    _prime_objects(context)
     _upsert_user(context, name, tuple(settings.color), host=False)
     _push_message(context, "system", f"Joining room {settings.code}")
     bpy.app.timers.register(bmp_tick, first_interval=0.05, persistent=True)
@@ -278,6 +289,7 @@ def _handle_event(context, kind: str, body: dict) -> None:
         _push_message(context, "system", f"Verify host code: {settings.verify_code}")
     elif kind == "welcome":
         settings.state = "connected"
+        settings.host_name = body.get("name", "")
         _push_message(context, "system", "Connected")
         _upsert_user(context, body.get("name", "host"), body.get("color", (1, 1, 1, 1)), host=True)
         for peer in body.get("peers", []):
@@ -303,6 +315,23 @@ def _handle_event(context, kind: str, body: dict) -> None:
                 user.mode = body.get("mode", "")
                 if body.get("name") == settings.name:
                     user.ping_ms = settings.rtt_ms
+        if (
+            settings.follow_host
+            and body.get("name")
+            and body.get("name") == settings.host_name
+            and isinstance(body.get("frame"), int)
+        ):
+            runtime["applying_frame"] = True
+            try:
+                context.scene.frame_current = int(body["frame"])
+            finally:
+                runtime["applying_frame"] = False
+    elif kind == "material_update":
+        _apply_material(context, body)
+    elif kind == "object_create":
+        _apply_object_create(context, body)
+    elif kind == "object_delete":
+        _apply_object_delete(context, body)
     elif kind == "ping_mark":
         body_pos = body.get("pos") or []
         name = body.get("name", "?")
@@ -448,6 +477,118 @@ def _expire_pings(context) -> None:
             pass
 
 
+# --------------------------------------------------------------------------- materials
+def material_values(material) -> dict:
+    base = list(getattr(material, "diffuse_color", (0.8, 0.8, 0.8, 1.0)))[:4]
+    data = {
+        "name": material.name,
+        "base_color": base,
+        "metallic": 0.0,
+        "roughness": 0.5,
+        "emission_color": [0.0, 0.0, 0.0],
+        "emission_strength": 0.0,
+    }
+    if not material.use_nodes or material.node_tree is None:
+        return data
+    for node in material.node_tree.nodes:
+        if node.type != "BSDF_PRINCIPLED":
+            continue
+        inputs = node.inputs
+        try:
+            data["base_color"] = list(inputs["Base Color"].default_value)[:4]
+            data["metallic"] = float(inputs["Metallic"].default_value)
+            data["roughness"] = float(inputs["Roughness"].default_value)
+            for key in ("Emission Color", "Emission"):
+                if key in inputs:
+                    data["emission_color"] = list(inputs[key].default_value)[:3]
+                    break
+            if "Emission Strength" in inputs:
+                data["emission_strength"] = float(inputs["Emission Strength"].default_value)
+        except (KeyError, TypeError, ValueError):
+            pass
+        break
+    return data
+
+
+def _material_signature(data: dict) -> tuple:
+    return (
+        data.get("name"),
+        tuple(data.get("base_color", ())),
+        data.get("metallic"),
+        data.get("roughness"),
+        tuple(data.get("emission_color", ())),
+        data.get("emission_strength"),
+    )
+
+
+def _sync_materials(context) -> None:
+    session: SessionService | None = runtime.get("session")
+    settings = context.window_manager.bmp
+    if session is None or settings.paused or not settings.sync_materials:
+        return
+    now = time.monotonic()
+    if now - runtime["last_material"] < 0.25:
+        return
+    runtime["last_material"] = now
+    obj = context.active_object
+    if obj is None or not getattr(obj, "material_slots", None):
+        return
+    uid = obj.get("bmp_uuid")
+    if not uid:
+        return
+    for index, slot in enumerate(obj.material_slots):
+        material = slot.material
+        if material is None:
+            continue
+        data = material_values(material)
+        signature = _material_signature(data)
+        key = (uid, index)
+        if runtime["material_shadow"].get(key) == signature:
+            continue
+        runtime["material_shadow"][key] = signature
+        session.send_material(uid, index, data)
+
+
+def _apply_material(context, body: dict) -> None:
+    obj = obj_sync.find(body.get("uuid"))
+    if obj is None or getattr(obj, "material_slots", None) is None:
+        return
+    data = material_payload.sanitize(body.get("material"))
+    slot_index = body.get("slot")
+    if data is None or not isinstance(slot_index, int) or slot_index < 0:
+        return
+    while len(obj.material_slots) <= slot_index:
+        if getattr(obj.data, "materials", None) is None:
+            return
+        obj.data.materials.append(None)
+    slot = obj.material_slots[slot_index]
+    material = slot.material
+    if material is None:
+        material = bpy.data.materials.new(data["name"])
+        slot.material = material
+    material.use_nodes = True
+    material.diffuse_color = tuple(data["base_color"])
+    if material.node_tree is not None:
+        for node in material.node_tree.nodes:
+            if node.type != "BSDF_PRINCIPLED":
+                continue
+            inputs = node.inputs
+            try:
+                inputs["Base Color"].default_value = data["base_color"]
+                inputs["Metallic"].default_value = data["metallic"]
+                inputs["Roughness"].default_value = data["roughness"]
+                for key in ("Emission Color", "Emission"):
+                    if key in inputs:
+                        inputs[key].default_value = data["emission_color"]
+                        break
+                if "Emission Strength" in inputs:
+                    inputs["Emission Strength"].default_value = data["emission_strength"]
+            except (KeyError, TypeError, ValueError):
+                pass
+            break
+    runtime["material_shadow"][(body.get("uuid"), slot_index)] = _material_signature(data)
+
+
 # --------------------------------------------------------------------------- bpy timer
 def _poll_control(context) -> None:
     now = time.monotonic()
@@ -499,11 +640,153 @@ def _poll_control(context) -> None:
         traceback.print_exc()
 
 
+# --------------------------------------------------------------------------- objects
+def _object_kind(obj) -> int:
+    if obj.type == "MESH":
+        return object_payload.KIND_MESH
+    if obj.type == "CAMERA":
+        return object_payload.KIND_CAMERA
+    if obj.type == "LIGHT":
+        return object_payload.KIND_LIGHT
+    return object_payload.KIND_EMPTY
+
+
+def _prime_objects(context) -> None:
+    known = set()
+    for obj in context.scene.objects:
+        if obj.get("bmp_ping"):
+            continue
+        uid = obj.get("bmp_uuid")
+        if not uid:
+            uid = str(uuid.uuid4())
+            obj["bmp_uuid"] = uid
+        known.add(uid)
+    runtime["known_objects"] = known
+
+
+def _send_object_create(session: SessionService, obj) -> None:
+    uid = obj.get("bmp_uuid") or str(uuid.uuid4())
+    obj["bmp_uuid"] = uid
+    kind = _object_kind(obj)
+    matrix = [float(value) for row in obj.matrix_world for value in row]
+    meta = {
+        "name": obj.name[:48],
+        "matrix": matrix,
+        "parent": obj.parent.get("bmp_uuid") if obj.parent else None,
+    }
+    geometry = b""
+    if kind == object_payload.KIND_MESH:
+        mirror = runtime["mirrors"].get(uid)
+        if mirror is None:
+            mirror = MeshMirror()
+            runtime["mirrors"][uid] = mirror
+        try:
+            geometry = mirror.full_snapshot(obj.data)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+            geometry = b""
+    elif kind == object_payload.KIND_CAMERA:
+        meta["lens"] = float(obj.data.lens)
+    elif kind == object_payload.KIND_LIGHT:
+        meta["light_type"] = obj.data.type
+        meta["energy"] = float(obj.data.energy)
+        meta["color"] = list(obj.data.color)[:3]
+    try:
+        session.send_object_create(uid, kind, meta, geometry)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+
+
+def _apply_object_create(context, body: dict) -> None:
+    uid = body.get("uuid")
+    if not uid or obj_sync.find(uid):
+        return
+    kind = body.get("kind")
+    meta = body.get("meta") or {}
+    name = str(meta.get("name", "Object"))[:48] or "Object"
+
+    try:
+        if kind == object_payload.KIND_MESH:
+            mesh = bpy.data.meshes.new(name)
+            obj = bpy.data.objects.new(name, mesh)
+            mirror = MeshMirror()
+            mirror.apply_snapshot(mesh, body.get("geometry", b""))
+            runtime["mirrors"][uid] = mirror
+        elif kind == object_payload.KIND_CAMERA:
+            data = bpy.data.cameras.new(name)
+            obj = bpy.data.objects.new(name, data)
+            if isinstance(meta.get("lens"), (int, float)):
+                data.lens = max(1.0, min(500.0, float(meta["lens"])))
+        elif kind == object_payload.KIND_LIGHT:
+            light_type = meta.get("light_type")
+            if light_type not in {"POINT", "SUN", "SPOT", "AREA"}:
+                light_type = "POINT"
+            data = bpy.data.lights.new(name, type=light_type)
+            obj = bpy.data.objects.new(name, data)
+            if isinstance(meta.get("energy"), (int, float)):
+                data.energy = max(0.0, min(1e6, float(meta["energy"])))
+            color = meta.get("color")
+            if isinstance(color, list) and len(color) == 3:
+                data.color = [max(0.0, min(1.0, float(v))) for v in color]
+        else:
+            obj = bpy.data.objects.new(name, None)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return
+
+    context.scene.collection.objects.link(obj)
+    obj["bmp_uuid"] = uid
+    runtime["known_objects"].add(uid)
+    obj_sync.apply(uid, meta.get("matrix", []))
+    parent_uid = meta.get("parent")
+    if parent_uid:
+        parent = obj_sync.find(parent_uid)
+        if parent is not None:
+            obj.parent = parent
+            obj_sync.apply(uid, meta.get("matrix", []))
+
+
+def _apply_object_delete(context, body: dict) -> None:
+    uid = body.get("uuid")
+    if not uid:
+        return
+    obj = obj_sync.find(uid)
+    runtime["known_objects"].discard(uid)
+    runtime["mirrors"].pop(uid, None)
+    runtime["object_shadow"].pop(uid, None)
+    if obj is None:
+        return
+    if context.active_object is obj and context.mode != "OBJECT":
+        return
+    mesh = obj.data if obj.type == "MESH" else None
+    try:
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if mesh is not None and mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+
+
 def _sync_transforms(context) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
     if session is None or not settings.sync_transforms or settings.paused:
         return
+    known = runtime["known_objects"]
+    current = set()
+    for obj in context.scene.objects:
+        if obj.get("bmp_ping"):
+            continue
+        uid = obj.get("bmp_uuid")
+        if not uid:
+            uid = str(uuid.uuid4())
+            obj["bmp_uuid"] = uid
+            _send_object_create(session, obj)
+        current.add(uid)
+    for uid in list(known - current):
+        session.send_object_delete(uid)
+    runtime["known_objects"] = current
+
     shadow: dict = runtime["object_shadow"]
     seen = set()
     for obj in context.scene.objects:
@@ -571,6 +854,21 @@ def _sync_mesh(context) -> None:
     if delta is not None:
         rev, payload = delta
         session.send_mesh(obj, "delta", payload, rev)
+
+
+def on_frame_change(scene) -> None:
+    if runtime.get("applying_frame"):
+        return
+    session: SessionService | None = runtime.get("session")
+    if session is None:
+        return
+    session.send_presence(
+        {
+            "scene": scene.name,
+            "frame": scene.frame_current,
+            "mode": bpy.context.mode if bpy.context else "OBJECT",
+        }
+    )
 
 
 def _send_presence(context) -> None:
@@ -651,6 +949,7 @@ def bmp_tick():
         if session is not None:
             _sync_transforms(context)
             _sync_mesh(context)
+            _sync_materials(context)
             _send_presence(context)
             _write_status(context)
             if session.failed:
@@ -898,6 +1197,7 @@ def register() -> None:
     ui.register()
     runtime["started"] = time.monotonic()
     bpy.app.timers.register(bmp_tick, first_interval=0.5, persistent=True)
+    bpy.app.handlers.frame_change_post.append(on_frame_change)
 
 
 def unregister() -> None:
