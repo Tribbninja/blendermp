@@ -17,7 +17,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetForegroundWindow, SetParent,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, GetWindowRect, GetClassNameW, PostMessageW, WM_CLOSE,
     BringWindowToTop,
-    GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOW,
+    GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SWP_NOACTIVATE, SWP_ASYNCWINDOWPOS, SW_SHOW,
     WS_CAPTION, WS_CHILD, WS_POPUP, WS_THICKFRAME,
 };
 
@@ -182,7 +182,7 @@ fn position(
             y,
             width,
             height,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
         )
     };
     if ok == 0 {

@@ -235,8 +235,16 @@ function scheduleBounds() {
   });
 }
 
+let boundsBusy = false;
+let boundsPending = false;
+
 async function updateBounds() {
   if (!isTauri || !state.embedded) return;
+  if (boundsBusy) {
+    boundsPending = true;
+    return;
+  }
+  boundsBusy = true;
   try {
     const box = insets();
     await invoke("set_embed_bounds", {
@@ -251,6 +259,12 @@ async function updateBounds() {
     log(`bounds failed: ${error}`);
     state.embedded = false;
     renderEmbed();
+  } finally {
+    boundsBusy = false;
+    if (boundsPending) {
+      boundsPending = false;
+      scheduleBounds();
+    }
   }
 }
 
