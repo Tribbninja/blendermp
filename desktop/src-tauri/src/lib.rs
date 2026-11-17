@@ -198,7 +198,15 @@ fn find_blender_window(state: State<AppState>) -> Result<Option<i64>, String> {
 }
 
 #[tauri::command]
-fn embed_blender(state: State<AppState>, left_px: f64, top_px: f64, right_px: f64, bottom_px: f64) -> Result<(), String> {
+fn embed_blender(
+    state: State<AppState>,
+    left_px: f64,
+    top_px: f64,
+    right_px: f64,
+    bottom_px: f64,
+    viewport_w: f64,
+    viewport_h: f64,
+) -> Result<(), String> {
     #[cfg(windows)]
     {
         let pid = *state.blender_pid.lock().map_err(|_| "state lock poisoned".to_string())?;
@@ -212,19 +220,30 @@ fn embed_blender(state: State<AppState>, left_px: f64, top_px: f64, right_px: f6
             top_px.max(0.0).round() as i32,
             right_px.max(0.0).round() as i32,
             bottom_px.max(0.0).round() as i32,
+            viewport_w,
+            viewport_h,
         )?;
         *state.embedded.lock().map_err(|_| "state lock poisoned".to_string())? = Some(info);
+        let _ = win_embed::dismiss_splash(pid);
         Ok(())
     }
     #[cfg(not(windows))]
     {
-        let _ = (state, left_px, top_px, right_px, bottom_px);
+        let _ = (state, left_px, top_px, right_px, bottom_px, viewport_w, viewport_h);
         Err("native embedding is Windows-only; Blender runs in its own window".into())
     }
 }
 
 #[tauri::command]
-fn set_embed_bounds(state: State<AppState>, left_px: f64, top_px: f64, right_px: f64, bottom_px: f64) -> Result<(), String> {
+fn set_embed_bounds(
+    state: State<AppState>,
+    left_px: f64,
+    top_px: f64,
+    right_px: f64,
+    bottom_px: f64,
+    viewport_w: f64,
+    viewport_h: f64,
+) -> Result<(), String> {
     #[cfg(windows)]
     {
         let guard = state.embedded.lock().map_err(|_| "state lock poisoned".to_string())?;
@@ -235,11 +254,13 @@ fn set_embed_bounds(state: State<AppState>, left_px: f64, top_px: f64, right_px:
             top_px.max(0.0).round() as i32,
             right_px.max(0.0).round() as i32,
             bottom_px.max(0.0).round() as i32,
+            viewport_w,
+            viewport_h,
         )
     }
     #[cfg(not(windows))]
     {
-        let _ = (state, left_px, top_px, right_px, bottom_px);
+        let _ = (state, left_px, top_px, right_px, bottom_px, viewport_w, viewport_h);
         Ok(())
     }
 }

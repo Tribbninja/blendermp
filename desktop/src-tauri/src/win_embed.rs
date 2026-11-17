@@ -10,13 +10,13 @@
 //! * The caller passes the bounds; they are clamped to sane minimums.
 //! * The original window style is restored on detach.
 
-use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
-use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClientRect, GetWindow, GetWindowLongPtrW, GetWindowTextLengthW,
     GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetForegroundWindow, SetParent,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SWP_NOACTIVATE,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOW, WS_CAPTION, WS_CHILD, WS_POPUP, WS_THICKFRAME,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, GetWindowRect, GetClassNameW, PostMessageW, WM_CLOSE,
+    GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOW,
+    WS_CAPTION, WS_CHILD, WS_POPUP, WS_THICKFRAME,
 };
 
 struct Search {
@@ -103,6 +103,8 @@ pub fn embed(
     top_px: i32,
     right_px: i32,
     bottom_px: i32,
+    viewport_w: f64,
+    viewport_h: f64,
 ) -> Result<EmbedInfo, String> {
     let child = child_handle as HWND;
     let parent = parent_handle as HWND;
@@ -131,7 +133,7 @@ pub fn embed(
         }
     }
 
-    position(child, parent, left_px, top_px, right_px, bottom_px)?;
+    position(child, parent, left_px, top_px, right_px, bottom_px, viewport_w, viewport_h)?;
     unsafe {
         let _ = ShowWindow(child, SW_SHOW);
     }
@@ -151,27 +153,30 @@ fn position(
     top_px: i32,
     right_px: i32,
     bottom_px: i32,
+    viewport_w: f64,
+    viewport_h: f64,
 ) -> Result<(), String> {
     let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
     if unsafe { GetClientRect(parent, &mut rect) } == 0 {
         return Err("GetClientRect failed".into());
     }
-    let mut origin = POINT { x: 0, y: 0 };
-    unsafe {
-        let _ = ClientToScreen(parent, &mut origin);
-    }
-
-    let left = left_px.max(0);
-    let top = top_px.max(0);
-    let width = (rect.right - rect.left - left - right_px.max(0)).max(320);
-    let height = (rect.bottom - rect.top - top - bottom_px.max(0)).max(240);
+    let client_w = (rect.right - rect.left) as f64;
+    let client_h = (rect.bottom - rect.top) as f64;
+    let scale_x = (client_w / viewport_w.max(1.0)).clamp(0.25, 4.0);
+    let scale_y = (client_h / viewport_h.max(1.0)).clamp(0.25, 4.0);
+    let left = ((left_px.max(0) as f64) * scale_x).round() as i32;
+    let top = ((top_px.max(0) as f64) * scale_y).round() as i32;
+    let right = ((right_px.max(0) as f64) * scale_x).round() as i32;
+    let bottom = ((bottom_px.max(0) as f64) * scale_y).round() as i32;
+    let width = (rect.right - rect.left - left - right).max(320);
+    let height = (rect.bottom - rect.top - top - bottom).max(240);
 
     let ok = unsafe {
         SetWindowPos(
             child,
             std::ptr::null_mut(),
-            origin.x + left,
-            origin.y + top,
+            left,
+            top,
             width,
             height,
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
@@ -189,13 +194,15 @@ pub fn resize(
     top_px: i32,
     right_px: i32,
     bottom_px: i32,
+    viewport_w: f64,
+    viewport_h: f64,
 ) -> Result<(), String> {
     let child = info.hwnd as HWND;
     let parent = info.parent as HWND;
     if unsafe { IsWindow(child) } == 0 || unsafe { IsWindow(parent) } == 0 {
         return Err(format!("window was closed (child={}, parent={})", info.hwnd, info.parent));
     }
-    position(child, parent, left_px, top_px, right_px, bottom_px)
+    position(child, parent, left_px, top_px, right_px, bottom_px, viewport_w, viewport_h)
 }
 
 pub fn detach(info: &EmbedInfo) {
@@ -206,6 +213,51 @@ pub fn detach(info: &EmbedInfo) {
         SetWindowLongPtrW(child, GWL_EXSTYLE, info.exstyle);
         let _ = ShowWindow(child, SW_SHOW);
     }
+}
+
+pub fn dismiss_splash(pid: u32) -> usize {
+    // After the main Blender window becomes a child, any remaining top-level
+    // GHOST window for its process is the startup splash. Close it with WM_CLOSE
+    // rather than killing the process.
+    struct Search {
+        pid: u32,
+        count: usize,
+    }
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let search = &mut *(lparam as *mut Search);
+        let mut window_pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut window_pid);
+        if window_pid != search.pid || IsWindowVisible(hwnd) == 0 {
+            return 1;
+        }
+        let mut class_buffer = [0u16; 128];
+        let class_length = GetClassNameW(hwnd, class_buffer.as_mut_ptr(), class_buffer.len() as i32);
+        if class_length <= 0 {
+            return 1;
+        }
+        let class_name = String::from_utf16_lossy(&class_buffer[..class_length as usize]);
+        if class_name != "GHOST_WindowClass" {
+            return 1;
+        }
+        let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            return 1;
+        }
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        // Splash windows are centered and modest; avoid closing large tool windows.
+        if (360..=1600).contains(&width) && (180..=1000).contains(&height) {
+            let _ = PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            search.count += 1;
+        }
+        1
+    }
+
+    let mut search = Search { pid, count: 0 };
+    unsafe {
+        let _ = EnumWindows(Some(callback), &mut search as *mut Search as LPARAM);
+    }
+    search.count
 }
 
 pub fn focus(info: &EmbedInfo) {

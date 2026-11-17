@@ -46,7 +46,7 @@
           <div class="statusline">
             <span class="dot" id="stateDot"></span>
             <span id="stateLabel">Offline</span>
-            <span class="sep">·</span>
+            <span class="sep">&middot;</span>
             <span id="latency">no session</span>
           </div>
         </div>
@@ -68,7 +68,7 @@
           <div class="codebox" id="codeBox" hidden>
             <div class="code-label">Room code</div>
             <div class="code-row">
-              <code id="roomCode">—</code>
+              <code id="roomCode">&mdash;</code>
               <button class="icon-btn" id="copyBtn" title="Copy code">
                 <svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15V6a2 2 0 0 1 2-2h9" /></svg>
               </button>
@@ -90,7 +90,7 @@
           <div class="actions" id="activeActions" hidden>
             <button class="btn primary" id="launchBtn">
               <svg viewBox="0 0 24 24"><path d="M12 3v12M7 8l5-5 5 5M4 17v3h16v-3" /></svg>
-              Launch Blender
+              <span id="launchLabel">Launch Blender</span>
             </button>
             <button class="btn ghost danger" id="leaveBtn">Leave</button>
           </div>
@@ -117,14 +117,14 @@
             <span class="live" id="liveLabel">idle</span>
           </div>
           <div class="stats">
-            <div><b id="pingValue">—</b><span>ms</span><small>latency</small></div>
+            <div><b id="pingValue">&mdash;</b><span>ms</span><small>latency</small></div>
             <div><b id="downValue">0</b><span>KB/s</span><small>in</small></div>
             <div><b id="upValue">0</b><span>KB/s</span><small>out</small></div>
           </div>
           <canvas id="spark" width="300" height="52"></canvas>
           <div class="diag-foot">
             <span id="blenderLabel">Blender not detected</span>
-            <span id="secureLabel" class="secure">TLS 1.3 · pinned</span>
+            <span id="secureLabel" class="secure">TLS 1.3 &middot; pinned</span>
           </div>
         </section>
       </div>
@@ -230,7 +230,7 @@
             <div class="step"><span>2</span>Launch Blender</div>
             <div class="step"><span>3</span>It docks right here</div>
           </div>
-          <div class="stage-hint" id="stageHint">Detecting Blender…</div>
+          <div class="stage-hint" id="stageHint">Detecting Blender...</div>
         </div>
       </div>
 
@@ -256,7 +256,7 @@
         <div class="message empty">Nothing said yet. Say hi.</div>
       </div>
       <form class="composer" id="chatForm">
-        <input id="chatInput" placeholder="Message the room…" maxlength="2000" autocomplete="off" />
+        <input id="chatInput" placeholder="Message the room..." maxlength="2000" autocomplete="off" />
         <button class="send" type="submit" title="Send">
           <svg viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-2.5-6.5L4 12z" /></svg>
         </button>

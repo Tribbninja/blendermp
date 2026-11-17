@@ -101,7 +101,7 @@ const demoStatus = {
   ],
   messages: [
     { author: "maya", text: "the hand retopo is on the right, take a look", stamp: "14:02" },
-    { author: "rowan", text: "pinging the ear seam â€” one sec", stamp: "14:03" },
+    { author: "rowan", text: "pinging the ear seam - one sec", stamp: "14:03" },
     { author: "isaac", text: "sending the updated blockout now", stamp: "14:04" },
   ],
 };
@@ -216,6 +216,8 @@ async function updateBounds() {
       topPx: box.top,
       rightPx: box.right,
       bottomPx: box.bottom,
+      viewportW: box.viewportW,
+      viewportH: box.viewportH,
     });
   } catch (error) {
     log(`bounds failed: ${error}`);
@@ -225,17 +227,21 @@ async function updateBounds() {
 }
 
 function insets() {
-  const dpr = window.devicePixelRatio || 1;
   const sidebar = document.querySelector(".sidebar").getBoundingClientRect();
   const chrome = document.querySelector(".stage-chrome").getBoundingClientRect();
   const bar = document.querySelector(".statusbar").getBoundingClientRect();
   const chat = document.querySelector(".chatpanel");
   const chatVisible = chat && chat.offsetWidth > 0 && !app.classList.contains("chat-closed");
+  // CSS pixels plus the CSS viewport size. The native side converts to physical
+  // pixels using the real client-size / viewport ratio, so it is correct whether
+  // or not the process is DPI aware.
   return {
-    left: Math.round(sidebar.right * dpr),
-    top: Math.round(chrome.bottom * dpr),
-    right: Math.round((chatVisible ? window.innerWidth - chat.getBoundingClientRect().left : 0) * dpr),
-    bottom: Math.round((window.innerHeight - bar.top) * dpr),
+    left: Math.round(sidebar.right),
+    top: Math.round(chrome.bottom),
+    right: Math.round(chatVisible ? window.innerWidth - chat.getBoundingClientRect().left : 0),
+    bottom: Math.round(window.innerHeight - bar.top),
+    viewportW: window.innerWidth,
+    viewportH: window.innerHeight,
   };
 }
 
@@ -257,14 +263,22 @@ function renderState(status) {
   $("detachChip").hidden = !active || !state.embedded;
   $("focusBtn").hidden = !state.embedded;
 
-  $("heroEyebrow").textContent = active ? (value === "connected" ? "Session live" : "Starting up") : "Get started";
+  $("heroEyebrow").textContent = active
+    ? value === "joining"
+      ? "Connecting"
+      : "Session live"
+    : "Get started";
   $("heroTitle").textContent = active
     ? value === "connected"
       ? "You're in the room"
-      : "Warming up Blender"
+      : value === "hosting"
+        ? "Your room is live"
+        : "Connecting to the host"
     : "Start a room";
   $("heroSub").textContent = active
-    ? "Share the code. Everyone connects over TLS 1.3 and the host validates every edit."
+    ? value === "hosting"
+      ? "Share the code. Blender is docked here; the host validates every edit."
+      : "Share the code. Everyone connects over TLS 1.3 and the host validates every edit."
     : "One click launches Blender, starts the session and embeds it right here.";
 
   const code = status?.code || "";
@@ -279,16 +293,16 @@ function renderState(status) {
   $("meAvatar").title = name;
 
   const rtt = Number(status?.rtt_ms || 0);
-  $("pingValue").textContent = rtt > 0 ? String(Math.round(rtt)) : "â€”";
+  $("pingValue").textContent = rtt > 0 ? String(Math.round(rtt)) : "-";
   $("latency").textContent = rtt > 0 ? `${Math.round(rtt)} ms` : active ? "measuring" : "no session";
 
   const blender = status?.blender;
   $("blenderLabel").textContent = blender ? `Blender ${blender}` : settings.blender ? "Blender ready" : "Blender not detected";
   $("statusRight").textContent = blender ? `Blender ${blender}` : "v0.1.0";
-  $("stageMode").textContent = state.embedded ? "embedded Â· native" : active ? "Blender separate" : "no Blender window";
-  $("statusLeft").textContent = active ? `${labels[value]} Â· ${code || "no code"}` : "Ready";
+  $("stageMode").textContent = state.embedded ? "embedded - native" : active ? "Blender separate" : "no Blender window";
+  $("statusLeft").textContent = active ? `${labels[value]} - ${code || "no code"}` : "Ready";
   $("statusMid").textContent = status?.relay ? "relay mode" : state.embedded ? "GPU passthrough" : "";
-  $("stageHint").textContent = settings.blender ? "Blender is ready to launch." : "Blender not detected â€” set the path in Settings.";
+  $("stageHint").textContent = settings.blender ? "Blender is ready to launch." : "Blender not detected - set the path in Settings.";
 
   if (!active) {
     $("chatSub").textContent = "Messages sync with Blender";
@@ -449,7 +463,11 @@ function renderEmbed() {
   $("embedChip").hidden = !isActive(state.status) || state.embedded;
   $("detachChip").hidden = !state.embedded;
   $("focusBtn").hidden = !state.embedded;
-  $("stageMode").textContent = state.embedded ? "embedded Â· native" : isActive(state.status) ? "Blender separate" : "no Blender window";
+  $("embedBtn").hidden = state.embedded;
+  $("detachBtn").hidden = !state.embedded;
+  const launchLabel = $("launchLabel");
+  if (launchLabel) launchLabel.textContent = state.embedded ? "Focus Blender" : "Launch Blender";
+  $("stageMode").textContent = state.embedded ? "embedded - native" : isActive(state.status) ? "Blender separate" : "no Blender window";
 }
 
 function applyStatus(status) {
@@ -464,7 +482,7 @@ function applyStatus(status) {
 /* ------------------------------------------------------------------ actions */
 async function detectBlender() {
   if (!isTauri) {
-    toast("Browser demo mode â€” desktop features are off", "error");
+    toast("Browser demo mode - desktop features are off", "error");
     return;
   }
   try {
@@ -477,7 +495,7 @@ async function detectBlender() {
       $("setBlender").value = path;
       $("stageHint").textContent = "Blender is ready to launch.";
     } else {
-      toast("Blender not found â€” set the path in Settings", "error");
+      toast("Blender not found - set the path in Settings", "error");
     }
   } catch (error) {
     log(`detect_blender failed: ${error}`);
@@ -496,7 +514,7 @@ async function launchBlender() {
   try {
     const pid = await invoke("launch_blender", { path: settings.blender, blendFile: null });
     log(`launch_blender ok pid=${pid}`);
-    toast("Blender launchingâ€¦", "ok");
+    toast("Blender launching...", "ok");
   } catch (error) {
     log(`launch_blender failed: ${error}`);
     toast(String(error), "error");
@@ -531,7 +549,7 @@ async function hostRoom() {
       relay: settings.useRelay ? settings.relay : null,
       use_relay: settings.useRelay,
     });
-    toast("Room startingâ€¦", "ok");
+    toast("Room starting...", "ok");
     await launchBlender();
   } catch (error) {
     toast(String(error), "error");
@@ -550,7 +568,7 @@ async function joinRoom() {
   store.set("name", name);
   try {
     await request({ action: "join", code, name, pin: pin || null });
-    toast("Joining roomâ€¦", "ok");
+    toast("Joining room...", "ok");
     setPanel("session");
     await launchBlender();
   } catch (error) {
@@ -575,6 +593,8 @@ async function embedNow() {
       topPx: box.top,
       rightPx: box.right,
       bottomPx: box.bottom,
+      viewportW: box.viewportW,
+      viewportH: box.viewportH,
     });
     state.embedded = true;
     renderEmbed();
@@ -609,7 +629,7 @@ async function sendChat(event) {
 
 async function copyCode() {
   const code = $("roomCode").textContent;
-  if (!code || code === "â€”") return;
+  if (!code || code === "-") return;
   try {
     await navigator.clipboard.writeText(code);
     toast("Room code copied", "ok");
@@ -656,6 +676,8 @@ async function embedLoop() {
       topPx: box.top,
       rightPx: box.right,
       bottomPx: box.bottom,
+      viewportW: box.viewportW,
+      viewportH: box.viewportH,
     });
     state.embedded = true;
     renderEmbed();
@@ -675,7 +697,13 @@ function wire() {
   $("joinGo").addEventListener("click", joinRoom);
   $("settingsClose").addEventListener("click", () => setPanel("session"));
   $("leaveBtn").addEventListener("click", leaveRoom);
-  $("launchBtn").addEventListener("click", launchBlender);
+  $("launchBtn").addEventListener("click", () => {
+    if (state.embedded) {
+      invoke("focus_blender").catch(() => {});
+      return;
+    }
+    launchBlender();
+  });
   $("embedBtn").addEventListener("click", embedNow);
   $("detachBtn").addEventListener("click", detachNow);
   $("embedChip").addEventListener("click", embedNow);
