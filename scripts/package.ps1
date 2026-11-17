@@ -41,6 +41,11 @@ if ($LASTEXITCODE -ne 0) { throw 'release build failed' }
 $appDir = Join-Path $dist 'blendermp'
 New-Item -ItemType Directory -Force -Path $appDir | Out-Null
 Copy-Item (Join-Path $env:CARGO_TARGET_DIR 'release\blendermp.exe') $appDir
+# The GNU build links WebView2Loader.dll dynamically. Ship it next to the exe
+# so the app does not depend on another program having it on PATH.
+$loader = Join-Path $env:CARGO_TARGET_DIR 'release\WebView2Loader.dll'
+if (-not (Test-Path $loader)) { throw 'WebView2Loader.dll was not produced by the release build' }
+Copy-Item $loader $appDir
 Copy-Item (Join-Path $root 'addon') (Join-Path $appDir 'addon') -Recurse
 Get-ChildItem (Join-Path $appDir 'addon') -Directory -Filter '__pycache__' -Recurse | Remove-Item -Recurse -Force
 Copy-Item (Join-Path $root 'README.md') $appDir
