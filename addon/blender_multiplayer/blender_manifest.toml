@@ -1,0 +1,19 @@
+schema_version = "1.0.0"
+id = "blender_multiplayer"
+version = "0.1.0"
+name = "Blendermp"
+tagline = "Low-latency collaborative Blender sessions over TLS"
+maintainer = "Blendermp"
+type = "add-on"
+tags = ["Network", "Collaboration", "3D View"]
+blender_version_min = "5.0.0"
+license = ["SPDX:MIT"]
+permissions = ["network", "files", "clipboard"]
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "*.pyc",
+  ".pytest_cache/",
+  "tests/",
+]

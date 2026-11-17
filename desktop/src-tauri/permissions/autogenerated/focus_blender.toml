@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-focus-blender"
+description = "Enables the focus_blender command without any pre-configured scope."
+commands.allow = ["focus_blender"]
+
+[[permission]]
+identifier = "deny-focus-blender"
+description = "Denies the focus_blender command without any pre-configured scope."
+commands.deny = ["focus_blender"]

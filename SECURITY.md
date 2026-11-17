@@ -1,0 +1,85 @@
+# Security model
+
+Blendermp is an early alpha. This document describes the guarantees it aims to
+provide and the ones it does not provide yet.
+
+## Trust model
+
+* **The host is authoritative.** All clients connect to the host over TLS 1.3 in
+  a star topology. Clients never talk to each other directly.
+* **Transport security is standard TLS 1.3** using Python's `ssl` module. There
+  is no application-level encryption and no bespoke cryptography in this
+  project.
+* **The host certificate is pinned.** The host generates a self-signed
+  certificate in `%LOCALAPPDATA%\Blendermp\certs` (owner-only permissions).
+  Joiners pin its SHA-256 fingerprint on first connection (TOFU) and compare the
+  short verification code shown in both UIs. A changed certificate is refused,
+  not silently trusted.
+* **The room code is an endpoint locator, not a secret.** It encodes the host's
+  IPv4 address and TCP port. It is not used to derive keys.
+* **An optional PIN** is verified server-side in constant time, with rate
+  limiting. It is held in memory for the session and never written to disk.
+
+## What the host validates
+
+Untrusted input is rejected before it reaches Blender:
+
+* frame magic, version, length, CRC;
+* message type and direction (clients cannot send host-only messages);
+* per-peer token-bucket rate limits and connection strikes;
+* JSON payload size (control ≤ 64 KB) and shape;
+* chat length (≤ 2,000 chars) and control-character stripping;
+* transform payloads: exactly 80 bytes, finite floats, bounded magnitude;
+* mesh payloads: ≤ 8 MB, ≤ 5,000,000 vertices, structural validation of delta
+  headers and snapshot lengths before relay;
+* object leases: a peer cannot edit an object leased to someone else;
+* names and colours: assigned by the host after authentication, made unique, so
+  a client cannot impersonate another participant;
+* relayed messages: the host sets the `from` identity itself.
+
+Backpressure is bounded: stale transforms are dropped, peers that cannot keep up
+are disconnected instead of growing an unbounded queue.
+
+## Local control channel
+
+The desktop app drives the addon through two JSON files in
+`%LOCALAPPDATA%\Blendermp`. That is a local trust boundary, so:
+
+* `session.json` is size-limited and schema-validated, with a strict action
+  allowlist (`host`, `join`, `leave`, `chat`) and a nonce;
+* only a valid 15-character room code is accepted;
+* no file paths, script fragments or arbitrary arguments are accepted;
+* status writes are atomic and bounded;
+* the Rust side validates the same inputs again before writing.
+
+## Desktop app
+
+* Strict CSP: no remote content, no inline scripts, no `eval` in our code.
+* Minimal Tauri capability list; only the commands the app needs are allowed.
+* The embedded window must belong to the Blender process the app launched, and
+  only a window whose title matches Blender is accepted.
+* Blender is launched with a fixed `--python-expr` and an allowlisted addon
+  path; no shell, no arbitrary arguments from the webview.
+* Release builds disable devtools.
+
+## Known limitations
+
+* **First-connection TOFU.** If an attacker can intercept the very first
+  connection and the user skips the verification-code comparison, they can
+  impersonate the host. Verify the code for untrusted networks.
+* **The host sees the scene.** This is cooperative editing, not
+  zero-knowledge sharing.
+* **LAN discovery leaks the code and display name to the local subnet.** That is
+  inherent to zero-config discovery; use a non-LAN room if that matters.
+* **No relay yet.** Cross-network sessions currently need a reachable host
+  (port forward, IPv6, or a VPN overlay). A self-hosted relay is on the roadmap.
+* **No certificate rotation UI.** Certificates rotate automatically after 30
+  days; peers must re-verify the new code.
+* **No independent security audit.** Do not use this for sensitive production
+  work yet.
+
+## Reporting
+
+Open an issue with a minimal reproduction. Do not include private keys, room
+PINs or captured scene data. If the report is sensitive, say so and a private
+channel will be arranged.

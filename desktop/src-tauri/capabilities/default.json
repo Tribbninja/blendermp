@@ -1,0 +1,20 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Minimal capability set for the main window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "allow-detect-blender",
+    "allow-launch-blender",
+    "allow-find-blender-window",
+    "allow-embed-blender",
+    "allow-set-embed-bounds",
+    "allow-detach-blender",
+    "allow-focus-blender",
+    "allow-read-status",
+    "allow-startup-flags",
+    "allow-write-session",
+    "allow-log-client"
+  ]
+}

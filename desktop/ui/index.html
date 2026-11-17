@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Blendermp</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app" id="app">
+    <nav class="rail">
+      <div class="logo" title="Blendermp">
+        <svg viewBox="0 0 32 32" aria-hidden="true">
+          <defs>
+            <linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#6ee7ff" />
+              <stop offset="1" stop-color="#8b5cf6" />
+            </linearGradient>
+          </defs>
+          <rect x="1" y="1" width="30" height="30" rx="9" fill="url(#lg)" opacity="0.16" />
+          <path d="M9 8h8a5 5 0 0 1 0 10H9z" fill="none" stroke="url(#lg)" stroke-width="2.4" stroke-linejoin="round" />
+          <path d="M9 18h9a4 4 0 0 1 0 8H9z" fill="none" stroke="url(#lg)" stroke-width="2.4" stroke-linejoin="round" />
+        </svg>
+      </div>
+
+      <button class="rail-btn active" data-view="session" title="Session">
+        <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10" /></svg>
+      </button>
+      <button class="rail-btn" data-view="chat" title="Chat">
+        <svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-8 8H7l-4 3v-7a8 8 0 0 1 8-8h2a8 8 0 0 1 8 4z" /></svg>
+      </button>
+      <button class="rail-btn" data-view="settings" title="Settings">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" /><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1" /></svg>
+      </button>
+
+      <div class="rail-spacer"></div>
+
+      <div class="rail-pill" id="railState" title="offline"></div>
+      <div class="avatar" id="meAvatar" title="You">A</div>
+    </nav>
+
+    <aside class="sidebar">
+      <header class="brand">
+        <div>
+          <div class="wordmark">Blendermp <span class="tag">alpha</span></div>
+          <div class="statusline">
+            <span class="dot" id="stateDot"></span>
+            <span id="stateLabel">Offline</span>
+            <span class="sep">·</span>
+            <span id="latency">no session</span>
+          </div>
+        </div>
+        <button class="icon-btn" id="refreshBtn" title="Refresh">
+          <svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5" /></svg>
+        </button>
+      </header>
+
+      <div class="toasts" id="toasts"></div>
+
+      <!-- session panel -->
+      <div class="panel" id="panel-session">
+        <section class="card hero">
+          <div class="hero-glow"></div>
+          <div class="eyebrow" id="heroEyebrow">Get started</div>
+          <h1 id="heroTitle">Start a room</h1>
+          <p id="heroSub">One click launches Blender, starts the session and embeds it right here.</p>
+
+          <div class="codebox" id="codeBox" hidden>
+            <div class="code-label">Room code</div>
+            <div class="code-row">
+              <code id="roomCode">—</code>
+              <button class="icon-btn" id="copyBtn" title="Copy code">
+                <svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15V6a2 2 0 0 1 2-2h9" /></svg>
+              </button>
+            </div>
+            <div class="verify" id="verifyRow" hidden>
+              <span class="lock">verify</span>
+              <code id="verifyCode"></code>
+            </div>
+          </div>
+
+          <div class="actions" id="hostActions">
+            <button class="btn primary" id="hostBtn">
+              <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
+              Host room
+            </button>
+            <button class="btn ghost" id="joinBtn">Join with code</button>
+          </div>
+
+          <div class="actions" id="activeActions" hidden>
+            <button class="btn primary" id="launchBtn">
+              <svg viewBox="0 0 24 24"><path d="M12 3v12M7 8l5-5 5 5M4 17v3h16v-3" /></svg>
+              Launch Blender
+            </button>
+            <button class="btn ghost danger" id="leaveBtn">Leave</button>
+          </div>
+
+          <div class="actions embed-actions" id="embedActions" hidden>
+            <button class="btn soft" id="embedBtn">Embed window</button>
+            <button class="btn ghost" id="detachBtn" hidden>Detach</button>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <span>In the room</span>
+            <span class="count" id="memberCount">0</span>
+          </div>
+          <ul class="members" id="members">
+            <li class="empty">No one here yet.</li>
+          </ul>
+        </section>
+
+        <section class="card diag">
+          <div class="card-head">
+            <span>Connection</span>
+            <span class="live" id="liveLabel">idle</span>
+          </div>
+          <div class="stats">
+            <div><b id="pingValue">—</b><span>ms</span><small>latency</small></div>
+            <div><b id="downValue">0</b><span>KB/s</span><small>in</small></div>
+            <div><b id="upValue">0</b><span>KB/s</span><small>out</small></div>
+          </div>
+          <canvas id="spark" width="300" height="52"></canvas>
+          <div class="diag-foot">
+            <span id="blenderLabel">Blender not detected</span>
+            <span id="secureLabel" class="secure">TLS 1.3 · pinned</span>
+          </div>
+        </section>
+      </div>
+
+      <!-- join panel -->
+      <div class="panel" id="panel-join" hidden>
+        <section class="card">
+          <div class="card-head">
+            <span>Join a room</span>
+            <button class="icon-btn" id="joinClose" title="Back">
+              <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6" /></svg>
+            </button>
+          </div>
+          <label class="field">
+            <span>Room code</span>
+            <input id="joinCode" inputmode="text" autocomplete="off" placeholder="ABCDE-FGHJK-MNPQR" spellcheck="false" maxlength="19" />
+          </label>
+          <label class="field">
+            <span>PIN <em>optional</em></span>
+            <input id="joinPin" type="password" autocomplete="off" placeholder="4+ characters" maxlength="64" />
+          </label>
+          <label class="field">
+            <span>Display name</span>
+            <input id="joinName" autocomplete="off" maxlength="48" />
+          </label>
+          <button class="btn primary wide" id="joinGo">Join room</button>
+          <p class="fine">Codes connect over TLS 1.3. The host certificate is pinned on first join, and the verification code is shown in the session panel.</p>
+        </section>
+      </div>
+
+      <!-- settings panel -->
+      <div class="panel" id="panel-settings" hidden>
+        <section class="card">
+          <div class="card-head">
+            <span>Settings</span>
+            <button class="icon-btn" id="settingsClose" title="Back">
+              <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6" /></svg>
+            </button>
+          </div>
+          <label class="field">
+            <span>Display name</span>
+            <input id="setName" maxlength="48" />
+          </label>
+          <label class="field">
+            <span>Host port</span>
+            <input id="setPort" type="number" min="1024" max="65535" />
+          </label>
+          <label class="field">
+            <span>Room PIN <em>optional</em></span>
+            <input id="setPin" type="password" maxlength="64" placeholder="Leave empty for none" />
+          </label>
+          <label class="field">
+            <span>Blender executable</span>
+            <input id="setBlender" spellcheck="false" />
+          </label>
+          <div class="row">
+            <button class="btn soft" id="detectBtn">Detect Blender</button>
+            <button class="btn ghost" id="saveSettings">Save</button>
+          </div>
+          <div class="security">
+            <strong>Security</strong>
+            <p>No custom cryptography. Transport is TLS 1.3 with a pinned host certificate, the host validates every action, and rooms are size- and rate-limited.</p>
+          </div>
+        </section>
+      </div>
+    </aside>
+
+    <main class="stage">
+      <div class="stage-chrome">
+        <div class="crumbs">
+          <span class="crumb-dot"></span>
+          <span id="stageTitle">Local workspace</span>
+          <span class="crumb-sep">/</span>
+          <span id="stageMode">no Blender window</span>
+        </div>
+        <div class="stage-actions">
+          <span class="bridge-pill" id="bridgePill">bridge: checking</span>
+          <button class="chip" id="focusBtn" hidden>Focus Blender</button>
+          <button class="chip" id="embedChip">Embed</button>
+          <button class="chip" id="detachChip" hidden>Detach</button>
+        </div>
+      </div>
+
+      <div class="stage-body" id="stageBody">
+        <div class="placeholder" id="placeholder">
+          <div class="orb">
+            <div class="orb-core"></div>
+            <div class="orb-ring r1"></div>
+            <div class="orb-ring r2"></div>
+          </div>
+          <h2>Blender, in the app</h2>
+          <p>The viewport is re-parented natively, so it renders at full GPU speed with no capture or compression.</p>
+          <div class="steps">
+            <div class="step"><span>1</span>Host or join a room</div>
+            <div class="step"><span>2</span>Launch Blender</div>
+            <div class="step"><span>3</span>It docks right here</div>
+          </div>
+          <div class="stage-hint" id="stageHint">Detecting Blender…</div>
+        </div>
+      </div>
+
+      <div class="statusbar">
+        <span id="statusLeft">Ready</span>
+        <span class="grow"></span>
+        <span id="statusMid"></span>
+        <span id="statusRight">v0.1.0</span>
+      </div>
+    </main>
+
+    <aside class="chatpanel" id="chatPanel">
+      <header class="chat-head">
+        <div>
+          <div class="chat-title">Room chat</div>
+          <div class="chat-sub" id="chatSub">Messages sync with Blender</div>
+        </div>
+        <button class="icon-btn" id="chatClose" title="Hide chat">
+          <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" /></svg>
+        </button>
+      </header>
+      <div class="messages" id="messages">
+        <div class="message empty">Nothing said yet. Say hi.</div>
+      </div>
+      <form class="composer" id="chatForm">
+        <input id="chatInput" placeholder="Message the room…" maxlength="2000" autocomplete="off" />
+        <button class="send" type="submit" title="Send">
+          <svg viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-2.5-6.5L4 12z" /></svg>
+        </button>
+      </form>
+    </aside>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

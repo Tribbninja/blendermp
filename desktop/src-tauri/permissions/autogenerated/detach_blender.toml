@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-detach-blender"
+description = "Enables the detach_blender command without any pre-configured scope."
+commands.allow = ["detach_blender"]
+
+[[permission]]
+identifier = "deny-detach-blender"
+description = "Denies the detach_blender command without any pre-configured scope."
+commands.deny = ["detach_blender"]

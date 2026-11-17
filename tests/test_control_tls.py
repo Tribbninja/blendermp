@@ -1,0 +1,114 @@
+import asyncio
+import json
+
+import pytest
+
+import control
+from core import tls
+from core.roomcode import encode_room
+
+
+@pytest.fixture()
+def appdir(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    return tmp_path
+
+
+def write_session(appdir, body):
+    path = control.session_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(body), encoding="utf-8")
+
+
+def test_valid_host_request(appdir):
+    code = encode_room("127.0.0.1", 51999)
+    write_session(appdir, {"action": "host", "nonce": "n" * 16, "name": "ada", "port": 51999, "code": code, "pin": "1234"})
+    request = control.read_session()
+    assert request["action"] == "host"
+    assert request["code"].replace("-", "") == code.replace("-", "")
+    assert request["pin"] == "1234"
+
+
+def test_invalid_requests_are_ignored(appdir):
+    cases = [
+        {"action": "run", "nonce": "x" * 16},
+        {"action": "host", "nonce": "short"},
+        {"action": "join", "nonce": "x" * 16, "code": "NOTACODE"},
+        {"action": "join", "nonce": "x" * 16},
+        {"action": "host", "nonce": "x" * 16, "port": 99999},
+        {"action": "host", "nonce": "x" * 16, "name": "bad\nname"},
+    ]
+    for body in cases:
+        write_session(appdir, body)
+        assert control.read_session() is None, body
+
+
+def test_oversized_control_file_rejected(appdir):
+    write_session(appdir, {"action": "host", "nonce": "x" * 16, "pad": "z" * 10000})
+    assert control.read_session() is None
+
+
+def test_status_is_bounded_and_atomic(appdir):
+    control.write_status(
+        {
+            "state": "hosting",
+            "code": "ABCDE-FGHJK-MNPQR",
+            "users": [{"name": "a" * 500, "color": [0.1, 0.2, 0.3, 1.0], "ping_ms": 10, "host": True}],
+            "bytes_in": 10**30,
+            "unknown": "ignored",
+        }
+    )
+    body = json.loads(control.status_path().read_text(encoding="utf-8"))
+    assert body["state"] == "hosting"
+    assert "unknown" not in body
+    assert len(body["users"][0]["name"]) <= 48
+    assert body["bytes_in"] == (1 << 62)
+
+
+def test_tls_certificate_and_pinning(appdir):
+    cert, key, fingerprint = tls.load_or_create_certificate(control.certs_dir())
+    assert cert.exists() and key.exists()
+    assert len(fingerprint) == 64
+    again = tls.load_or_create_certificate(control.certs_dir())
+    assert again[2] == fingerprint
+    assert tls.verify_fingerprint(fingerprint, fingerprint.upper())
+    assert not tls.verify_fingerprint(fingerprint, "0" * 64)
+    assert len(tls.short_fingerprint(fingerprint)) == 19
+
+
+def test_tofu_store(appdir):
+    code = encode_room("10.1.2.3", 51999)
+    assert tls.known_fingerprint(control.data_dir(), code) is None
+    tls.remember_fingerprint(control.data_dir(), code, "a" * 64)
+    assert tls.known_fingerprint(control.data_dir(), code) == "a" * 64
+    tls.forget_fingerprint(control.data_dir(), code)
+    assert tls.known_fingerprint(control.data_dir(), code) is None
+
+
+def test_tls_loopback_and_fingerprint(appdir):
+    cert, key, fingerprint = tls.load_or_create_certificate(control.certs_dir())
+
+    async def scenario():
+        server_context = tls.server_context(cert, key)
+
+        async def handler(reader, writer):
+            data = await reader.read(64)
+            writer.write(b"echo:" + data)
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(handler, "127.0.0.1", 0, ssl=server_context)
+        port = server.sockets[0].getsockname()[1]
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", port, ssl=tls.client_context(), server_hostname="blendermp"
+        )
+        assert tls.verify_fingerprint(tls.peer_fingerprint(writer), fingerprint)
+        writer.write(b"hi")
+        await writer.drain()
+        assert await reader.read(64) == b"echo:hi"
+        writer.close()
+        server.close()
+        await server.wait_closed()
+
+    asyncio.run(scenario())

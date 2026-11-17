@@ -1,0 +1,716 @@
+"""Blendermp - collaborative Blender sessions.
+
+The addon talks to the desktop app through two small JSON files in the user's
+local data folder. That keeps the integration dependency-free and lets the app
+start, stop and drive sessions without an RPC framework.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path as _Path
+
+# Blender disables Python's user site, so TLS certificate generation needs a
+# per-user vendor directory. The desktop app's bootstrap installs cryptography
+# here; without it the addon still loads and reports a clear error on host.
+_VENDOR = _Path(os.environ.get("LOCALAPPDATA", _Path.home() / ".local" / "share")) / "Blendermp" / "python"
+if _VENDOR.is_dir() and str(_VENDOR) not in sys.path:
+    sys.path.insert(0, str(_VENDOR))
+
+import json
+import queue
+import socket
+import time
+import traceback
+import uuid
+from pathlib import Path
+
+import bpy
+from bpy.app.handlers import persistent
+from bpy.props import BoolProperty, CollectionProperty, FloatProperty, FloatVectorProperty, IntProperty, StringProperty
+from bpy.types import Operator, Panel, PropertyGroup
+from bpy_extras.io_utils import ExportHelper
+
+from . import control, ui
+from .session import MAX_MESH, SessionService
+from .sync import objects as obj_sync
+from .sync.mesh import MeshMirror
+
+bl_info = {
+    "name": "Blendermp",
+    "author": "Blendermp",
+    "version": (0, 1, 0),
+    "blender": (5, 0, 0),
+    "location": "View3D > Sidebar > Blendermp",
+    "description": "Low-latency collaborative Blender sessions",
+    "category": "Network",
+}
+
+ADDON_VERSION = "0.1.0"
+TICK = 1.0 / 30.0
+CONTROL_POLL = 0.5
+STATUS_WRITE = 0.5
+MESH_POLL = 1.0 / 12.0
+
+runtime: dict = {
+    "session": None,
+    "inbox": queue.Queue(),
+    "mirrors": {},
+    "object_shadow": {},
+    "tracked": set(),
+    "last_control_nonce": None,
+    "last_status": 0.0,
+    "last_mesh": 0.0,
+    "last_presence": 0.0,
+    "control_checked": 0.0,
+    "started": 0.0,
+}
+
+
+# --------------------------------------------------------------------------- props
+class BMPUser(PropertyGroup):
+    name: StringProperty()
+    color: FloatVectorProperty(size=4, subtype="COLOR", min=0.0, max=1.0, default=(0.4, 0.8, 1.0, 1.0))
+    ping_ms: IntProperty(default=0)
+    scene: StringProperty()
+    frame: IntProperty()
+    mode: StringProperty()
+    host: BoolProperty()
+
+
+class BMPMessage(PropertyGroup):
+    author: StringProperty()
+    text: StringProperty()
+    stamp: StringProperty()
+
+
+class BMPState(PropertyGroup):
+    state: StringProperty(default="offline")  # offline|hosting|joining|connected
+    code: StringProperty()
+    join_code: StringProperty()
+    is_host: BoolProperty()
+    name: StringProperty(default="")
+    color: FloatVectorProperty(size=4, subtype="COLOR", min=0.0, max=1.0, default=(0.35, 0.8, 0.95, 1.0))
+    port: IntProperty(name="Port", default=51999, min=1024, max=65535)
+    pin: StringProperty(name="Room PIN", subtype="PASSWORD", maxlen=64)
+    rtt_ms: IntProperty(default=0)
+    bytes_in: IntProperty(default=0)
+    bytes_out: IntProperty(default=0)
+    last_error: StringProperty()
+    fingerprint: StringProperty()
+    verify_code: StringProperty()
+    chat_text: StringProperty()
+    sync_mesh: BoolProperty(name="Sync active mesh", default=True)
+    sync_transforms: BoolProperty(name="Sync object transforms", default=True)
+    users: CollectionProperty(type=BMPUser)
+    messages: CollectionProperty(type=BMPMessage)
+    show_users: BoolProperty(default=True)
+    show_chat: BoolProperty(default=True)
+
+
+def state(context) -> BMPState:
+    return context.window_manager.bmp
+
+
+def _push_message(context, author: str, text: str) -> None:
+    messages = context.window_manager.bmp.messages
+    item = messages.add()
+    item.author = author
+    item.text = text
+    item.stamp = time.strftime("%H:%M")
+    while len(messages) > 200:
+        messages.remove(0)
+
+
+def _upsert_user(context, name: str, color, host: bool = False) -> None:
+    users = context.window_manager.bmp.users
+    for user in users:
+        if user.name == name:
+            user.color = color
+            user.host = host
+            return
+    user = users.add()
+    user.name = name
+    user.color = color
+    user.host = host
+
+
+def _remove_user(context, name: str) -> None:
+    users = context.window_manager.bmp.users
+    for index, user in enumerate(users):
+        if user.name == name:
+            users.remove(index)
+            return
+
+
+def _local_ip() -> str:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 80))
+        return probe.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        probe.close()
+
+
+# --------------------------------------------------------------------------- session control
+def start_host(context, code: str | None = None, port: int | None = None) -> None:
+    stop_session(context)
+    settings = context.window_manager.bmp
+    port = port or settings.port
+    if not code:
+        from .core.roomcode import encode_room
+
+        code = encode_room(_local_ip(), port)
+    settings.code = code
+    settings.is_host = True
+    settings.state = "hosting"
+    settings.last_error = ""
+    name = settings.name or f"user-{uuid.uuid4().hex[:4]}"
+    settings.name = name
+    session = SessionService(
+        inbox=runtime["inbox"],
+        host=True,
+        code=code,
+        name=name,
+        color=tuple(settings.color),
+        port=port,
+        pin=settings.pin,
+    )
+    session.start()
+    runtime["session"] = session
+    runtime["mirrors"].clear()
+    runtime["object_shadow"].clear()
+    _upsert_user(context, name, tuple(settings.color), host=True)
+    _push_message(context, "system", f"Hosting room {code}")
+    bpy.app.timers.register(bmp_tick, first_interval=0.05, persistent=True)
+
+
+def start_join(context, code: str) -> None:
+    stop_session(context)
+    settings = context.window_manager.bmp
+    name = settings.name or f"user-{uuid.uuid4().hex[:4]}"
+    settings.name = name
+    settings.code = code.strip().upper()
+    settings.is_host = False
+    settings.state = "joining"
+    settings.last_error = ""
+    session = SessionService(
+        inbox=runtime["inbox"],
+        host=False,
+        code=settings.code,
+        name=name,
+        color=tuple(settings.color),
+        port=settings.port,
+        fingerprint=settings.fingerprint or None,
+        pin=settings.pin,
+    )
+    session.start()
+    runtime["session"] = session
+    runtime["mirrors"].clear()
+    runtime["object_shadow"].clear()
+    _upsert_user(context, name, tuple(settings.color), host=False)
+    _push_message(context, "system", f"Joining room {settings.code}")
+    bpy.app.timers.register(bmp_tick, first_interval=0.05, persistent=True)
+
+
+def stop_session(context) -> None:
+    session = runtime.get("session")
+    if session:
+        try:
+            session.stop()
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+    runtime["session"] = None
+    runtime["mirrors"].clear()
+    runtime["object_shadow"].clear()
+    settings = context.window_manager.bmp
+    settings.state = "offline"
+    settings.rtt_ms = 0
+    settings.users.clear()
+    if runtime["inbox"] is not None:
+        while not runtime["inbox"].empty():
+            try:
+                runtime["inbox"].get_nowait()
+            except queue.Empty:
+                break
+
+
+# --------------------------------------------------------------------------- inbox
+def _handle_event(context, kind: str, body: dict) -> None:
+    settings = context.window_manager.bmp
+    if kind == "state":
+        value = body.get("state")
+        if value in {"offline", "hosting", "joining", "connected"}:
+            settings.state = value
+    elif kind == "host_ready":
+        settings.code = body.get("code", settings.code)
+        settings.fingerprint = body.get("fingerprint", "")
+        settings.verify_code = body.get("short", "")
+        _push_message(context, "system", f"Room {settings.code} ready")
+    elif kind == "host_key":
+        settings.fingerprint = body.get("fingerprint", "")
+        settings.verify_code = body.get("short", "")
+        _push_message(context, "system", f"Verify host code: {settings.verify_code}")
+    elif kind == "welcome":
+        settings.state = "connected"
+        _push_message(context, "system", "Connected")
+        _upsert_user(context, body.get("name", "host"), body.get("color", (1, 1, 1, 1)), host=True)
+        for peer in body.get("peers", []):
+            _upsert_user(context, peer.get("name", "?"), peer.get("color", (1, 1, 1, 1)))
+        # send our full mesh for tracked objects so the newcomer sees them
+        _send_snapshots(context)
+    elif kind == "peer_join":
+        _upsert_user(context, body.get("name", "?"), body.get("color", (1, 1, 1, 1)))
+        _push_message(context, "system", f"{body.get('name', 'someone')} joined")
+    elif kind == "peer_leave":
+        _remove_user(context, body.get("name", "?"))
+        _push_message(context, "system", f"{body.get('name', 'someone')} left")
+    elif kind == "presence":
+        _upsert_user(context, body.get("name", "?"), body.get("color", (1, 1, 1, 1)))
+        for user in settings.users:
+            if user.name == body.get("name"):
+                user.scene = body.get("scene", "")
+                user.frame = int(body.get("frame", 0))
+                user.mode = body.get("mode", "")
+                if body.get("name") == settings.name:
+                    user.ping_ms = settings.rtt_ms
+    elif kind == "chat":
+        _push_message(context, body.get("name", "?"), body.get("text", ""))
+    elif kind == "rtt":
+        settings.rtt_ms = int(body.get("ms", 0))
+    elif kind == "transform":
+        obj_sync.apply(body.get("uuid"), body.get("matrix", []))
+    elif kind == "mesh_delta":
+        _apply_mesh_delta(context, body)
+    elif kind == "mesh_snapshot":
+        _apply_mesh_snapshot(context, body)
+    elif kind == "error":
+        settings.last_error = str(body.get("message", "unknown error"))
+    elif kind == "disconnected":
+        settings.state = "offline"
+        _push_message(context, "system", f"Disconnected: {body.get('reason', 'unknown')}")
+
+
+def _apply_mesh_delta(context, body: dict) -> None:
+    uid = body.get("uuid")
+    payload = body.get("payload", b"")
+    if not isinstance(payload, (bytes, bytearray)) or len(payload) > MAX_MESH:
+        return
+    obj = obj_sync.find(uid)
+    if obj is None or obj.type != "MESH":
+        return
+    if context.active_object == obj and context.mode in {"EDIT_MESH", "SCULPT"}:
+        return  # never fight the local sculpt
+    mirror = runtime["mirrors"].setdefault(uid, MeshMirror())
+    try:
+        mirror.apply_delta(obj.data, bytes(payload))
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+
+
+def _apply_mesh_snapshot(context, body: dict) -> None:
+    uid = body.get("uuid")
+    payload = body.get("payload", b"")
+    if not isinstance(payload, (bytes, bytearray)) or len(payload) > MAX_MESH:
+        return
+    obj = obj_sync.find(uid)
+    if obj is None or obj.type != "MESH":
+        return
+    mirror = runtime["mirrors"].setdefault(uid, MeshMirror())
+    try:
+        mirror.apply_snapshot(obj.data, bytes(payload))
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+
+
+def _send_snapshots(context) -> None:
+    session: SessionService | None = runtime.get("session")
+    if session is None:
+        return
+    for obj in context.scene.objects:
+        if obj.type != "MESH" or obj.name not in runtime["tracked"]:
+            continue
+        mirror = runtime["mirrors"].setdefault(obj.name, MeshMirror())
+        try:
+            payload = mirror.full_snapshot(obj.data)
+            session.send_mesh(obj, "snapshot", payload, 0)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+
+
+# --------------------------------------------------------------------------- bpy timer
+def _poll_control(context) -> None:
+    now = time.monotonic()
+    if now - runtime["control_checked"] < CONTROL_POLL:
+        return
+    runtime["control_checked"] = now
+    request = control.read_session()
+    if not request:
+        return
+    nonce = request.get("nonce")
+    if not nonce or nonce == runtime["last_control_nonce"]:
+        return
+    runtime["last_control_nonce"] = nonce
+    settings = context.window_manager.bmp
+    if request.get("name"):
+        settings.name = request["name"]
+    if request.get("port"):
+        settings.port = int(request["port"])
+    if request.get("fingerprint"):
+        settings.fingerprint = request["fingerprint"]
+    if "pin" in request:
+        settings.pin = request["pin"]
+    action = request.get("action")
+    try:
+        if action == "host":
+            start_host(context, request.get("code") or None, request.get("port"))
+        elif action == "join":
+            code = request.get("code", "")
+            if code:
+                start_join(context, code)
+        elif action == "chat":
+            text = request.get("text", "")
+            session = runtime.get("session")
+            if session is None or not text:
+                settings.last_error = "Not connected"
+            else:
+                session.send_chat(text)
+                _push_message(context, settings.name, text)
+        elif action == "leave":
+            stop_session(context)
+    except Exception as exc:  # noqa: BLE001
+        settings.last_error = str(exc)
+        traceback.print_exc()
+
+
+def _sync_transforms(context) -> None:
+    session: SessionService | None = runtime.get("session")
+    if session is None or not context.window_manager.bmp.sync_transforms:
+        return
+    shadow: dict = runtime["object_shadow"]
+    seen = set()
+    for obj in context.scene.objects:
+        uid = obj.get("bmp_uuid")
+        if not uid:
+            uid = str(uuid.uuid4())
+            obj["bmp_uuid"] = uid
+        seen.add(uid)
+        matrix = obj.matrix_world
+        current = tuple(round(v, 6) for row in matrix for v in row)
+        previous = shadow.get(uid)
+        if previous is None:
+            shadow[uid] = current
+            continue
+        if current != previous:
+            shadow[uid] = current
+            session.send_transform(uid, current)
+    for stale in list(shadow.keys() - seen):
+        del shadow[stale]
+
+
+def _sync_mesh(context) -> None:
+    session: SessionService | None = runtime.get("session")
+    settings = context.window_manager.bmp
+    if session is None or not settings.sync_mesh:
+        return
+    now = time.monotonic()
+    if now - runtime["last_mesh"] < MESH_POLL:
+        return
+    runtime["last_mesh"] = now
+    obj = context.active_object
+    if obj is None or obj.type != "MESH" or context.mode not in {"EDIT_MESH", "SCULPT"}:
+        return
+    uid = obj.get("bmp_uuid") or str(uuid.uuid4())
+    obj["bmp_uuid"] = uid
+    runtime["tracked"].add(obj.name)
+    mirror = runtime["mirrors"].get(uid)
+    if mirror is None or not mirror.matches(obj.data):
+        mirror = MeshMirror()
+        runtime["mirrors"][uid] = mirror
+        try:
+            snapshot = mirror.full_snapshot(obj.data)
+            session.send_mesh(obj, "snapshot", snapshot, 0)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        return
+    try:
+        delta = mirror.poll(obj.data)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return
+    if delta is not None:
+        rev, payload = delta
+        session.send_mesh(obj, "delta", payload, rev)
+
+
+def _send_presence(context) -> None:
+    session: SessionService | None = runtime.get("session")
+    if session is None:
+        return
+    now = time.monotonic()
+    if now - runtime["last_presence"] < 1.0:
+        return
+    runtime["last_presence"] = now
+    session.send_presence(
+        {
+            "scene": context.scene.name,
+            "frame": context.scene.frame_current,
+            "mode": context.mode,
+        }
+    )
+
+
+def _write_status(context) -> None:
+    session: SessionService | None = runtime.get("session")
+    now = time.monotonic()
+    if now - runtime["last_status"] < STATUS_WRITE:
+        return
+    runtime["last_status"] = now
+    settings = context.window_manager.bmp
+    stats = session.stats() if session else {}
+    users = [
+        {
+            "name": user.name,
+            "color": list(user.color),
+            "ping_ms": user.ping_ms,
+            "host": user.host,
+        }
+        for user in settings.users
+    ]
+    messages = [
+        {"author": item.author, "text": item.text, "stamp": item.stamp}
+        for item in list(settings.messages)[-20:]
+    ]
+    control.write_status(
+        {
+            "state": settings.state,
+            "code": settings.code,
+            "is_host": settings.is_host,
+            "name": settings.name,
+            "fingerprint": settings.fingerprint,
+            "verify_code": settings.verify_code,
+            "last_error": settings.last_error,
+            "rtt_ms": stats.get("rtt_ms", 0),
+            "bytes_in": stats.get("bytes_in", 0),
+            "bytes_out": stats.get("bytes_out", 0),
+            "peers": stats.get("peers", []),
+            "users": users,
+            "messages": messages,
+            "blender": bpy.app.version_string,
+            "addon": ADDON_VERSION,
+        }
+    )
+
+
+def bmp_tick():
+    context = bpy.context
+    if context is None or context.window_manager is None:
+        return TICK
+    try:
+        _poll_control(context)
+        session: SessionService | None = runtime.get("session")
+        inbox = runtime["inbox"]
+        while True:
+            try:
+                kind, body = inbox.get_nowait()
+            except queue.Empty:
+                break
+            _handle_event(context, kind, body)
+        if session is not None:
+            _sync_transforms(context)
+            _sync_mesh(context)
+            _send_presence(context)
+            _write_status(context)
+            if session.failed:
+                settings = context.window_manager.bmp
+                settings.last_error = session.failure_reason or "connection failed"
+                stop_session(context)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+    return TICK
+
+
+# --------------------------------------------------------------------------- operators
+class BMP_OT_host(Operator):
+    bl_idname = "bmp.host"
+    bl_label = "Host Session"
+    bl_description = "Start hosting a session in this scene"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        start_host(context)
+        return {"FINISHED"}
+
+
+class BMP_OT_join(Operator):
+    bl_idname = "bmp.join"
+    bl_label = "Join Session"
+    bl_description = "Join a session with a room code"
+    bl_options = {"REGISTER"}
+
+    code: StringProperty(name="Room code")
+
+    def invoke(self, context, event):
+        self.code = context.window_manager.bmp.join_code
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def draw(self, context):
+        self.layout.prop(self, "code", text="Code")
+
+    def execute(self, context):
+        code = self.code.strip()
+        if not code:
+            self.report({"ERROR"}, "Enter a room code")
+            return {"CANCELLED"}
+        try:
+            start_join(context, code)
+        except Exception as exc:  # noqa: BLE001
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class BMP_OT_leave(Operator):
+    bl_idname = "bmp.leave"
+    bl_label = "Leave Session"
+    bl_description = "Disconnect from the current session"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        stop_session(context)
+        return {"FINISHED"}
+
+
+class BMP_OT_copy_code(Operator):
+    bl_idname = "bmp.copy_code"
+    bl_label = "Copy Room Code"
+    bl_description = "Copy the room code to the clipboard"
+
+    def execute(self, context):
+        code = context.window_manager.bmp.code
+        if code:
+            context.window_manager.clipboard = code
+            self.report({"INFO"}, f"Copied {code}")
+        return {"FINISHED"}
+
+
+class BMP_OT_send_chat(Operator):
+    bl_idname = "bmp.send_chat"
+    bl_label = "Send"
+    bl_description = "Send a chat message"
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        text = settings.chat_text.strip()
+        if not text:
+            return {"CANCELLED"}
+        session: SessionService | None = runtime.get("session")
+        if session is None:
+            self.report({"ERROR"}, "Not connected")
+            return {"CANCELLED"}
+        session.send_chat(text)
+        _push_message(context, settings.name, text)
+        settings.chat_text = ""
+        return {"FINISHED"}
+
+
+class BMP_OT_track_mesh(Operator):
+    bl_idname = "bmp.track_mesh"
+    bl_label = "Track Active Mesh"
+    bl_description = "Stream the active mesh to the session"
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj is None or obj.type != "MESH":
+            self.report({"ERROR"}, "Select a mesh object")
+            return {"CANCELLED"}
+        runtime["tracked"].add(obj.name)
+        uid = obj.get("bmp_uuid") or str(uuid.uuid4())
+        obj["bmp_uuid"] = uid
+        mirror = MeshMirror()
+        runtime["mirrors"][uid] = mirror
+        session: SessionService | None = runtime.get("session")
+        if session:
+            session.send_mesh(obj, "snapshot", mirror.full_snapshot(obj.data), 0)
+        self.report({"INFO"}, f"Tracking {obj.name}")
+        return {"FINISHED"}
+
+
+class BMP_OT_ping(Operator):
+    bl_idname = "bmp.ping"
+    bl_label = "Ping"
+    bl_description = "Measure round-trip latency to the host"
+
+    def execute(self, context):
+        session: SessionService | None = runtime.get("session")
+        if session is None:
+            return {"CANCELLED"}
+        session.send_ping()
+        return {"FINISHED"}
+
+
+class BMP_OT_export_log(Operator, ExportHelper):
+    bl_idname = "bmp.export_log"
+    bl_label = "Export diagnostics"
+    bl_description = "Write session diagnostics to a text file"
+    filename_ext = ".txt"
+    filter_glob: StringProperty(default="*.txt", options={"HIDDEN"})
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        session: SessionService | None = runtime.get("session")
+        stats = session.stats() if session else {}
+        lines = [
+            f"Blendermp addon {ADDON_VERSION}",
+            f"Blender {bpy.app.version_string}",
+            f"state={settings.state} host={settings.is_host} code={settings.code}",
+            f"name={settings.name} port={settings.port}",
+            f"rtt_ms={stats.get('rtt_ms')} bytes_in={stats.get('bytes_in')} bytes_out={stats.get('bytes_out')}",
+            f"peers={stats.get('peers')}",
+            f"error={settings.last_error}",
+        ]
+        with open(self.filepath, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines))
+        return {"FINISHED"}
+
+
+classes = (
+    BMPUser,
+    BMPMessage,
+    BMPState,
+    BMP_OT_host,
+    BMP_OT_join,
+    BMP_OT_leave,
+    BMP_OT_copy_code,
+    BMP_OT_send_chat,
+    BMP_OT_track_mesh,
+    BMP_OT_ping,
+    BMP_OT_export_log,
+)
+
+
+def register() -> None:
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    bpy.types.WindowManager.bmp = bpy.props.PointerProperty(type=BMPState)
+    ui.register()
+    runtime["started"] = time.monotonic()
+    bpy.app.timers.register(bmp_tick, first_interval=0.5, persistent=True)
+
+
+def unregister() -> None:
+    try:
+        bpy.app.timers.unregister(bmp_tick)
+    except ValueError:
+        pass
+    session = runtime.get("session")
+    if session:
+        session.stop()
+        runtime["session"] = None
+    ui.unregister()
+    del bpy.types.WindowManager.bmp
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)

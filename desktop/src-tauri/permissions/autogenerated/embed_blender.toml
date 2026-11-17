@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-embed-blender"
+description = "Enables the embed_blender command without any pre-configured scope."
+commands.allow = ["embed_blender"]
+
+[[permission]]
+identifier = "deny-embed-blender"
+description = "Denies the embed_blender command without any pre-configured scope."
+commands.deny = ["embed_blender"]
