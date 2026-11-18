@@ -19,6 +19,9 @@
       <button class="rail-btn active" data-view="session" title="Session">
         <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10" /></svg>
       </button>
+      <button class="rail-btn" data-view="servers" title="Public servers">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18" /></svg>
+      </button>
       <button class="rail-btn" data-view="chat" title="Chat">
         <svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-8 8H7l-4 3v-7a8 8 0 0 1 8-8h2a8 8 0 0 1 8 4z" /></svg>
       </button>
@@ -62,16 +65,29 @@
       <div class="panel" id="panel-session">
         <section class="intro">
           <div class="eyebrow" id="heroEyebrow">Get started</div>
-          <h1 id="heroTitle">Start a room</h1>
-          <p id="heroSub">One click launches Blender, starts the session and embeds it right here.</p>
+          <h1 id="heroTitle">Start a server</h1>
+          <p id="heroSub">Host a public server, or browse servers other people are hosting.</p>
 
-          <div class="codebox" id="codeBox" hidden>
-            <div class="code-label">Room code</div>
+          <div class="host-setup" id="hostSetup">
+            <label class="field">
+              <span>Server name</span>
+              <input id="serverName" autocomplete="off" maxlength="48" />
+            </label>
+            <label class="check">
+              <input type="checkbox" id="serverPublic" />
+              <span>List in the public server browser</span>
+            </label>
+            <label class="field">
+              <span>Password <em>optional</em></span>
+              <input id="serverPassword" type="password" autocomplete="new-password" maxlength="64" />
+            </label>
+          </div>
+
+          <div class="codebox" id="serverBox" hidden>
+            <div class="code-label" id="serverLabel">Your server</div>
             <div class="code-row">
-              <code id="roomCode">--</code>
-              <button class="icon-btn" id="copyBtn" title="Copy code">
-                <svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15V6a2 2 0 0 1 2-2h9" /></svg>
-              </button>
+              <code id="serverTitle">--</code>
+              <span class="badge" id="serverState">private</span>
             </div>
             <div class="verify" id="verifyRow" hidden>
               <span>verify</span>
@@ -80,8 +96,8 @@
           </div>
 
           <div class="actions" id="hostActions">
-            <button class="btn primary" id="hostBtn">Host room</button>
-            <button class="btn ghost" id="joinBtn">Join with code</button>
+            <button class="btn primary" id="hostBtn">Host server</button>
+            <button class="btn ghost" id="joinBtn">Browse servers</button>
           </div>
 
           <div class="actions" id="activeActions" hidden>
@@ -126,28 +142,38 @@
         </section>
       </div>
 
-      <div class="panel" id="panel-join" hidden>
+      <div class="panel" id="panel-servers" hidden>
         <section class="section">
           <div class="section-head">
-            <span>Join a room</span>
-            <button class="icon-btn" id="joinClose" title="Back">
-              <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6" /></svg>
-            </button>
+            <span>Public servers</span>
+            <div class="head-actions">
+              <button class="icon-btn" id="serverRefresh" title="Refresh">
+                <svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" /></svg>
+              </button>
+              <button class="icon-btn" id="joinClose" title="Back">
+                <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6" /></svg>
+              </button>
+            </div>
           </div>
           <label class="field">
-            <span>Room code</span>
-            <input id="joinCode" inputmode="text" autocomplete="off" placeholder="ABCDE-FGHJK-MNPQR" spellcheck="false" maxlength="19" />
+            <span>Search</span>
+            <input id="serverSearch" placeholder="Server name or host" autocomplete="off" />
           </label>
-          <label class="field">
-            <span>PIN <em>optional</em></span>
-            <input id="joinPin" type="password" autocomplete="off" placeholder="Leave empty for none" maxlength="64" />
-          </label>
-          <label class="field">
-            <span>Display name</span>
-            <input id="joinName" autocomplete="off" maxlength="48" />
-          </label>
-          <button class="btn primary wide" id="joinGo">Join room</button>
-          <p class="fine">Codes connect over TLS 1.3. The host certificate is pinned on first join.</p>
+          <div class="server-list" id="serverList">
+            <p class="empty">Set a directory URL in Settings to browse public servers.</p>
+          </div>
+          <div class="server-join" id="serverJoinBox" hidden>
+            <div class="server-join-head">Join <b id="serverJoinName"></b></div>
+            <label class="field" id="serverPasswordRow" hidden>
+              <span>Password</span>
+              <input id="serverPasswordJoin" type="password" autocomplete="off" maxlength="64" />
+            </label>
+            <div class="row">
+              <button class="btn primary" id="serverConnect">Connect</button>
+              <button class="btn ghost" id="serverCancel">Cancel</button>
+            </div>
+          </div>
+          <p class="fine" id="serverDirectoryNote">Public servers come from the directory URL in Settings.</p>
         </section>
       </div>
 
@@ -168,8 +194,8 @@
             <input id="setPort" type="number" min="1024" max="65535" />
           </label>
           <label class="field">
-            <span>Room PIN <em>optional</em></span>
-            <input id="setPin" type="password" maxlength="64" />
+            <span>Directory URL <em>optional</em></span>
+            <input id="setDirectory" placeholder="http://203.0.113.5:7101" spellcheck="false" />
           </label>
           <label class="field">
             <span>Relay <em>optional, IPv4:port</em></span>

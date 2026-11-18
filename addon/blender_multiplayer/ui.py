@@ -33,24 +33,15 @@ class BMP_PT_main(bpy.types.Panel):
 
         if settings.state in {"hosting", "connected"}:
             box = layout.box()
-            box.label(text="Room code", icon="LINKED")
-            row = box.row(align=True)
-            row.scale_y = 1.4
-            row.label(text=settings.code)
-            row.operator("bmp.copy_code", text="", icon="COPYDOWN")
+            box.label(text="Server", icon="WORLD")
+            if settings.is_host:
+                box.label(text="Public listing is managed in the desktop app")
             if settings.verify_code:
                 box.label(text=f"Verify: {settings.verify_code}", icon="LOCKED")
-        else:
-            box = layout.box()
-            box.label(text="Join a room", icon="LINKED")
-            row = box.row(align=True)
-            row.prop(settings, "join_code", text="")
-            row.operator("bmp.join", text="Join", icon="IMPORT")
 
         row = layout.row(align=True)
         if settings.state == "offline":
-            row.operator("bmp.host", text="Host", icon="PLAY")
-            row.operator("bmp.join", text="Join", icon="IMPORT")
+            row.label(text="Host or browse public servers in the desktop app", icon="INFO")
         else:
             row.operator("bmp.leave", text="Leave", icon="PANEL_CLOSE")
             if settings.state == "connected":

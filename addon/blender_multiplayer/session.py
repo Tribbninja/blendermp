@@ -617,10 +617,17 @@ class SessionService:
         if self.pin:
             supplied = body.get("pin")
             if not isinstance(supplied, str) or not hmac.compare_digest(supplied[:64], self.pin):
-                peer.enqueue(
-                    protocol.encode(protocol.json_frame(MessageType.ERROR, {"message": "invalid room pin"})),
-                    critical=True,
-                )
+                # Write directly: the peer is dropped immediately afterwards,
+                # so a queued frame could be discarded before it is sent.
+                try:
+                    peer.writer.write(
+                        protocol.encode(
+                            protocol.json_frame(MessageType.ERROR, {"message": "invalid server password"})
+                        )
+                    )
+                    await peer.writer.drain()
+                except Exception:  # noqa: BLE001
+                    pass
                 raise Violation("invalid pin")
         peer.name = clean_name(body.get("name"))
         # Names are identity for leases, so the host makes them unique.
@@ -821,6 +828,33 @@ class SessionService:
             except Violation:
                 asyncio.create_task(self._drop_peer(peer))
 
+    def kick(self, name: str) -> None:
+        """Ask the host loop to disconnect a peer by its assigned name."""
+        loop = self._loop
+        if self.is_host and loop and loop.is_running():
+            loop.call_soon_threadsafe(lambda: asyncio.create_task(self._kick_peer(name)))
+
+    async def _kick_peer(self, name: str) -> None:
+        target = next(
+            (peer for peer in self._peers.values() if peer.authenticated and peer.name == name),
+            None,
+        )
+        if target is None:
+            return
+        try:
+            target.writer.write(
+                protocol.encode(protocol.json_frame(MessageType.KICK, {"message": "Kicked by host"}))
+            )
+            await target.writer.drain()
+        except Exception:  # noqa: BLE001
+            pass
+        await self._drop_peer(target)
+        try:
+            target.writer.close()
+            await target.writer.wait_closed()
+        except Exception:  # noqa: BLE001
+            pass
+
     async def _drop_peer(self, peer: Peer) -> None:
         was_authenticated = peer.authenticated
         peer.authenticated = False
@@ -908,6 +942,14 @@ class SessionService:
         await writer.drain()
 
         frame = await asyncio.wait_for(self._read_frame(reader), timeout=8.0)
+        if frame is not None and frame.type == MessageType.ERROR:
+            body = self._json(frame, 1024)
+            message = clean_text(body.get("message"), 200) or "host rejected the join"
+            self.failed = True
+            self.failure_reason = message
+            self._emit("error", {"message": message})
+            self._request_stop()
+            return
         if frame is None or frame.type != MessageType.WELCOME:
             raise RuntimeError("host rejected the join")
         body = self._json(frame, 4096)
@@ -973,6 +1015,14 @@ class SessionService:
         if frame.type == MessageType.BYE:
             body = self._json(frame, 1024)
             self._emit("peer_leave", {"name": clean_text(body.get("name"), MAX_NAME)})
+            return
+
+        if frame.type == MessageType.KICK:
+            body = self._json(frame, 1024)
+            self.failed = True
+            self.failure_reason = clean_text(body.get("message"), 200) or "Kicked by host"
+            self._emit("kicked", {"message": self.failure_reason})
+            self._request_stop()
             return
 
         if frame.type == MessageType.TRANSFORM:

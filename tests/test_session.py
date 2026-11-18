@@ -139,3 +139,31 @@ def test_invalid_room_code_fails_closed(appdir):
     finally:
         client.stop()
         events.stop()
+
+def test_host_can_kick_client(appdir):
+    port = free_port()
+    code = encode_room("127.0.0.1", port)
+    host_events = Events(queue.Queue())
+    client_events = Events(queue.Queue())
+
+    host = session_mod.SessionService(
+        host_events.inbox, host=True, code=code, name="host", color=(1, 1, 1, 1), port=port
+    )
+    host.start()
+    assert wait_for(lambda: host.state == "hosting"), "host did not start"
+    client = session_mod.SessionService(
+        client_events.inbox, host=False, code=code, name="ada", color=(1, 1, 1, 1), port=port
+    )
+    client.start()
+    try:
+        assert wait_for(lambda: client.state == "connected"), client.failure_reason
+        assert wait_for(lambda: host_events.has("peer_join", name="ada"))
+        host.kick("ada")
+        assert wait_for(lambda: client_events.has("kicked")), "client did not receive the kick"
+        assert wait_for(lambda: client.failed), "client did not stop after the kick"
+        assert wait_for(lambda: host_events.has("peer_leave", name="ada")), "host did not drop the peer"
+    finally:
+        client.stop()
+        host.stop()
+        host_events.stop()
+        client_events.stop()

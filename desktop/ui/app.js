@@ -63,6 +63,9 @@ const settings = {
   name: store.get("name", `user-${Math.random().toString(36).slice(2, 6)}`),
   port: Number(store.get("port", 51999)),
   pin: store.get("pin", ""),
+  serverName: store.get("serverName", ""),
+  public: store.get("public", "1") === "1",
+  directory: store.get("directory", ""),
   relay: store.get("relay", ""),
   useRelay: store.get("useRelay", "0") === "1",
   blender: store.get("blender", ""),
@@ -79,8 +82,18 @@ const state = {
   messagesKey: "",
   blenderBusy: false,
   lastError: "",
+  servers: [],
+  pendingServer: null,
+  serverQuery: "",
+  serverId: "",
+  joinedServerName: "",
+  lastAnnounce: 0,
+  directoryError: "",
+  wasHosting: false,
   demo: demoMode,
 };
+
+let serverSearchTimer = 0;
 
 /* ------------------------------------------------------------------ tauri */
 const demoStatus = {
@@ -140,21 +153,6 @@ function toast(message, kind = "") {
   setTimeout(() => item.remove(), 4200);
 }
 
-function normalizeCode(value) {
-  return value
-    .toUpperCase()
-    .replace(/[^0-9A-Z]/g, "")
-    .replace(/O/g, "0")
-    .replace(/[IL]/g, "1")
-    .slice(0, 15);
-}
-
-function groupCode(value) {
-  const text = normalizeCode(value);
-  const parts = [text.slice(0, 5), text.slice(5, 10), text.slice(10, 15)].filter(Boolean);
-  return parts.join("-");
-}
-
 function initials(name) {
   return (name || "?").slice(0, 2).toUpperCase();
 }
@@ -169,23 +167,41 @@ function isActive(status) {
   return Boolean(status && ["hosting", "joining", "connected"].includes(status.state));
 }
 
+function directoryBase() {
+  const value = String(settings.directory || "").trim();
+  return value ? value.replace(/\/+$/, "") : "";
+}
+
+function makeServerId() {
+  const bytes = new Uint8Array(16);
+  if (window.crypto?.getRandomValues) {
+    window.crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i += 1) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function serverDisplayName() {
+  return settings.serverName.trim() || `${settings.name}'s server`;
+}
+
 function setPanel(name) {
   state.panel = name;
-  for (const key of ["session", "join", "settings"]) {
+  for (const key of ["session", "servers", "settings"]) {
     $(`panel-${key}`).hidden = key !== name;
   }
   window.BMPLayout?.setTile("session", true);
   window.BMPLayout?.refreshRail();
-  if (name === "join") {
-    $("joinCode").value = "";
-    $("joinName").value = settings.name;
-    $("joinPin").value = "";
-    setTimeout(() => $("joinCode").focus(), 30);
+  if (name === "servers") {
+    $("serverSearch").value = state.serverQuery;
+    loadServers();
+    setTimeout(() => $("serverSearch").focus(), 30);
   }
   if (name === "settings") {
     $("setName").value = settings.name;
     $("setPort").value = settings.port;
-    $("setPin").value = settings.pin;
+    $("setDirectory").value = settings.directory;
     $("setRelay").value = settings.relay;
     $("setUseRelay").checked = settings.useRelay;
     $("setBlender").value = settings.blender;
@@ -256,7 +272,9 @@ function renderState(status) {
   $("liveLabel").className = `live ${value === "connected" ? "on" : value === "joining" ? "busy" : ""}`;
 
   const active = isActive(status);
+  const hosting = active && Boolean(status?.is_host);
   $("hostActions").hidden = active;
+  $("hostSetup").hidden = active;
   $("activeActions").hidden = !active;
   $("embedActions").hidden = !active;
   $("embedChip").hidden = !active || state.embedded;
@@ -266,24 +284,45 @@ function renderState(status) {
   $("heroEyebrow").textContent = active
     ? value === "joining"
       ? "Connecting"
-      : "Session live"
+      : "Server live"
     : "Get started";
   $("heroTitle").textContent = active
     ? value === "connected"
-      ? "You're in the room"
+      ? "You're in the server"
       : value === "hosting"
-        ? "Your room is live"
-        : "Connecting to the host"
-    : "Start a room";
+        ? "Your server is live"
+        : "Connecting to the server"
+    : "Start a server";
   $("heroSub").textContent = active
     ? value === "hosting"
-      ? "Share the code. Blender is docked here; the host validates every edit."
-      : "Share the code. Everyone connects over TLS 1.3 and the host validates every edit."
-    : "One click launches Blender, starts the session and embeds it right here.";
+      ? settings.public
+        ? "Your server is in the public browser. The host validates every edit."
+        : "Private server. It is not listed in the public browser."
+      : "Connected over TLS 1.3. The host validates every edit."
+    : "Host a public server, or browse servers other people are hosting.";
 
-  const code = status?.code || "";
-  $("codeBox").hidden = !code;
-  if (code) $("roomCode").textContent = code;
+  $("serverBox").hidden = !active;
+  if (active) {
+    $("serverLabel").textContent = hosting ? "Your server" : "Server";
+    $("serverTitle").textContent = hosting
+      ? serverDisplayName()
+      : state.joinedServerName || "Connected";
+    if (hosting) {
+      if (!settings.public) {
+        $("serverState").textContent = "private";
+        $("serverState").className = "badge";
+      } else if (!directoryBase()) {
+        $("serverState").textContent = "directory not set";
+        $("serverState").className = "badge warn";
+      } else {
+        $("serverState").textContent = "public";
+        $("serverState").className = "badge on";
+      }
+    } else {
+      $("serverState").textContent = "connected";
+      $("serverState").className = "badge on";
+    }
+  }
   const verify = status?.verify_code || "";
   $("verifyRow").hidden = !verify;
   if (verify) $("verifyCode").textContent = verify;
@@ -300,7 +339,9 @@ function renderState(status) {
   $("blenderLabel").textContent = blender ? `Blender ${blender}` : settings.blender ? "Blender ready" : "Blender 5.x not detected";
   $("statusRight").textContent = blender ? `Blender ${blender}` : "v0.1.0";
   $("stageMode").textContent = state.embedded ? "embedded - native" : active ? "Blender separate" : "no Blender window";
-  $("statusLeft").textContent = active ? `${labels[value]} - ${code || "no code"}` : "Ready";
+  $("statusLeft").textContent = active
+    ? `${labels[value]} - ${hosting ? serverDisplayName() : state.joinedServerName || "server"}`
+    : "Ready";
   $("statusMid").textContent = status?.relay ? "relay mode" : state.embedded ? "GPU passthrough" : "";
   $("stageHint").textContent = settings.blender ? "Blender is ready to launch." : "Blender 5.x not detected - install Blender 5 or set the path in Settings.";
 
@@ -350,6 +391,16 @@ function renderMembers(status) {
     ms.className = "ms";
     ms.textContent = user.ping_ms ? `${Math.round(user.ping_ms)} ms` : "";
     item.append(ms);
+
+    if (status?.is_host && !user.host && user.name) {
+      const kick = document.createElement("button");
+      kick.className = "kick-btn";
+      kick.type = "button";
+      kick.textContent = "Kick";
+      kick.title = `Kick ${user.name}`;
+      kick.addEventListener("click", () => kickPlayer(user.name));
+      item.append(kick);
+    }
 
     list.append(item);
   }
@@ -481,6 +532,10 @@ function applyStatus(status) {
   } else if (!error) {
     state.lastError = "";
   }
+  const hosting = status.state === "hosting" && Boolean(status.is_host);
+  if (hosting && !state.wasHosting && settings.public) announceServer();
+  if (!hosting && state.wasHosting && status.state === "offline") removeServer();
+  state.wasHosting = hosting;
   renderState(status);
   renderMembers(status);
   renderMessages(status);
@@ -560,6 +615,16 @@ async function hostRoom() {
     toast("Set the Blender path first", "error");
     return;
   }
+  settings.serverName = $("serverName").value.trim() || `${settings.name}'s server`;
+  settings.public = $("serverPublic").checked;
+  settings.pin = $("serverPassword").value;
+  store.set("serverName", settings.serverName);
+  store.set("public", settings.public ? "1" : "0");
+  store.set("pin", settings.pin);
+  removeServer();
+  if (settings.public && !directoryBase()) {
+    toast("Set a directory URL in Settings to list this server publicly", "error");
+  }
   try {
     await request({
       action: "host",
@@ -569,26 +634,28 @@ async function hostRoom() {
       relay: settings.useRelay ? settings.relay : null,
       use_relay: settings.useRelay,
     });
-    toast("Room starting...", "ok");
+    state.serverId = makeServerId();
+    state.joinedServerName = "";
+    state.lastAnnounce = 0;
+    state.wasHosting = false;
+    toast(settings.public ? "Public server starting..." : "Private server starting...", "ok");
     await launchBlender();
+    announceServer();
   } catch (error) {
     toast(String(error), "error");
   }
 }
 
-async function joinRoom() {
-  const code = groupCode($("joinCode").value);
-  const name = $("joinName").value.trim() || settings.name;
-  const pin = $("joinPin").value;
-  if (normalizeCode(code).length !== 15) {
-    toast("That room code is incomplete", "error");
-    return;
-  }
-  settings.name = name;
-  store.set("name", name);
+async function joinServer(server, pin = "") {
+  if (!server || !server.code) return;
+  removeServer();
   try {
-    await request({ action: "join", code, name, pin: pin || null });
-    toast("Joining room...", "ok");
+    await request({ action: "join", code: server.code, name: settings.name, pin: pin || null });
+    state.joinedServerName = server.name || "server";
+    state.serverId = "";
+    state.pendingServer = null;
+    $("serverJoinBox").hidden = true;
+    toast(`Joining ${server.name || "server"}...`, "ok");
     setPanel("session");
     await launchBlender();
   } catch (error) {
@@ -599,12 +666,14 @@ async function joinRoom() {
 async function leaveRoom() {
   try {
     await request({ action: "leave" });
-    toast("Leaving room...");
+    removeServer();
+    toast("Leaving server...");
+    state.joinedServerName = "";
     for (let attempt = 0; attempt < 30; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 200));
       const status = await poll();
       if (!status || !isActive(status)) {
-        toast("Left the room");
+        toast("Left the server");
         return;
       }
     }
@@ -612,6 +681,173 @@ async function leaveRoom() {
   } catch (error) {
     toast(String(error), "error");
   }
+}
+
+async function kickPlayer(name) {
+  if (!name) return;
+  if (!window.confirm(`Kick ${name} from the server?`)) return;
+  try {
+    await request({ action: "kick", target: name });
+    toast(`Kicked ${name}`, "ok");
+  } catch (error) {
+    toast(String(error), "error");
+  }
+}
+
+/* ------------------------------------------------------------------ servers */
+async function loadServers() {
+  const base = directoryBase();
+  if (!base) {
+    renderServers("Set a directory URL in Settings to browse public servers.");
+    $("serverDirectoryNote").textContent = "No directory configured.";
+    return;
+  }
+  $("serverDirectoryNote").textContent = `Directory: ${base}`;
+  try {
+    const query = encodeURIComponent(state.serverQuery.trim());
+    const response = await fetch(`${base}/servers?q=${query}&limit=100`, { cache: "no-store" });
+    if (!response.ok) throw new Error(`directory returned ${response.status}`);
+    const body = await response.json();
+    state.servers = Array.isArray(body.servers) ? body.servers : [];
+    state.directoryError = "";
+    renderServers("");
+  } catch (error) {
+    state.servers = [];
+    state.directoryError = String(error);
+    renderServers(`Could not reach ${base}. Check the directory URL in Settings.`);
+    log(`directory list failed: ${error}`);
+  }
+}
+
+function renderServers(message) {
+  const list = $("serverList");
+  list.replaceChildren();
+  if (message) {
+    const item = document.createElement("p");
+    item.className = "empty";
+    item.textContent = message;
+    list.append(item);
+    return;
+  }
+  if (!state.servers.length) {
+    const item = document.createElement("p");
+    item.className = "empty";
+    item.textContent = state.serverQuery.trim()
+      ? `No public servers match "${state.serverQuery.trim()}".`
+      : "No public servers are listed right now.";
+    list.append(item);
+    return;
+  }
+  for (const server of state.servers) {
+    const row = document.createElement("div");
+    row.className = "server-row";
+
+    const main = document.createElement("div");
+    main.className = "server-main";
+    const name = document.createElement("div");
+    name.className = "server-name";
+    name.textContent = server.name || "Untitled server";
+    main.append(name);
+    const meta = document.createElement("div");
+    meta.className = "server-meta";
+    const host = server.host || "unknown host";
+    const players = Number(server.players) || 1;
+    const maximum = Number(server.max) || 16;
+    meta.textContent = `${host} - ${players}/${maximum} players`;
+    main.append(meta);
+    row.append(main);
+
+    const tags = document.createElement("div");
+    tags.className = "server-tags";
+    if (server.password) {
+      const badge = document.createElement("span");
+      badge.className = "badge warn";
+      badge.textContent = "password";
+      tags.append(badge);
+    }
+    if (server.relay) {
+      const badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = "relay";
+      tags.append(badge);
+    }
+    row.append(tags);
+
+    const join = document.createElement("button");
+    join.className = "mini-btn";
+    join.type = "button";
+    join.textContent = "Join";
+    join.addEventListener("click", () => openServerJoin(server));
+    row.append(join);
+
+    list.append(row);
+  }
+}
+
+function openServerJoin(server) {
+  state.pendingServer = server;
+  $("serverJoinName").textContent = server.name || "server";
+  const needsPassword = Boolean(server.password);
+  $("serverPasswordRow").hidden = !needsPassword;
+  $("serverPasswordJoin").value = "";
+  $("serverJoinBox").hidden = false;
+  if (needsPassword) setTimeout(() => $("serverPasswordJoin").focus(), 20);
+}
+
+async function connectServer() {
+  const server = state.pendingServer;
+  if (!server) return;
+  const pin = server.password ? $("serverPasswordJoin").value : "";
+  await joinServer(server, pin);
+}
+
+function announceServer() {
+  if (!isTauri || !settings.public || !directoryBase()) return;
+  const status = state.status;
+  if (!status || status.state !== "hosting" || !status.is_host || !status.code) return;
+  if (!state.serverId) state.serverId = makeServerId();
+  const players = Array.isArray(status.users) ? Math.max(1, status.users.length) : 1;
+  const body = {
+    id: state.serverId,
+    name: serverDisplayName(),
+    host: settings.name,
+    code: status.code,
+    players,
+    max: 64,
+    password: Boolean(settings.pin),
+    relay: Boolean(status.relay),
+    version: "0.1.0",
+  };
+  fetch(`${directoryBase()}/announce`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    cache: "no-store",
+  })
+    .then((response) => {
+      if (!response.ok) throw new Error(`directory returned ${response.status}`);
+      state.directoryError = "";
+      state.lastAnnounce = Date.now();
+    })
+    .catch((error) => {
+      if (state.directoryError !== String(error)) {
+        state.directoryError = String(error);
+        toast(`Directory unreachable: ${directoryBase()}`, "error");
+      }
+      log(`directory announce failed: ${error}`);
+    });
+}
+
+function removeServer() {
+  const id = state.serverId;
+  state.serverId = "";
+  if (!isTauri || !id || !directoryBase()) return;
+  fetch(`${directoryBase()}/remove`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id }),
+    cache: "no-store",
+  }).catch(() => {});
 }
 
 async function embedNow() {
@@ -653,22 +889,6 @@ async function sendChat(event) {
     await request({ action: "chat", text });
   } catch (error) {
     toast(String(error), "error");
-  }
-}
-
-async function copyCode() {
-  const code = $("roomCode").textContent;
-  if (!code || code === "-") return;
-  try {
-    await navigator.clipboard.writeText(code);
-    toast("Room code copied", "ok");
-  } catch {
-    const range = document.createRange();
-    range.selectNodeContents($("roomCode"));
-    const selection = window.getSelection();
-    selection.removeAllRanges();
-    selection.addRange(range);
-    toast("Select and copy the code");
   }
 }
 
@@ -724,9 +944,25 @@ async function embedLoop() {
 /* ------------------------------------------------------------------ wiring */
 function wire() {
   $("hostBtn").addEventListener("click", hostRoom);
-  $("joinBtn").addEventListener("click", () => setPanel("join"));
+  $("joinBtn").addEventListener("click", () => setPanel("servers"));
   $("joinClose").addEventListener("click", () => setPanel("session"));
-  $("joinGo").addEventListener("click", joinRoom);
+  $("serverRefresh").addEventListener("click", loadServers);
+  $("serverConnect").addEventListener("click", connectServer);
+  $("serverCancel").addEventListener("click", () => {
+    state.pendingServer = null;
+    $("serverJoinBox").hidden = true;
+  });
+  $("serverSearch").addEventListener("input", (event) => {
+    state.serverQuery = event.target.value;
+    clearTimeout(serverSearchTimer);
+    serverSearchTimer = setTimeout(() => loadServers(), 250);
+  });
+  $("serverSearch").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") loadServers();
+  });
+  $("serverPasswordJoin").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") connectServer();
+  });
   $("settingsClose").addEventListener("click", () => setPanel("session"));
   $("leaveBtn").addEventListener("click", leaveRoom);
   $("launchBtn").addEventListener("click", () => {
@@ -742,7 +978,6 @@ function wire() {
   $("detachChip").addEventListener("click", detachNow);
   $("focusBtn").addEventListener("click", () => invoke("focus_blender").catch(() => {}));
   $("focusView").addEventListener("click", () => window.BMPLayout?.focusView());
-  $("copyBtn").addEventListener("click", copyCode);
   $("chatForm").addEventListener("submit", sendChat);
   $("chatClose").addEventListener("click", () => window.BMPLayout?.setTile("chat", false));
   $("collapseLeft").addEventListener("click", () => window.BMPLayout?.setTile("session", false));
@@ -751,13 +986,13 @@ function wire() {
   $("saveSettings").addEventListener("click", () => {
     settings.name = $("setName").value.trim() || settings.name;
     settings.port = Math.max(1024, Math.min(65535, Number($("setPort").value) || 51999));
-    settings.pin = $("setPin").value;
+    settings.directory = $("setDirectory").value.trim();
     settings.relay = $("setRelay").value.trim();
     settings.useRelay = $("setUseRelay").checked;
     settings.blender = $("setBlender").value.trim();
     store.set("name", settings.name);
     store.set("port", settings.port);
-    store.set("pin", settings.pin);
+    store.set("directory", settings.directory);
     store.set("relay", settings.relay);
     store.set("useRelay", settings.useRelay ? "1" : "0");
     store.set("blender", settings.blender);
@@ -766,18 +1001,6 @@ function wire() {
     setPanel("session");
   });
 
-  $("joinCode").addEventListener("input", (event) => {
-    const caret = event.target.selectionStart;
-    event.target.value = groupCode(event.target.value);
-    if (caret !== null) event.target.setSelectionRange(event.target.value.length, event.target.value.length);
-  });
-
-  $("joinCode").addEventListener("keydown", (event) => {
-    if (event.key === "Enter") joinRoom();
-  });
-  $("joinPin").addEventListener("keydown", (event) => {
-    if (event.key === "Enter") joinRoom();
-  });
   $("setPort").addEventListener("change", () => {
     settings.port = Math.max(1024, Math.min(65535, Number($("setPort").value) || 51999));
   });
@@ -801,10 +1024,12 @@ async function boot() {
   markBridge();
   setPanel("session");
   $("meAvatar").textContent = initials(settings.name);
-  $("joinName").value = settings.name;
+  $("serverName").value = settings.serverName || `${settings.name}'s server`;
+  $("serverPublic").checked = settings.public;
+  $("serverPassword").value = settings.pin;
   $("setName").value = settings.name;
   $("setPort").value = settings.port;
-  $("setPin").value = settings.pin;
+  $("setDirectory").value = settings.directory;
   $("setRelay").value = settings.relay;
   $("setUseRelay").checked = settings.useRelay;
   $("setBlender").value = settings.blender;
@@ -819,13 +1044,16 @@ async function boot() {
   await poll();
   setInterval(poll, 750);
   setInterval(embedLoop, 1200);
+  setInterval(announceServer, 15000);
+  setInterval(() => {
+    if (state.panel === "servers") loadServers();
+  }, 8000);
 
   try {
     const flags = await invoke("startup_flags");
     if (flags && flags.autohost) await hostRoom();
     if (flags && flags.autojoin) {
-      $("joinCode").value = groupCode(flags.autojoin);
-      await joinRoom();
+      await joinServer({ code: flags.autojoin, name: "server", password: false });
     }
   } catch {
     /* flags are optional */

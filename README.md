@@ -4,8 +4,9 @@ Low-latency collaborative Blender sessions, with a desktop app that launches
 Blender and **docks the live window inside the app** (native re-parenting, not
 video capture, so it keeps full GPU performance).
 
-> **Status: alpha vertical slice.** Hosting, joining by room code, TLS pinning,
-> presence, chat, object transforms, mesh streaming and window embedding work.
+> **Status: alpha vertical slice.** Hosting, the public server browser, TLS
+> pinning, presence, chat, object transforms, mesh streaming and window
+> embedding work.
 > Cross-network NAT traversal, edit-mode topology sync and the long feature list
 > in the plan are not implemented yet.
 
@@ -13,11 +14,13 @@ video capture, so it keeps full GPU performance).
 
 ## What works today
 
-* **Zero-config LAN sessions.** The host's machine is the server; room codes
-  encode the endpoint, so there is no external service.
-* **Cross-network sessions through a self-hosted relay** (`docs/RELAY.md`). The
-  host keeps one outbound tunnel, clients join with the same code, and TLS stays
-  end-to-end so the relay only forwards ciphertext.
+* **Public server browser.** Hosts set a server name, publish it to a directory,
+  and optionally add a password. Everyone can search by name and click to join;
+  room codes stay internal. Hosts can kick players from the member list. The
+  directory is a small self-hosted JSON service; entries expire after 60 seconds.
+* **LAN-first and cross-network.** The host's machine is the server. A
+  self-hosted relay (`docs/RELAY.md`) carries sessions between networks while
+  TLS stays end-to-end, so the relay only forwards ciphertext.
 * **TLS 1.3 everywhere**, self-signed host certificate, SHA-256 fingerprint
   pinning and a short verification code (no custom crypto).
 * **Host-authoritative protocol**: validated message types, size/rate limits,
@@ -45,8 +48,8 @@ video capture, so it keeps full GPU performance).
   latency and bandwidth telemetry, pause-sync, follow-host frame, and chat
   commands (`/who`, `/ping`, `/leave`, `/me`).
 * **Desktop shell** (Tauri 2, Rust + static HTML/CSS/JS): launches Blender,
-  writes the control request, docks Blender into the stage, shows room code,
-  participants, chat, diagnostics and a live verification code.
+  writes the control request, docks Blender into the stage, shows the server
+  browser, participants, chat, diagnostics and a live verification code.
 * **Modular tile workspace with fixed docks**: click **Layout** to enter edit
   mode, then drag Session, Chat or Diagnostics by its top bar onto the **Left**,
   **Right** or **Bottom** dock. Panels reflow live as you hover a dock, swap
@@ -57,20 +60,24 @@ video capture, so it keeps full GPU performance).
   same animated transition. Blender is hidden while arranging and returns to the
   viewport when you press Done or Escape.
 
-The protocol and engine have **97 passing tests**, including a real TLS
-host/client session, certificate-mismatch rejection, relay chat over a
-multiplexed tunnel, and 1,000-vertex delta round-trips under loss/reordering.
+The protocol and engine have **103 passing tests**, including a real TLS
+host/client session, certificate-mismatch rejection, relay chat, password
+rejection and host kick over a multiplexed tunnel, the public directory API, and
+1,000-vertex delta round-trips under loss/reordering.
 
 ## Cross-network
 
 ```bash
 # on a VPS or spare machine
 python -m server.relay --host 0.0.0.0 --port 7100
+python -m server.directory --host 0.0.0.0 --port 7101
 ```
 
 Set **Relay** to `your-host:7100` in Settings and enable **Host through the
-relay**. Room codes then point at the relay; joining is unchanged and the TLS
-certificate is still pinned to the host. See [docs/RELAY.md](docs/RELAY.md).
+relay**. Set **Directory URL** to `http://your-host:7101` on the host and every
+client. Published entries point at the relay; joining from the browser is
+unchanged and the TLS certificate is still pinned to the host. See
+[docs/RELAY.md](docs/RELAY.md).
 
 ## Quick start (Windows)
 
@@ -82,9 +89,11 @@ powershell -ExecutionPolicy Bypass -File scripts/bootstrap.ps1
 powershell -ExecutionPolicy Bypass -File scripts/dev.ps1
 ```
 
-`dev.ps1` builds with the GNU Rust toolchain and starts the app. Click **Host
-room**; the app launches Blender, the addon starts hosting, and the window docks
-into the stage.
+`dev.ps1` builds with the GNU Rust toolchain and starts the app. Set a server
+name and password, then click **Host server**; the app launches Blender, the
+addon starts hosting, and the window docks into the stage. With a directory URL
+configured and **List in the public server browser** enabled, the server appears
+for everyone using that directory.
 
 To start in a room immediately:
 
@@ -92,9 +101,10 @@ To start in a room immediately:
 scripts/dev.ps1 -Autohost
 ```
 
-Joining: enter the host's code (or paste the invite code) under **Join with
-code**. The first connection pins the host certificate and shows a verification
-code; compare it with the host's.
+Joining: click **Browse servers**, search by name, and press **Join**. If the
+server has a password, enter it in the prompt. The first connection pins the
+host certificate and shows a verification code; compare it with the host's. The
+host can kick anyone from the member list.
 
 ### Packaged build
 
@@ -161,6 +171,7 @@ addon/blender_multiplayer/     Blender 5.x extension (importable package)
 desktop/ui/                    static UI (no bundler)
 desktop/src-tauri/             Tauri 2 shell + Win32 embedding
 server/relay.py                self-hosted cross-network relay
+server/directory.py            self-hosted public server directory
 tests/                         protocol, chunker, leases, TLS, relay, live session
 tools/                         icon generator, mesh round-trip, smoke client
 scripts/                       bootstrap, dev launcher, packaging
@@ -199,7 +210,7 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   `blender --command extension install-file`.
 * The app launches Blender, embeds its window, and reports the live room code,
   fingerprint and verification code.
-* `pytest`: 97 passed.
+* `pytest`: 103 passed.
 
 ## Limitations
 

@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover - allows importing the module standalone
 APP_DIR = "Blendermp"
 MAX_CONTROL_BYTES = 4096
 MAX_STATUS_BYTES = 32 * 1024
-ALLOWED_ACTIONS = {"host", "join", "leave", "chat"}
+ALLOWED_ACTIONS = {"host", "join", "leave", "chat", "kick"}
 NAME_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,48}$")
 HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
@@ -141,6 +141,12 @@ def read_session() -> dict[str, Any] | None:
         if not isinstance(text, str) or not text.strip() or len(text) > 2000:
             return None
         result["text"] = text.strip()
+
+    if action == "kick":
+        target = body.get("target")
+        if not isinstance(target, str) or not NAME_RE.match(target):
+            return None
+        result["target"] = target
 
     if action == "host" and body.get("code") is not None:
         code = body.get("code")

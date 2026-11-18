@@ -99,3 +99,12 @@ The desktop app drives the addon through two JSON files in
 Open an issue with a minimal reproduction. Do not include private keys, room
 PINs or captured scene data. If the report is sensitive, say so and a private
 channel will be arranged.
+
+## Public directory
+
+The public directory stores a server's display name, host name, room endpoint,
+player count, password flag and version for at most 60 seconds after the last
+announcement. It never receives the server password, scene data, chat or
+certificates. Announcements are unauthenticated by design, so a directory
+operator can list or remove entries; clients still pin the host certificate and
+the host still validates every connection. Kicks are enforced by the host.

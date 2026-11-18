@@ -25,6 +25,7 @@ enum Action {
     Join,
     Leave,
     Chat,
+    Kick,
 }
 
 #[derive(Deserialize)]
@@ -37,6 +38,7 @@ struct SessionRequest {
     pin: Option<String>,
     fingerprint: Option<String>,
     text: Option<String>,
+    target: Option<String>,
     relay: Option<String>,
     use_relay: Option<bool>,
 }
@@ -482,7 +484,12 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
     }
     if let Some(pin) = &request.pin {
         if !valid_pin(pin) {
-            return Err("invalid room PIN".into());
+            return Err("invalid room password".into());
+        }
+    }
+    if let Some(target) = &request.target {
+        if !valid_name(target) {
+            return Err("invalid kick target".into());
         }
     }
     if let Some(fingerprint) = &request.fingerprint {
@@ -507,7 +514,7 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
     }
 
     let code = match request.action {
-        Action::Leave | Action::Chat => None,
+        Action::Leave | Action::Chat | Action::Kick => None,
         Action::Join => Some(normalize_code(request.code.as_deref().ok_or("a room code is required to join")?)?),
         Action::Host => match request.code.as_deref() {
             Some(value) => Some(normalize_code(value)?),
@@ -526,6 +533,17 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
         _ => None,
     };
 
+    let target = match request.action {
+        Action::Kick => Some(
+            request
+                .target
+                .as_deref()
+                .ok_or("a player name is required to kick")?
+                .to_string(),
+        ),
+        _ => None,
+    };
+
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_nanos())
@@ -538,6 +556,7 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
         "pin": request.pin,
         "fingerprint": request.fingerprint,
         "text": text,
+        "target": target,
         "relay": request.relay,
         "use_relay": request.use_relay,
         "nonce": format!("{:x}-{:x}", std::process::id(), stamp),

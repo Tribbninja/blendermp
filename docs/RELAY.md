@@ -91,3 +91,22 @@ python -m server.relay --host 127.0.0.1 --port 7100
 Set the relay to `127.0.0.1:7100` on the host and join from the same machine to
 exercise the full path. The test suite does this automatically
 (`tests/test_relay.py`).
+
+## Public server directory
+
+Run the directory next to the relay on the same VPS:
+
+```bash
+python -m server.directory --host 0.0.0.0 --port 7101
+```
+
+Open **TCP 7101** in the firewall. Set **Directory URL** to
+`http://your-host:7101` on the host and on every client (Settings). The host
+sets a server name, optionally a password, and enables **List in the public
+server browser**. Clients open **Browse servers**, search by name and click
+**Join**. The host can kick players from the member list.
+
+The directory stores only the server name, host name, room endpoint, player
+count, password flag and version, and forgets an entry after 60 seconds without
+a refresh. It never sees scene data, passwords or certificates. Put it behind an
+HTTPS reverse proxy if it is exposed to the public internet.

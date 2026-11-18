@@ -184,10 +184,15 @@
   }
 
   function refreshRail() {
+    const panel = callbacks.getPanel?.();
     document.querySelectorAll(".rail-btn").forEach((button) => {
       const view = button.dataset.view;
-      if (view === "settings") {
-        button.classList.toggle("active", callbacks.getPanel?.() === "settings");
+      if (view === "servers" || view === "settings") {
+        button.classList.toggle("active", panel === view);
+        return;
+      }
+      if (view === "session") {
+        button.classList.toggle("active", panel === "session" && Boolean(slotOf("session")));
         return;
       }
       button.classList.toggle("active", view === "viewport" || Boolean(slotOf(view)));
@@ -429,13 +434,23 @@
     document.querySelectorAll(".rail-btn").forEach((button) => {
       button.addEventListener("click", () => {
         const view = button.dataset.view;
-        if (view === "settings") {
+        if (view === "settings" || view === "servers") {
           setTile("session", true);
-          callbacks.setPanel?.("settings");
+          callbacks.setPanel?.(view);
           refreshRail();
           return;
         }
-        if (view === "session" || view === "chat" || view === "diagnostics") {
+        if (view === "session") {
+          if (callbacks.getPanel?.() !== "session") {
+            setTile("session", true);
+            callbacks.setPanel?.("session");
+            refreshRail();
+            return;
+          }
+          toggleTile("session");
+          return;
+        }
+        if (view === "chat" || view === "diagnostics") {
           toggleTile(view);
         }
       });

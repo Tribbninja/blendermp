@@ -106,7 +106,7 @@ class BMPState(PropertyGroup):
     name: StringProperty(default="")
     color: FloatVectorProperty(size=4, subtype="COLOR", min=0.0, max=1.0, default=(0.35, 0.8, 0.95, 1.0))
     port: IntProperty(name="Port", default=51999, min=1024, max=65535)
-    pin: StringProperty(name="Room PIN", subtype="PASSWORD", maxlen=64)
+    pin: StringProperty(name="Server password", subtype="PASSWORD", maxlen=64)
     rtt_ms: IntProperty(default=0)
     bytes_in: IntProperty(default=0)
     bytes_out: IntProperty(default=0)
@@ -180,8 +180,9 @@ def _local_ip() -> str:
 def start_host(context, code: str | None = None, port: int | None = None) -> None:
     stop_session(context)
     settings = context.window_manager.bmp
-    from .core.roomcode import FLAG_RELAY, encode_room
+    from .core.roomcode import FLAG_PIN, FLAG_RELAY, encode_room
 
+    flags = FLAG_PIN if settings.pin else 0
     relay: tuple[str, int] | None = None
     if code is None and settings.use_relay:
         host = settings.relay_host.strip()
@@ -194,12 +195,12 @@ def start_host(context, code: str | None = None, port: int | None = None) -> Non
         except ValueError as exc:
             raise ValueError("Relay host must be an IPv4 address") from exc
         relay = (host, settings.relay_port)
-        code = encode_room(host, settings.relay_port, FLAG_RELAY)
+        code = encode_room(host, settings.relay_port, flags | FLAG_RELAY)
         port = 0
     else:
         port = port or settings.port
         if not code:
-            code = encode_room(_local_ip(), port)
+            code = encode_room(_local_ip(), port, flags)
     settings.code = code
     settings.is_host = True
     settings.state = "hosting"
@@ -319,6 +320,9 @@ def _handle_event(context, kind: str, body: dict) -> None:
     elif kind == "peer_leave":
         _remove_user(context, body.get("name", "?"))
         _push_message(context, "system", f"{body.get('name', 'someone')} left")
+    elif kind == "kicked":
+        settings.last_error = str(body.get("message", "Kicked by host"))[:180]
+        _push_message(context, "system", settings.last_error)
     elif kind == "presence":
         _upsert_user(context, body.get("name", "?"), body.get("color", (1, 1, 1, 1)))
         for user in settings.users:
@@ -879,6 +883,13 @@ def _poll_control(context) -> None:
             else:
                 session.send_chat(text)
                 _push_message(context, settings.name, text)
+        elif action == "kick":
+            target = request.get("target")
+            session = runtime.get("session")
+            if session is None or not settings.is_host:
+                settings.last_error = "Only the host can kick players"
+            elif target:
+                session.kick(target)
         elif action == "leave":
             stop_session(context)
     except Exception as exc:  # noqa: BLE001
