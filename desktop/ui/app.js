@@ -729,16 +729,24 @@ function renderServers(message) {
     list.append(item);
     return;
   }
-  if (!state.servers.length) {
+  const activeCode = isActive(state.status)
+    ? String(state.status?.code || "").replace(/[^0-9A-Z]/g, "")
+    : "";
+  const visible = state.servers.filter((server) => !activeCode || server.code !== activeCode);
+  if (!visible.length) {
     const item = document.createElement("p");
     item.className = "empty";
-    item.textContent = state.serverQuery.trim()
-      ? `No public servers match "${state.serverQuery.trim()}".`
-      : "No public servers are listed right now.";
+    item.textContent = activeCode
+      ? state.status?.is_host
+        ? "Your server is listed. Other public servers will appear here."
+        : "You are connected to this server. Other public servers will appear here."
+      : state.serverQuery.trim()
+        ? `No public servers match "${state.serverQuery.trim()}".`
+        : "No public servers are listed right now.";
     list.append(item);
     return;
   }
-  for (const server of state.servers) {
+  for (const server of visible) {
     const row = document.createElement("div");
     row.className = "server-row";
 

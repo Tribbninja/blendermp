@@ -18,9 +18,10 @@ video capture, so it keeps full GPU performance).
   and optionally add a password. Everyone can search by name and click to join;
   room codes stay internal. Hosts can kick players from the member list. The
   directory is a small self-hosted JSON service; entries expire after 60 seconds.
-* **LAN-first and cross-network.** The host's machine is the server. A
+* **Self-hosted and cross-network.** The host's machine is the server. A
   self-hosted relay (`docs/RELAY.md`) carries sessions between networks while
-  TLS stays end-to-end, so the relay only forwards ciphertext.
+  TLS stays end-to-end, so the relay only forwards ciphertext. Hosts and clients
+  point at the same self-hosted directory to browse each other.
 * **TLS 1.3 everywhere**, self-signed host certificate, SHA-256 fingerprint
   pinning and a short verification code (no custom crypto).
 * **Host-authoritative protocol**: validated message types, size/rate limits,
@@ -208,8 +209,8 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   loops, UVs, smooth flags).
 * The packaged extension validates and installs with
   `blender --command extension install-file`.
-* The app launches Blender, embeds its window, and reports the live room code,
-  fingerprint and verification code.
+* The app launches Blender, embeds its window, and reports the live server
+  status, fingerprint and verification code.
 * `pytest`: 103 passed.
 
 ## Limitations
