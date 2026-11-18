@@ -217,6 +217,13 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
 * Multires is not supported.
 * Alpha software: back up work before a session.
 
+## Troubleshooting
+
+If Blender does not start or the session stays offline, check
+`%LOCALAPPDATA%\Blendermp\blender.log` (Blender and addon output) and
+`%LOCALAPPDATA%\Blendermp\ui.log` (desktop app). Blendermp requires Blender 5.x;
+on a PC without it, the installer offers to install Blender 5.3 automatically.
+
 ## Security
 
 Read [SECURITY.md](SECURITY.md). There is no custom cryptography: TLS 1.3 does

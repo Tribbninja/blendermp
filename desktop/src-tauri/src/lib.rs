@@ -3,7 +3,7 @@ mod win_embed;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::State;
@@ -179,6 +179,12 @@ fn newest_blender() -> Option<PathBuf> {
         }
     }
 
+    // The addon targets Blender 5.x. Keep unknowns (for example Steam, whose
+    // folder has no version) but drop installs that are definitely too old.
+    candidates.retain(|path| {
+        let version = blender_version(path);
+        version.is_empty() || version.first().copied().unwrap_or(0) >= 5
+    });
     candidates.sort_by(|a, b| {
         blender_version(a)
             .cmp(&blender_version(b))
@@ -202,6 +208,10 @@ fn launch_blender(state: State<AppState>, path: String, blend_file: Option<Strin
     if !exe.is_file() {
         return Err("Blender path is not a file".into());
     }
+    let version = blender_version(&exe);
+    if !version.is_empty() && version.first().copied().unwrap_or(0) < 5 {
+        return Err("Blender 5 or newer is required".into());
+    }
 
     let root = addon_root().ok_or_else(|| "addon folder not found; set BMP_ADDON_ROOT".to_string())?;
     let root_text = root.to_string_lossy().to_string();
@@ -223,6 +233,24 @@ fn launch_blender(state: State<AppState>, path: String, blend_file: Option<Strin
             }
             command.arg(blend);
         }
+    }
+
+    // Keep Blender's stdout/stderr in a log instead of a console window. This
+    // captures addon tracebacks and startup errors for support.
+    if let Ok(log) = fs::File::create(data_dir().join("blender.log")) {
+        if let Ok(err) = log.try_clone() {
+            command.stdout(Stdio::from(log)).stderr(Stdio::from(err));
+        }
+    }
+
+    // blender.exe is a console-subsystem binary. Without this flag Windows
+    // opens a console window next to Blender (and that console can be picked
+    // up as the Blender window to embed).
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
     }
 
     let child = command.spawn().map_err(|error| format!("could not start Blender: {error}"))?;
@@ -366,14 +394,50 @@ fn focus_blender(state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn read_status() -> Option<serde_json::Value> {
+fn read_status(state: State<AppState>) -> Option<serde_json::Value> {
     let path = data_dir().join("status.json");
     let metadata = fs::metadata(&path).ok()?;
     if metadata.len() > MAX_STATUS_BYTES {
         return None;
     }
     let body = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&body).ok()
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+
+    // Ignore a status left behind by a different Blender process. On the first
+    // poll after an app restart, adopt a visible Blender so joining reuses it
+    // instead of starting a second copy.
+    let status_pid = value.get("pid").and_then(|value| value.as_u64()).map(|value| value as u32);
+    let mut tracked = state.blender_pid.lock().ok()?;
+    match (*tracked, status_pid) {
+        (Some(expected), Some(actual)) => {
+            if expected != actual {
+                return None;
+            }
+            #[cfg(windows)]
+            {
+                if !win_embed::process_alive(expected) {
+                    *tracked = None;
+                    return Some(serde_json::json!({
+                        "state": "offline",
+                        "users": [],
+                        "messages": [],
+                    }));
+                }
+            }
+        }
+        (Some(_), None) => return None,
+        (None, Some(actual)) => {
+            #[cfg(windows)]
+            {
+                if win_embed::find_window_for_pid(actual).is_none() {
+                    return None;
+                }
+            }
+            *tracked = Some(actual);
+        }
+        (None, None) => {}
+    }
+    Some(value)
 }
 
 #[tauri::command]

@@ -275,6 +275,13 @@ def stop_session(context) -> None:
                 runtime["inbox"].get_nowait()
             except queue.Empty:
                 break
+    # Publish the offline state immediately; otherwise the app keeps showing
+    # the last connected status until another session starts.
+    runtime["last_status"] = 0.0
+    try:
+        _write_status(context, force=True)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
 
 
 # --------------------------------------------------------------------------- inbox
@@ -1151,10 +1158,10 @@ def _send_presence(context) -> None:
     )
 
 
-def _write_status(context) -> None:
+def _write_status(context, force: bool = False) -> None:
     session: SessionService | None = runtime.get("session")
     now = time.monotonic()
-    if now - runtime["last_status"] < STATUS_WRITE:
+    if not force and now - runtime["last_status"] < STATUS_WRITE:
         return
     runtime["last_status"] = now
     settings = context.window_manager.bmp
@@ -1190,6 +1197,7 @@ def _write_status(context) -> None:
             "messages": messages,
             "blender": bpy.app.version_string,
             "addon": ADDON_VERSION,
+            "pid": os.getpid(),
         }
     )
 
@@ -1215,11 +1223,13 @@ def bmp_tick():
             _sync_materials(context)
             _sync_modifiers(context)
             _send_presence(context)
-            _write_status(context)
-            if session.failed:
-                settings = context.window_manager.bmp
-                settings.last_error = session.failure_reason or "connection failed"
-                stop_session(context)
+        # Keep writing while offline too, so the desktop app always sees the
+        # current state and never stays stuck on "connected".
+        _write_status(context)
+        if session is not None and session.failed:
+            settings = context.window_manager.bmp
+            settings.last_error = session.failure_reason or "connection failed"
+            stop_session(context)
     except Exception:  # noqa: BLE001
         traceback.print_exc()
     return TICK
@@ -1543,6 +1553,14 @@ def unregister() -> None:
     if session:
         session.stop()
         runtime["session"] = None
+    try:
+        settings = bpy.context.window_manager.bmp
+        settings.state = "offline"
+        settings.users.clear()
+        runtime["last_status"] = 0.0
+        _write_status(bpy.context, force=True)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
     ui.unregister()
     del bpy.types.WindowManager.bmp
     for cls in reversed(classes):

@@ -78,6 +78,7 @@ const state = {
   rates: { down: 0, up: 0 },
   messagesKey: "",
   blenderBusy: false,
+  lastError: "",
   demo: demoMode,
 };
 
@@ -296,12 +297,12 @@ function renderState(status) {
   $("latency").textContent = rtt > 0 ? `${Math.round(rtt)} ms` : active ? "measuring" : "no session";
 
   const blender = status?.blender;
-  $("blenderLabel").textContent = blender ? `Blender ${blender}` : settings.blender ? "Blender ready" : "Blender not detected";
+  $("blenderLabel").textContent = blender ? `Blender ${blender}` : settings.blender ? "Blender ready" : "Blender 5.x not detected";
   $("statusRight").textContent = blender ? `Blender ${blender}` : "v0.1.0";
   $("stageMode").textContent = state.embedded ? "embedded - native" : active ? "Blender separate" : "no Blender window";
   $("statusLeft").textContent = active ? `${labels[value]} - ${code || "no code"}` : "Ready";
   $("statusMid").textContent = status?.relay ? "relay mode" : state.embedded ? "GPU passthrough" : "";
-  $("stageHint").textContent = settings.blender ? "Blender is ready to launch." : "Blender not detected - set the path in Settings.";
+  $("stageHint").textContent = settings.blender ? "Blender is ready to launch." : "Blender 5.x not detected - install Blender 5 or set the path in Settings.";
 
   if (!active) {
     $("chatSub").textContent = "Messages sync with Blender";
@@ -472,6 +473,14 @@ function renderEmbed() {
 function applyStatus(status) {
   if (!status || typeof status !== "object") return;
   state.status = status;
+  const error = String(status.last_error || "").trim();
+  if (error && error !== state.lastError) {
+    state.lastError = error;
+    log(`addon error: ${error}`);
+    toast(error, "error");
+  } else if (!error) {
+    state.lastError = "";
+  }
   renderState(status);
   renderMembers(status);
   renderMessages(status);
@@ -494,7 +503,7 @@ async function detectBlender() {
       $("setBlender").value = path;
       $("stageHint").textContent = "Blender is ready to launch.";
     } else {
-      toast("Blender not found - set the path in Settings", "error");
+      toast("Blender 5.x not found - install Blender 5 or set the path in Settings", "error");
     }
   } catch (error) {
     log(`detect_blender failed: ${error}`);
@@ -511,6 +520,18 @@ async function launchBlender() {
   if (state.blenderBusy) return;
   state.blenderBusy = true;
   try {
+    if (state.embedded) {
+      log("Blender is already embedded; reusing it");
+      await invoke("focus_blender").catch(() => {});
+      return;
+    }
+    const existing = await invoke("find_blender_window").catch(() => null);
+    if (existing) {
+      log("reusing the running Blender window");
+      if (state.embedded) await invoke("focus_blender").catch(() => {});
+      else await embedNow();
+      return;
+    }
     const pid = await invoke("launch_blender", { path: settings.blender, blendFile: null });
     log(`launch_blender ok pid=${pid}`);
     toast("Blender launching...", "ok");
@@ -578,7 +599,16 @@ async function joinRoom() {
 async function leaveRoom() {
   try {
     await request({ action: "leave" });
-    toast("Left the room");
+    toast("Leaving room...");
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const status = await poll();
+      if (!status || !isActive(status)) {
+        toast("Left the room");
+        return;
+      }
+    }
+    toast("Blender did not disconnect. Close Blender, then rejoin.", "error");
   } catch (error) {
     toast(String(error), "error");
   }
@@ -647,8 +677,10 @@ async function poll() {
   try {
     const status = await invoke("read_status");
     if (status) applyStatus(status);
+    return status;
   } catch {
     /* ignore transient read errors */
+    return null;
   }
 }
 
@@ -658,6 +690,7 @@ async function embedLoop() {
   try {
     if (!isActive(state.status)) {
       if (state.embedded) {
+        await invoke("detach_blender").catch(() => {});
         state.embedded = false;
         renderEmbed();
       }

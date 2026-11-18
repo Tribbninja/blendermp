@@ -67,7 +67,7 @@ Function .onInit
     Call DetectBlender
     StrCmp $BlenderFound "1" blender_ready
     IfSilent blender_ready
-    MessageBox MB_YESNO|MB_ICONQUESTION "Blender was not found on this PC.$\r$\n$\r$\nBlendermp needs Blender to open and sync scenes. Download and install Blender ${BLENDER_VERSION} from blender.org now?$\r$\n$\r$\nThis downloads about 366 MB. Windows will ask for administrator permission. Choose No to install Blendermp only." IDNO blender_ready
+    MessageBox MB_YESNO|MB_ICONQUESTION "Blender 5.x was not found on this PC.$\r$\n$\r$\nBlendermp needs Blender 5 or newer to open and sync scenes. Download and install Blender ${BLENDER_VERSION} from blender.org now?$\r$\n$\r$\nThis downloads about 366 MB. Windows will ask for administrator permission. Choose No to install Blendermp only." IDNO blender_ready
     StrCpy $NeedBlender "1"
     blender_ready:
 FunctionEnd

@@ -57,6 +57,19 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         return 1;
     }
 
+    // Blender's main window uses GHOST_WindowClass. Its console window (from
+    // launching blender.exe directly) also has a title containing "blender",
+    // so filter by class to avoid embedding the console.
+    let mut class_buffer = [0u16; 128];
+    let class_length = GetClassNameW(hwnd, class_buffer.as_mut_ptr(), class_buffer.len() as i32);
+    if class_length <= 0 {
+        return 1;
+    }
+    let class_name = String::from_utf16_lossy(&class_buffer[..class_length as usize]);
+    if class_name != "GHOST_WindowClass" {
+        return 1;
+    }
+
     let mut pid = 0u32;
     GetWindowThreadProcessId(hwnd, &mut pid);
     if pid == search.pid && title.to_lowercase().contains("blender") {
@@ -261,6 +274,23 @@ pub fn dismiss_splash(pid: u32) -> usize {
         let _ = EnumWindows(Some(callback), &mut search as *mut Search as LPARAM);
     }
     search.count
+}
+
+pub fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut code);
+        let _ = CloseHandle(handle);
+        ok != 0 && code == STILL_ACTIVE as u32
+    }
 }
 
 pub fn set_visible(info: &EmbedInfo, visible: bool) {

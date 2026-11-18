@@ -166,7 +166,7 @@ def write_status(data: dict[str, Any]) -> None:
         value = data.get(key)
         if isinstance(value, bool):
             safe[key] = value
-    for key in ("rtt_ms", "bytes_in", "bytes_out"):
+    for key in ("rtt_ms", "bytes_in", "bytes_out", "pid"):
         value = data.get(key)
         if isinstance(value, int) and not isinstance(value, bool):
             safe[key] = max(-1, min(value, 1 << 62))

@@ -2,10 +2,15 @@
 !ifndef BLENDER_DETECT_NSH
 !define BLENDER_DETECT_NSH
 
+!include "FileFunc.nsh"
+
 Var BlenderFound
 
 Function CheckBlenderRoot
     IfFileExists "$R9\blender.exe" 0 cbr_scan
+        ${GetFileVersion} "$R9\blender.exe" $6
+        StrCpy $7 $6 1
+        StrCmp $7 "5" 0 cbr_scan
         StrCpy $BlenderFound "1"
         Return
     cbr_scan:
@@ -13,6 +18,17 @@ Function CheckBlenderRoot
     cbr_loop:
         StrCmp $1 "" cbr_done
         IfFileExists "$R9\$1\blender.exe" 0 cbr_next
+            ${GetFileVersion} "$R9\$1\blender.exe" $6
+            StrCpy $7 $6 1
+            StrCmp $7 "5" cbr_accept
+            ; Some portable builds omit version resources; fall back to the
+            ; folder name ("Blender 5.3" or "blender-5.3.0-windows-x64").
+            StrCmp $6 "" 0 cbr_next
+            StrCpy $7 $1 9
+            StrCmp $7 "Blender 5" cbr_accept
+            StrCmp $7 "blender-5" cbr_accept
+            Goto cbr_next
+        cbr_accept:
             StrCpy $BlenderFound "1"
             Goto cbr_done
         cbr_next:
@@ -37,11 +53,11 @@ Function DetectBlender
     Call CheckBlenderRoot
     StrCmp $BlenderFound "1" detect_done
 
-    IfFileExists "$PROGRAMFILES\Steam\steamapps\common\Blender\blender.exe" 0 +2
-        StrCpy $BlenderFound "1"
+    StrCpy $R9 "$PROGRAMFILES\Steam\steamapps\common\Blender"
+    Call CheckBlenderRoot
     StrCmp $BlenderFound "1" detect_done
-    IfFileExists "$PROGRAMFILES64\Steam\steamapps\common\Blender\blender.exe" 0 +2
-        StrCpy $BlenderFound "1"
+    StrCpy $R9 "$PROGRAMFILES64\Steam\steamapps\common\Blender"
+    Call CheckBlenderRoot
     StrCmp $BlenderFound "1" detect_done
 
     ; MSI installs can use a custom INSTALL_ROOT; read the uninstall entry.
@@ -53,6 +69,9 @@ Function DetectBlender
         ReadRegStr $4 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\$3" "DisplayName"
         StrCpy $5 $4 7
         StrCmp $5 "Blender" 0 detect_reg_next
+        ReadRegStr $6 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\$3" "DisplayVersion"
+        StrCpy $7 $6 1
+        StrCmp $7 "5" 0 detect_reg_next
         ReadRegStr $4 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\$3" "InstallLocation"
         StrCmp $4 "" detect_reg_next
         IfFileExists "$4\blender.exe" detect_found
