@@ -51,7 +51,7 @@ bl_info = {
     "category": "Network",
 }
 
-ADDON_VERSION = "0.1.0"
+ADDON_VERSION = "0.1.1"
 TICK = 1.0 / 30.0
 CONTROL_POLL = 0.5
 STATUS_WRITE = 0.5

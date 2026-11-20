@@ -124,7 +124,7 @@ const demoStatus = {
   bytes_in: 184320,
   bytes_out: 92160,
   blender: "5.3.0",
-  addon: "0.1.0",
+  addon: "0.1.1",
   users: [
     { name: "isaac", color: [0.37, 0.91, 0.83, 1], ping_ms: 0, host: true },
     { name: "maya", color: [0.55, 0.63, 0.98, 1], ping_ms: 24, host: false },
@@ -377,7 +377,7 @@ function renderState(status) {
 
   const blender = status?.blender;
   $("blenderLabel").textContent = blender ? `Blender ${blender}` : settings.blender ? "Blender ready" : "Blender 5.x not detected";
-  $("statusRight").textContent = blender ? `Blender ${blender}` : "v0.1.0";
+  $("statusRight").textContent = blender ? `Blender ${blender}` : "v0.1.1";
   $("stageMode").textContent = state.embedded ? "embedded - native" : active ? "Blender separate" : "no Blender window";
   $("statusLeft").textContent = active
     ? `${labels[value]} - ${hosting ? serverDisplayName() : state.joinedServerName || "server"}`
@@ -939,7 +939,7 @@ function announceServer() {
     password: Boolean(settings.pin),
     relay: Boolean(status.relay),
     relay_url: hubRelayUrl(),
-    version: "0.1.0",
+    version: "0.1.1",
   };
   Promise.allSettled(
     targets.map(async (url) => {
