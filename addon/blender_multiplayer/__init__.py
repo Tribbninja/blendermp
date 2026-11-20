@@ -66,7 +66,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 8, 10),
+    "version": (0, 8, 11),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -312,7 +312,7 @@ class BMPState(PropertyGroup):
     paused: BoolProperty(name="Pause sync", default=False)
     follow_host: BoolProperty(name="Follow host frame", default=False)
     follow_user: StringProperty()
-    show_cameras: BoolProperty(name="Show cameras", default=True)
+    show_cameras: BoolProperty(name="Show camera widgets", default=False)
     show_selections: BoolProperty(name="Show selections", default=True)
     show_labels: BoolProperty(name="Show name tags", default=True)
     show_lasers: BoolProperty(name="Show laser pointers", default=True)
@@ -481,7 +481,6 @@ def start_host(
     settings.is_host = True
     settings.state = "hosting"
     settings.role = "owner"
-    settings.show_cameras = True
     settings.show_selections = True
     settings.show_labels = True
     settings.last_error = ""
@@ -543,7 +542,6 @@ def start_join(
     settings.is_host = False
     settings.state = "joining"
     settings.role = "editor"
-    settings.show_cameras = True
     settings.show_selections = True
     settings.show_labels = True
     settings.last_error = ""
@@ -5161,7 +5159,7 @@ def _camera_segments(matrix, aspect: float, distance: float = 7.0, scale: float 
         orbit = 7.0
     if not math.isfinite(orbit) or orbit <= 0.0:
         orbit = 7.0
-    size = max(0.15, min(0.6, orbit * 0.06)) * max(0.5, min(2.0, float(scale or 1.0)))
+    size = 0.3 * max(0.5, min(2.0, float(scale or 1.0)))
     forward = size
     height = size * 0.35
     width = height * max(0.6, min(2.6, float(aspect or 1.6)))
@@ -5342,7 +5340,7 @@ def _sync_remote_visuals(context) -> None:
     settings = context.window_manager.bmp
     from mathutils import Vector
 
-    show_cameras = bool(getattr(settings, "show_cameras", True))
+    show_cameras = bool(getattr(settings, "show_cameras", False))
     show_selections = bool(getattr(settings, "show_selections", True))
     show_lasers = bool(getattr(settings, "show_lasers", True))
     colorblind = bool(getattr(settings, "colorblind_safe", False))
@@ -5396,7 +5394,7 @@ def _sync_remote_visuals(context) -> None:
             matrix = _smooth_view(user.name, list(user.view), now)
             if matrix is not None:
                 origin = matrix.translation
-                widget = max(0.15, min(0.6, float(user.view_distance) * 0.06))
+                widget = 0.2
                 if show_cameras:
                     segments = _camera_segments(
                         matrix,
@@ -5565,6 +5563,12 @@ def _draw_remote_labels() -> None:
         except Exception:  # noqa: BLE001
             pass
     drawn = []
+    try:
+        # A previous draw (or an older addon build) can leave the native blurry
+        # shadow enabled on this font; clear it so only our crisp outline shows.
+        blf.disable(font, blf.SHADOW)
+    except Exception:  # noqa: BLE001
+        pass
     for position, name, color in labels:
         clip = matrix @ Vector((position[0], position[1], position[2], 1.0))
         if clip.w <= 0.0001:
@@ -5588,16 +5592,14 @@ def _draw_remote_labels() -> None:
                 (outline, 0),
                 (0, -outline),
                 (0, outline),
-                (-outline, -outline),
-                (outline, outline),
-                (-outline, outline),
-                (outline, -outline),
             ):
                 blf.position(font, left + offset_x, base + offset_y, 0.0)
                 blf.draw(font, name)
             red, green, blue = _readable_label(color)
             blf.color(font, red, green, blue, 1.0)
             blf.position(font, left, base, 0.0)
+            # Draw the fill twice so it fully covers the outline interior.
+            blf.draw(font, name)
             blf.draw(font, name)
             drawn.append((name, x, y))
         except Exception:  # noqa: BLE001

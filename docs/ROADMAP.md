@@ -14,6 +14,7 @@ Progress log:
 - [x] 2026-11-20: Phase 1 lock reliability: lease sweep broadcasts `expiring`/`released`, snapshot-driven owner cleanup, expiry auto-renew, request queue, host-side grant/deny, lock status in the N-panel.
 - [x] 2026-11-20: Phase 1 presence 2.0: edit-mode vertex selection relay/points, 3D cursor, follow-user camera, overlay toggles. Laser pointer removed after poor reliability.
 - [x] 2026-11-20: Phase 1 roles: host assigns viewer/commenter/editor/admin, server-enforced mutating-frame guard, downgrade releases leases, role UI in the desktop member list.
+- [x] 2026-11-21: 0.8.11: remote camera widgets are off by default and use a fixed world size (no growth with the other user zoom); labels clear any stale blf shadow and use a thin 1px outline with a doubled fill.
 - [x] 2026-11-21: 0.8.10: crash detection only reports unclean exits from active sessions; a forced kill while offline (installer/update) no longer shows a false crash notice.
 - [x] 2026-11-21: 0.8.9: lease robustness: the host only force-takes a lease when it actually changes the object (no more stealing client leases every tick); blocked selections are cleared even if already selected; releases on deselect/leave/role change remain.
 - [x] 2026-11-21: 0.8.8: hosts advertise a direct code for every local IPv4 (Wi-Fi + Windows ICS Ethernet); the client picks the code on its own /24, so ICS-connected PCs get LAN latency instead of the relay.
