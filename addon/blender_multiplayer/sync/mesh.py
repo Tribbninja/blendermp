@@ -202,6 +202,64 @@ class MeshMirror:
         self.hashes = chunker.chunk_hashes(self.shadow)
 
 
+def snapshot_bmesh(bm) -> bytes:
+    """Encode the live Edit Mode BMesh as a full compressed geometry snapshot."""
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    verts = len(bm.verts)
+    positions = np.empty(verts * 3, dtype=np.float32)
+    try:
+        bm.verts.foreach_get("co", positions)
+        positions = positions.reshape(-1, 3)
+    except (AttributeError, TypeError, RuntimeError):
+        positions = np.array(
+            [[vert.co.x, vert.co.y, vert.co.z] for vert in bm.verts],
+            dtype=np.float32,
+        ).reshape(-1, 3)
+    edges = np.empty(len(bm.edges) * 2, dtype=np.uint32)
+    for index, edge in enumerate(bm.edges):
+        edges[index * 2] = edge.verts[0].index
+        edges[index * 2 + 1] = edge.verts[1].index
+    loops = []
+    starts = []
+    totals = []
+    smooth = []
+    materials = []
+    for face in bm.faces:
+        start = len(loops)
+        face_loops = list(face.loops)
+        loops.extend(loop.vert.index for loop in face_loops)
+        starts.append(start)
+        totals.append(len(face_loops))
+        smooth.append(1 if face.smooth else 0)
+        materials.append(int(face.material_index))
+    layer = bm.loops.layers.uv.active
+    uvs = None
+    uv_name = ""
+    if layer is not None:
+        uv_name = layer.name
+        uv_values = []
+        for face in bm.faces:
+            for loop in face.loops:
+                uv = loop[layer].uv
+                uv_values.extend((uv.x, uv.y))
+        if len(uv_values) == len(loops) * 2:
+            uvs = np.asarray(uv_values, dtype=np.float32)
+    geometry = chunker.encode_geometry(
+        positions,
+        np.asarray(edges, dtype=np.uint32),
+        np.asarray(loops, dtype=np.uint32),
+        np.asarray(starts, dtype=np.uint32),
+        np.asarray(totals, dtype=np.uint32),
+        np.asarray(smooth, dtype=np.uint8),
+        np.asarray(materials, dtype=np.uint32),
+        uv_name or None,
+        uvs,
+    )
+    return chunker.pack_geometry(geometry)
+
+
 class EditMirror:
     """Position mirror for a mesh that is currently in Edit Mode.
 

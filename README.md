@@ -29,9 +29,10 @@ surface that cross-process re-parenting causes on some GPUs).
   materials, modifiers, collections, active camera, world background and render
   settings; the joining Blender replaces its local scene with that snapshot
   before live sync starts, so both start identical.
-* **Live Edit Mode vertex sync**: vertex moves stream as compact deltas at up to
-  30 Hz in both directions, without leaving Edit Mode. Structural edits apply
-  when the editor leaves Edit Mode.
+* **Live Edit Mode topology**: vertex drags stream as deltas, and structural
+  changes (extrude, subdivide, bevel, delete) send a debounced full topology
+  snapshot after the operation settles. The receiver rebuilds the mesh while
+  remaining in Object Mode.
 * **One editor per object**: selecting an object claims an edit lease. Other
   players see it locked (unselectable) and cannot edit it until the owner
   deselects or leaves. The active object name is shown for each player.
@@ -71,7 +72,8 @@ surface that cross-process re-parenting causes on some GPUs).
   applied exactly at network rate (up to 60 Hz on LAN). There is no display
   interpolation, so the remote view never lags behind the authoritative state.
 * **Basic material sync**: Principled BSDF base colour, metallic, roughness and
-  emission, plus the viewport colour, for the active object. Node graphs and
+  emission, plus the viewport colour, for every object's material slots.
+  Imported objects carry their slot colours on creation. Full node graphs and
   textures are not replicated yet.
 * **Modifier stack sync**: common modifiers (Subdivision, Mirror, Array, Solidify,
   Bevel, Decimate, Triangulate, Smooth, Weld, Screw) and geometry-nodes group

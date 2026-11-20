@@ -43,12 +43,12 @@ from .core import object_payload
 from .core.version import ADDON_VERSION
 from .session import MAX_MESH, SessionService
 from .sync import objects as obj_sync
-from .sync.mesh import EditMirror, MeshMirror
+from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 1, 12),
+    "version": (0, 1, 13),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -56,6 +56,8 @@ bl_info = {
 }
 
 TICK = 1.0 / 60.0
+TOPOLOGY_POLL = 0.2
+TOPOLOGY_DEBOUNCE = 0.15
 CONTROL_POLL = 0.5
 STATUS_WRITE = 0.5
 MESH_POLL = 1.0 / 20.0
@@ -140,6 +142,9 @@ runtime: dict = {
     "last_edit_sel": 0.0,
     "last_selection_uid": "",
     "last_selection_count": 0,
+    "topology_sig": {},
+    "topology_due": {},
+    "last_topology": 0.0,
     "create_errors": set(),
     "draw_lines": None,
     "draw_labels": None,
@@ -164,6 +169,7 @@ runtime: dict = {
     "lease_request": None,
     "lease_requests": {},
     "last_material": 0.0,
+    "material_cursor": 0,
     "last_presence": 0.0,
     "control_checked": 0.0,
     "started": 0.0,
@@ -1046,26 +1052,31 @@ def _sync_materials(context) -> None:
     if now - runtime["last_material"] < 0.25:
         return
     runtime["last_material"] = now
-    obj = context.active_object
-    if obj is None or not getattr(obj, "material_slots", None):
+    candidates = [
+        item
+        for item in context.scene.objects
+        if item.get("bmp_uuid") and getattr(item, "material_slots", None)
+    ]
+    if not candidates:
         return
-    uid = obj.get("bmp_uuid")
-    if not uid:
-        return
-    owner = runtime["lease_owners"].get(uid)
-    if owner is not None and owner != settings.name:
-        return
-    for index, slot in enumerate(obj.material_slots):
-        material = slot.material
-        if material is None:
+    cursor = runtime.get("material_cursor", 0) % len(candidates)
+    runtime["material_cursor"] = cursor + 4
+    for obj in candidates[cursor : cursor + 4]:
+        uid = obj.get("bmp_uuid")
+        owner = runtime["lease_owners"].get(uid)
+        if owner is not None and owner != settings.name:
             continue
-        data = material_values(material)
-        signature = _material_signature(data)
-        key = (uid, index)
-        if runtime["material_shadow"].get(key) == signature:
-            continue
-        runtime["material_shadow"][key] = signature
-        session.send_material(uid, index, data)
+        for index, slot in enumerate(obj.material_slots[:16]):
+            material = slot.material
+            if material is None:
+                continue
+            data = material_values(material)
+            signature = _material_signature(data)
+            key = (uid, index)
+            if runtime["material_shadow"].get(key) == signature:
+                continue
+            runtime["material_shadow"][key] = signature
+            session.send_material(uid, index, data)
 
 
 def _apply_material(context, body: dict) -> None:
@@ -1754,6 +1765,14 @@ def _send_object_create(session: SessionService, obj) -> None:
     collections = [collection for collection in getattr(obj, "users_collection", []) if collection != bpy.context.scene.collection]
     if collections:
         meta["collection"] = collections[0].name[:64]
+    materials = []
+    for index, slot in enumerate(getattr(obj, "material_slots", [])[:16]):
+        if slot.material is not None:
+            data = material_values(slot.material)
+            data["slot"] = index
+            materials.append(data)
+    if materials:
+        meta["materials"] = materials
     geometry = b""
     if kind == object_payload.KIND_MESH:
         mirror = runtime["mirrors"].get(uid)
@@ -1867,6 +1886,14 @@ def _apply_object_create(context, body: dict) -> None:
         if parent is not None:
             obj.parent = parent
             obj_sync.apply(uid, meta.get("matrix", []))
+    materials = meta.get("materials")
+    if isinstance(materials, list):
+        for item in materials[:16]:
+            if not isinstance(item, dict):
+                continue
+            slot = item.get("slot")
+            if isinstance(slot, int) and 0 <= slot <= 255:
+                _apply_material(context, {"uuid": uid, "slot": slot, "material": item})
 
 
 def _apply_object_delete(context, body: dict) -> None:
@@ -2042,6 +2069,46 @@ def _sync_transforms(context) -> None:
         del shadow[stale]
 
 
+def _sync_edit_topology(context, session: SessionService, obj, bm) -> None:
+    """Debounced full snapshots when Edit Mode topology changes."""
+    now = time.monotonic()
+    if now - runtime["last_topology"] < TOPOLOGY_POLL:
+        return
+    runtime["last_topology"] = now
+    uid = obj.get("bmp_uuid")
+    if not uid:
+        return
+    count = len(bm.edges)
+    sample = []
+    if count:
+        for index in list(range(min(128, count))) + list(range(max(0, count - 128), count)):
+            edge = bm.edges[index]
+            sample.append((edge.verts[0].index, edge.verts[1].index))
+    signature = (len(bm.verts), count, len(bm.faces), hash(tuple(sample)))
+    if signature != runtime["topology_sig"].get(uid):
+        runtime["topology_sig"][uid] = signature
+        runtime["topology_due"][uid] = now + TOPOLOGY_DEBOUNCE
+    due = runtime["topology_due"].get(uid, 0.0)
+    if not due or now < due:
+        return
+    runtime["topology_due"].pop(uid, None)
+    try:
+        payload = snapshot_bmesh(bm)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return
+    if not payload:
+        return
+    if len(payload) > MAX_MESH:
+        _push_message(context, "system", f"Topology for {obj.name[:40]} is too large to sync")
+        return
+    session.send_mesh(obj, "snapshot", payload, 0)
+    # The position mirror no longer matches the new topology.
+    runtime["edit_mirrors"].pop(uid, None)
+    runtime["mirrors"].pop(uid, None)
+    _push_message(context, "system", f"Topology synced for {obj.name[:40]}")
+
+
 def _sync_edit_mesh(context, session: SessionService, obj) -> None:
     """Stream vertex moves while an object is in Edit Mode.
 
@@ -2080,6 +2147,7 @@ def _sync_edit_mesh(context, session: SessionService, obj) -> None:
         bm = bmesh.from_edit_mesh(obj.data)
     except Exception:  # noqa: BLE001
         return
+    _sync_edit_topology(context, session, obj, bm)
     mirror = runtime["edit_mirrors"].get(uid)
     if mirror is None or not mirror.matches(bm):
         # Seed from the object's pre-edit mesh, not from the BMesh. If the user
@@ -2266,9 +2334,9 @@ def _camera_segments(matrix, aspect: float, distance: float = 7.0) -> list:
         orbit = 7.0
     if not math.isfinite(orbit) or orbit <= 0.0:
         orbit = 7.0
-    size = max(0.25, min(2.5, orbit * 0.12))
+    size = max(0.15, min(0.6, orbit * 0.06))
     forward = size
-    height = size * 0.34
+    height = size * 0.35
     width = height * max(0.6, min(2.6, float(aspect or 1.6)))
     apex = matrix @ Vector((0.0, 0.0, 0.0))
     corners = [
@@ -2277,18 +2345,10 @@ def _camera_segments(matrix, aspect: float, distance: float = 7.0) -> list:
         matrix @ Vector((width, height, -forward)),
         matrix @ Vector((-width, height, -forward)),
     ]
-    tip = matrix @ Vector((0.0, 0.0, -forward))
-    arrow = [
-        matrix @ Vector((-width * 0.45, 0.0, -forward + size * 0.28)),
-        matrix @ Vector((width * 0.45, 0.0, -forward + size * 0.28)),
-    ]
     segments = [(apex, corner) for corner in corners]
     segments.extend(
         (corners[index], corners[(index + 1) % 4]) for index in range(4)
     )
-    segments.append((apex, tip))
-    segments.append((tip, arrow[0]))
-    segments.append((tip, arrow[1]))
     return segments
 
 
@@ -2307,7 +2367,9 @@ def _object_segments(obj, max_edges: int = 2500) -> list:
     if obj.type == "MESH":
         mesh = obj.data
         count = len(mesh.vertices)
-        if count and len(mesh.edges) <= max_edges:
+        # Only tiny meshes get a true edge outline. Dense imported models look
+        # like a wireframe overlay otherwise, so use a clean bounding box.
+        if count and 0 < len(mesh.edges) <= 120:
             segments = []
             for edge in mesh.edges:
                 first, second = edge.vertices
@@ -2317,8 +2379,6 @@ def _object_segments(obj, max_edges: int = 2500) -> list:
                 end = matrix @ mesh.vertices[second].co
                 if not all(math.isfinite(float(value)) for value in (*start, *end)):
                     continue
-                # Ignore corrupt/oversized geometry rather than drawing a line
-                # across the whole viewport.
                 if (end - start).length > max_length:
                     continue
                 segments.append((start, end))
@@ -2457,7 +2517,7 @@ def _sync_remote_visuals(context) -> None:
                 for first, second in segments:
                     max_segment = max(max_segment, float((second - first).length))
                 origin = matrix.translation
-                widget = max(0.25, min(2.5, float(user.view_distance) * 0.12))
+                widget = max(0.15, min(0.6, float(user.view_distance) * 0.06))
                 labels.append(
                     (origin + Vector((0.0, 0.0, widget * 0.5)), user.name, color)
                 )
@@ -2604,18 +2664,22 @@ def _draw_remote_labels() -> None:
     height = float(region.height)
     matrix = region_data.perspective_matrix
     font = 0
-    pad = 1
     lift = 8
     try:
-        # Fixed point size at the default DPI keeps the tags identical on
-        # every display instead of looking doubled or blurry on HiDPI.
         blf.size(font, 12.0, 72.0)
     except Exception:  # noqa: BLE001
         try:
             blf.size(font, 12)
         except Exception:  # noqa: BLE001
             pass
-    outline = ((-pad, 0.0), (pad, 0.0), (0.0, -pad), (0.0, pad))
+    shadow_native = False
+    try:
+        blf.enable(font, blf.SHADOW)
+        blf.shadow(font, 3, 0.0, 0.0, 0.0, 1.0)
+        blf.shadow_offset(font, 1, -1)
+        shadow_native = True
+    except Exception:  # noqa: BLE001
+        shadow_native = False
     drawn = []
     for position, name, color in labels:
         clip = matrix @ Vector((position[0], position[1], position[2], 1.0))
@@ -2625,20 +2689,25 @@ def _draw_remote_labels() -> None:
         y = (clip.y / clip.w * 0.5 + 0.5) * height + lift
         if x < -160 or y < -160 or x > width + 160 or y > height + 160:
             continue
-        if any(other == name and abs(x - ox) < 18 and abs(y - oy) < 18 for other, ox, oy in drawn):
+        if any(other == name and abs(x - ox) < 24 and abs(y - oy) < 24 for other, ox, oy in drawn):
             continue
         try:
             text_width, _text_height = blf.dimensions(font, name)
             left = round(x - text_width * 0.5)
             base = round(y)
-            blf.color(font, 0.015, 0.015, 0.02, 0.95)
-            for dx, dy in outline:
-                blf.position(font, left + dx, base + dy, 0.0)
+            if not shadow_native:
+                blf.color(font, 0.015, 0.015, 0.02, 0.95)
+                blf.position(font, left + 1, base - 1, 0.0)
                 blf.draw(font, name)
             blf.color(font, float(color[0]), float(color[1]), float(color[2]), 1.0)
             blf.position(font, left, base, 0.0)
             blf.draw(font, name)
             drawn.append((name, x, y))
+        except Exception:  # noqa: BLE001
+            pass
+    if shadow_native:
+        try:
+            blf.disable(font, blf.SHADOW)
         except Exception:  # noqa: BLE001
             pass
 
