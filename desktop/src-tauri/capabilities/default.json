@@ -22,6 +22,7 @@
     "allow-write-settings",
     "allow-startup-flags",
     "allow-write-session",
-    "allow-log-client"
+    "allow-log-client",
+    "allow-export-diagnostics"
   ]
 }

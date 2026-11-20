@@ -52,7 +52,17 @@ class BMP_PT_main(bpy.types.Panel):
         if settings.last_error:
             error = layout.box()
             error.alert = True
-            error.label(text=settings.last_error[:180], icon="ERROR")
+            label = f"[{settings.last_error_code}] {settings.last_error}" if settings.last_error_code else settings.last_error
+            error.label(text=label[:180], icon="ERROR")
+
+        if settings.crash_notice:
+            crash = layout.box()
+            crash.alert = True
+            crash.label(text="Blendermp closed unexpectedly last time", icon="RECOVER_LAST")
+            crash.label(text=settings.crash_notice[:180])
+            row = crash.row(align=True)
+            row.operator("bmp.recover_checkpoints", text="Recover", icon="FILE_REFRESH")
+            row.operator("bmp.dismiss_crash", text="Dismiss", icon="X")
 
         if settings.state != "offline":
             box = layout.box()

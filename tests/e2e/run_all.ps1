@@ -1,0 +1,17 @@
+param(
+    [string]$Blender = 'C:\Program Files\Blender Foundation\Blender 5.3\blender.exe'
+)
+$ErrorActionPreference = 'Stop'
+$failed = @()
+foreach ($name in @('run_material.ps1', 'run_details.ps1', 'run_topology.ps1')) {
+    Write-Host "== $name" -ForegroundColor Cyan
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot $name) -Blender $Blender
+    if ($LASTEXITCODE -ne 0) {
+        $failed += $name
+    }
+}
+if ($failed.Count -gt 0) {
+    Write-Host ("FAILED: " + ($failed -join ', ')) -ForegroundColor Red
+    exit 1
+}
+Write-Host 'ALL E2E OK' -ForegroundColor Green

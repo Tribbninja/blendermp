@@ -134,7 +134,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.1.16";
+const APP_VERSION = "0.1.17";
 const PROTOCOL_VERSION = 2;
 const CAPABILITIES = 1; // core presence view; keep in sync with core/protocol.py
 const settings = {
@@ -273,6 +273,8 @@ async function mockInvoke(command) {
       return null;
     case "write_settings":
       return null;
+    case "export_diagnostics":
+      return "C:\\Users\\you\\AppData\\Local\\Blendermp\\diagnostics\\blendermp-diagnostics-demo.zip";
     case "launch_blender":
       return 4242;
     case "find_blender_window":
@@ -781,8 +783,9 @@ function applyStatus(status) {
   const error = String(status.last_error || "").trim();
   if (error && error !== state.lastError) {
     state.lastError = error;
-    log(`addon error: ${error}`);
-    toast(error, "error");
+    const errorCode = String(status.error_code || "").trim();
+    log(errorCode ? `addon error [${errorCode}]: ${error}` : `addon error: ${error}`);
+    toast(errorCode ? `${errorCode}: ${error}` : error, "error");
   } else if (!error) {
     state.lastError = "";
   }
@@ -840,6 +843,21 @@ async function detectBlender() {
   } catch (error) {
     log(`detect_blender failed: ${error}`);
     toast(`Blender detection failed: ${error}`, "error");
+  }
+}
+
+async function exportDiagnostics() {
+  if (!isTauri) {
+    toast("Browser demo mode - desktop features are off", "error");
+    return;
+  }
+  try {
+    const path = await invoke("export_diagnostics");
+    log(`diagnostics exported -> ${path}`);
+    toast("Diagnostics bundle saved", "ok");
+  } catch (error) {
+    log(`export_diagnostics failed: ${error}`);
+    toast(`Diagnostics failed: ${error}`, "error");
   }
 }
 
@@ -1480,6 +1498,7 @@ function wire() {
   $("collapseLeft").addEventListener("click", () => window.BMPLayout?.setTile("session", false));
   $("refreshBtn").addEventListener("click", poll);
   $("detectBtn").addEventListener("click", detectBlender);
+  $("exportDiagnostics").addEventListener("click", exportDiagnostics);
   $("saveSettings").addEventListener("click", () => {
     settings.name = $("setName").value.trim() || settings.name;
     settings.port = Math.max(1024, Math.min(65535, Number($("setPort").value) || 51999));

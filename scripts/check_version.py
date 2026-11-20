@@ -69,7 +69,16 @@ def collect() -> dict[str, str | None]:
     }
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    global ROOT
+    argv = sys.argv[1:] if argv is None else argv
+    if "--root" in argv:
+        index = argv.index("--root")
+        try:
+            ROOT = Path(argv[index + 1]).resolve()
+        except IndexError:
+            print("--root needs a path")
+            return 2
     version = expected_version()
     values = collect()
     bad = {name: value for name, value in values.items() if value != version}

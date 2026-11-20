@@ -48,6 +48,12 @@ def certs_dir() -> Path:
     return path
 
 
+def checkpoints_dir() -> Path:
+    path = data_dir() / "checkpoints"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def session_path() -> Path:
     return data_dir() / "session.json"
 
@@ -243,10 +249,17 @@ def read_session() -> dict[str, Any] | None:
 def write_status(data: dict[str, Any]) -> None:
     """Write a bounded, sanitised status document atomically."""
     safe: dict[str, Any] = {}
-    for key in ("state", "code", "name", "addon", "blender", "fingerprint", "verify_code", "last_error", "role", "overlay_info", "direct_code"):
+    for key in ("state", "code", "name", "addon", "blender", "fingerprint", "verify_code", "last_error", "error_code", "role", "overlay_info", "direct_code"):
         value = data.get(key)
         if isinstance(value, str):
             safe[key] = value[:256]
+    scene = data.get("scene")
+    if isinstance(scene, dict):
+        safe["scene"] = {
+            key: max(0, min(int(scene.get(key, 0)), 1 << 40))
+            for key in ("objects", "meshes", "vertices", "materials", "images", "collections")
+            if isinstance(scene.get(key, 0), int) and not isinstance(scene.get(key, 0), bool)
+        }
     for key in ("is_host", "relay", "fast_mode"):
         value = data.get(key)
         if isinstance(value, bool):

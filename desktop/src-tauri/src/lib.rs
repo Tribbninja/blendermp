@@ -645,6 +645,230 @@ fn chrono_stamp() -> String {
     format!("{seconds}")
 }
 
+fn redact_text(text: &str) -> String {
+    let mut output = text.to_string();
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        if !home.is_empty() {
+            output = output.replace(&home, "<home>");
+        }
+    }
+    if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+        if !appdata.is_empty() {
+            output = output.replace(&appdata, "<appdata>");
+        }
+    }
+    output
+}
+
+fn redact_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for key in keys {
+                let lower = key.to_lowercase();
+                if lower == "hostkey"
+                    || lower == "host_key"
+                    || lower == "relaytoken"
+                    || lower == "relay_token"
+                    || lower == "token"
+                    || lower == "pin"
+                    || lower == "password"
+                    || lower == "secret"
+                    || lower == "privatekey"
+                    || lower == "private_key"
+                    || lower.contains("token")
+                    || lower.contains("secret")
+                {
+                    map.insert(key, serde_json::Value::String("<redacted>".into()));
+                }
+            }
+            for item in map.values_mut() {
+                redact_json(item);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut().take(256) {
+                redact_json(item);
+            }
+        }
+        serde_json::Value::String(text) => {
+            *text = redact_text(text);
+        }
+        _ => {}
+    }
+}
+
+fn tail_log(path: &Path, max_lines: usize) -> String {
+    let Ok(text) = fs::read_to_string(path) else {
+        return String::new();
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..]
+        .iter()
+        .map(|line| {
+            let lower = line.to_lowercase();
+            if lower.contains("hostkey")
+                || lower.contains("relay_token")
+                || lower.contains("\"pin\"")
+                || lower.contains("password")
+                || lower.contains("private_key")
+            {
+                "[redacted line]".to_string()
+            } else {
+                redact_text(line)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn gpu_names() -> String {
+    #[cfg(windows)]
+    {
+        if let Ok(output) = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name) -join '; '",
+            ])
+            .output()
+        {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !text.is_empty() {
+                    return text.chars().take(300).collect();
+                }
+            }
+        }
+    }
+    "unknown".into()
+}
+
+fn run_zip(stage: &Path, destination: &Path) -> Result<(), String> {
+    let status = Command::new("tar")
+        .arg("-a")
+        .arg("-c")
+        .arg("-f")
+        .arg(destination)
+        .arg("-C")
+        .arg(stage)
+        .arg(".")
+        .status();
+    if let Ok(status) = status {
+        if status.success() && destination.is_file() {
+            return Ok(());
+        }
+    }
+    let pattern = format!("{}/*", stage.display());
+    let status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Compress-Archive -Force -Path $args[0] -DestinationPath $args[1]",
+        ])
+        .arg(pattern)
+        .arg(destination)
+        .status()
+        .map_err(|error| error.to_string())?;
+    if status.success() && destination.is_file() {
+        Ok(())
+    } else {
+        Err("could not create the diagnostics archive".into())
+    }
+}
+
+#[tauri::command]
+fn export_diagnostics(app: tauri::AppHandle) -> Result<String, String> {
+    let directory = data_dir();
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let stamp = chrono_stamp();
+    let stage = std::env::temp_dir().join(format!("blendermp-diag-{}-{}", std::process::id(), stamp));
+    fs::create_dir_all(&stage).map_err(|error| error.to_string())?;
+
+    let status = fs::read_to_string(directory.join("status.json")).unwrap_or_default();
+    let status_json: serde_json::Value =
+        serde_json::from_str(&status).unwrap_or(serde_json::Value::Null);
+    let addon = status_json
+        .get("addon")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let versions = serde_json::json!({
+        "app": app.package_info().version.to_string(),
+        "addon": addon,
+        "protocol": 2,
+        "blender": status_json.get("blender").cloned().unwrap_or(serde_json::Value::Null),
+    });
+    let system = serde_json::json!({
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "processor": std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_default(),
+        "processors": std::env::var("NUMBER_OF_PROCESSORS").unwrap_or_default(),
+        "gpu": gpu_names(),
+        "app": app.package_info().version.to_string(),
+    });
+
+    let write_json = |name: &str, mut value: serde_json::Value| -> Result<(), String> {
+        redact_json(&mut value);
+        let body = serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())?;
+        fs::write(stage.join(name), body).map_err(|error| error.to_string())
+    };
+
+    write_json("versions.json", versions)?;
+    write_json("system.json", system)?;
+    write_json("status.json", status_json)?;
+
+    for (name, target_name) in [
+        ("settings.json", "settings.redacted.json"),
+        ("session.json", "session.redacted.json"),
+    ] {
+        let path = directory.join(name);
+        if let Ok(text) = fs::read_to_string(&path) {
+            let value: serde_json::Value =
+                serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+            write_json(target_name, value)?;
+        }
+    }
+
+    for name in ["ui.log", "blender.log", "events.log", "events.log.1"] {
+        let text = tail_log(&directory.join(name), 500);
+        if !text.is_empty() {
+            fs::write(stage.join(name), text).map_err(|error| error.to_string())?;
+        }
+    }
+
+    let heartbeats = directory.join("heartbeats");
+    if let Ok(entries) = fs::read_dir(&heartbeats) {
+        let mut values = Vec::new();
+        for entry in entries.flatten().take(32) {
+            if let Ok(text) = fs::read_to_string(entry.path()) {
+                if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) {
+                    redact_json(&mut value);
+                    values.push(value);
+                }
+            }
+        }
+        write_json("heartbeats.json", serde_json::Value::Array(values))?;
+    }
+
+    fs::write(
+        stage.join("README.txt"),
+        "Blendermp support bundle\nPaths, host keys, relay tokens and PINs are redacted.\n",
+    )
+    .map_err(|error| error.to_string())?;
+
+    let target = directory
+        .join("diagnostics")
+        .join(format!("blendermp-diagnostics-{stamp}.zip"));
+    fs::create_dir_all(target.parent().unwrap_or(&directory)).map_err(|error| error.to_string())?;
+    let result = run_zip(&stage, &target);
+    let _ = fs::remove_dir_all(&stage);
+    result?;
+    Ok(target.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 fn startup_flags() -> serde_json::Value {
     let autohost = std::env::args().any(|arg| arg == "--autohost");
@@ -849,7 +1073,8 @@ pub fn run() {
             write_settings,
             log_client,
             startup_flags,
-            write_session
+            write_session,
+            export_diagnostics
         ])
         .on_window_event(|window, event| {
             // Closing the app also closes the Blender instance it launched.
@@ -898,3 +1123,38 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running Blendermp");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_secret_keys_case_insensitively() {
+        let mut value = serde_json::json!({
+            "hostKey": "secret-value",
+            "relayToken": "token-value",
+            "pin": "1234",
+            "name": "Ada",
+            "nested": {"password": "hunter2"},
+        });
+        redact_json(&mut value);
+        assert_eq!(value["hostKey"], "<redacted>");
+        assert_eq!(value["relayToken"], "<redacted>");
+        assert_eq!(value["pin"], "<redacted>");
+        assert_eq!(value["nested"]["password"], "<redacted>");
+        assert_eq!(value["name"], "Ada");
+    }
+
+    #[test]
+    fn redacts_user_paths() {
+        let home = std::env::var("USERPROFILE").unwrap_or_default();
+        if home.is_empty() {
+            return;
+        }
+        let text = format!("{home}\\Documents\\scene.blend");
+        let redacted = redact_text(&text);
+        assert!(!redacted.contains(&home));
+        assert!(redacted.contains("<home>"));
+    }
+}
+

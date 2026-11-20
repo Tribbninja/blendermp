@@ -38,7 +38,7 @@ if __package__:
     from .core import image_payload
     from .core import material as material_payload
     from .core import object_payload, protocol, tls
-    from .core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, Frame, MessageType
+    from .core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, ErrorCode, Frame, MessageType
     from .core.roomcode import FLAG_RELAY, decode_room, encode_room, room_id
     from .core.version import ADDON_VERSION, compatible
     from .net.relay import RelayClientAgent, RelayHostAgent
@@ -48,7 +48,7 @@ else:  # pragma: no cover - allows importing the module standalone (tests)
     from core import image_payload
     from core import material as material_payload
     from core import object_payload, protocol, tls
-    from core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, Frame, MessageType
+    from core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, ErrorCode, Frame, MessageType
     from core.roomcode import FLAG_RELAY, decode_room, encode_room, room_id
     from core.version import ADDON_VERSION, compatible
     from net.relay import RelayClientAgent, RelayHostAgent
@@ -267,6 +267,7 @@ class SessionService:
 
         self.failed = False
         self.failure_reason = ""
+        self.failure_code = ""
         self.fingerprint = ""
         self.bound_port = 0
         self.state = "offline"
@@ -394,7 +395,8 @@ class SessionService:
     def _fail(self, reason: str) -> None:
         self.failed = True
         self.failure_reason = reason[:200]
-        self._emit("error", {"message": self.failure_reason})
+        self.failure_code = ErrorCode.INTERNAL.value
+        self._emit("error", {"message": self.failure_reason, "code": self.failure_code})
         self._request_stop()
 
     def _enqueue(self, frame: Frame) -> None:
@@ -476,7 +478,29 @@ class SessionService:
                 if frame is None:
                     break
                 await self._handle_host_frame(peer, frame)
-        except (Violation, asyncio.IncompleteReadError, ConnectionError, asyncio.CancelledError):
+        except Violation as exc:
+            message = str(exc)
+            if message != "peer left":
+                lowered = message.lower()
+                if "rate limit" in lowered:
+                    code = ErrorCode.RATE_LIMIT
+                elif "too large" in lowered or "exceeds" in lowered:
+                    code = ErrorCode.ASSET_TOO_LARGE
+                else:
+                    code = ErrorCode.PROTOCOL
+                try:
+                    peer.enqueue(
+                        protocol.encode(
+                            protocol.json_frame(
+                                MessageType.ERROR,
+                                {"message": message[:200], "code": code.value},
+                            )
+                        ),
+                        critical=True,
+                    )
+                except Violation:
+                    pass
+        except (asyncio.IncompleteReadError, ConnectionError, asyncio.CancelledError):
             pass
         except Exception:  # noqa: BLE001
             traceback.print_exc()
@@ -532,7 +556,7 @@ class SessionService:
                 protocol.encode(
                     protocol.json_frame(
                         MessageType.ERROR,
-                        {"message": "your role does not allow edits", "code": "role_denied"},
+                        {"message": "your role does not allow edits", "code": ErrorCode.ROLE_DENIED.value},
                     )
                 ),
                 critical=True,
@@ -791,7 +815,7 @@ class SessionService:
 
         raise Violation(f"message type {frame.type} is not accepted by the host")
 
-    async def _reject_hello(self, peer: Peer, message: str, code: str = "update_required") -> None:
+    async def _reject_hello(self, peer: Peer, message: str, code: str = ErrorCode.UPDATE_REQUIRED.value) -> None:
         """Write a rejection before the peer is dropped.
 
         A queued frame may not flush before the connection closes, so write
@@ -817,7 +841,7 @@ class SessionService:
         if self.pin:
             supplied = body.get("pin")
             if not isinstance(supplied, str) or not hmac.compare_digest(supplied[:64], self.pin):
-                await self._reject_hello(peer, "invalid server password", "invalid_pin")
+                await self._reject_hello(peer, "invalid server password", ErrorCode.AUTH_FAILED.value)
                 raise Violation("invalid pin")
         peer.app = clean_text(body.get("app"), 32)
         peer.addon = clean_text(body.get("addon"), 32)
@@ -831,21 +855,21 @@ class SessionService:
             await self._reject_hello(
                 peer,
                 f"update Blendermp: reinstall the latest {self.version} build to join",
-                "update_required",
+                ErrorCode.UPDATE_REQUIRED.value,
             )
             raise Violation("legacy client")
         if peer.protocol != PROTOCOL_VERSION:
             await self._reject_hello(
                 peer,
                 f"protocol mismatch: host uses {PROTOCOL_VERSION}, client uses {peer.protocol}",
-                "protocol_mismatch",
+                ErrorCode.PROTOCOL.value,
             )
             raise Violation("protocol mismatch")
         if not compatible(self.version, peer.app):
             await self._reject_hello(
                 peer,
                 f"update Blendermp: host is {self.version}, client is {peer.app}",
-                "update_required",
+                ErrorCode.UPDATE_REQUIRED.value,
             )
             raise Violation("version mismatch")
         peer.name = clean_name(body.get("name"))
@@ -896,7 +920,7 @@ class SessionService:
                 protocol.encode(
                     protocol.json_frame(
                         MessageType.ERROR,
-                        {"message": "your role does not allow editing", "code": "role_denied"},
+                        {"message": "your role does not allow editing", "code": ErrorCode.ROLE_DENIED.value},
                     )
                 ),
                 critical=True,
@@ -1337,9 +1361,11 @@ class SessionService:
         if frame is not None and frame.type == MessageType.ERROR:
             body = self._json(frame, 1024)
             message = clean_text(body.get("message"), 200) or "host rejected the join"
+            code = clean_text(body.get("code"), 48) or ErrorCode.UPDATE_REQUIRED.value
             self.failed = True
             self.failure_reason = message
-            self._emit("error", {"message": message})
+            self.failure_code = code
+            self._emit("error", {"message": message, "code": code})
             self._request_stop()
             return
         if frame is None or frame.type != MessageType.WELCOME:
@@ -1619,7 +1645,13 @@ class SessionService:
 
         if frame.type == MessageType.ERROR:
             body = self._json(frame, 1024)
-            self._emit("error", {"message": clean_text(body.get("message"), 200)})
+            self._emit(
+                "error",
+                {
+                    "message": clean_text(body.get("message"), 200),
+                    "code": clean_text(body.get("code"), 48) or ErrorCode.PROTOCOL.value,
+                },
+            )
 
     # ------------------------------------------------------------------ tick
     async def _tick_loop(self) -> None:

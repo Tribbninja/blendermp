@@ -7,11 +7,15 @@ on:
 jobs:
   python:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           cache: pip
       - run: python -m pip install -r requirements-dev.txt
       - run: python scripts/check_version.py
@@ -27,3 +31,40 @@ jobs:
           node-version: "22"
       - run: node --check desktop/ui/app.js
       - run: node --check desktop/ui/layout.js
+
+  rust:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+      - run: cargo check --manifest-path desktop/src-tauri/Cargo.toml
+      - run: cargo test --manifest-path desktop/src-tauri/Cargo.toml
+
+  worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npx --yes wrangler@4 deploy --dry-run --config cloudflare/wrangler.toml
+
+  blender:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Blender 5.3
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "blender.zip"
+          curl.exe -L --fail -o $zip "https://download.blender.org/release/Blender5.3/blender-5.3.0-windows-x64.zip"
+          Expand-Archive -Path $zip -DestinationPath $env:RUNNER_TEMP -Force
+          $exe = Get-ChildItem -Path $env:RUNNER_TEMP -Filter blender.exe -Recurse | Select-Object -First 1
+          "BMP_BLENDER=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Headless perf harness
+        shell: pwsh
+        run: |
+          & $env:BMP_BLENDER --background --factory-startup --python bench/bench_mesh.py -- --sizes 10000,100000

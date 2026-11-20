@@ -114,6 +114,8 @@ def test_status_is_bounded_and_atomic(appdir):
             "code": "ABCDE-FGHJK-MNPQR",
             "users": [{"name": "a" * 500, "color": [0.1, 0.2, 0.3, 1.0], "ping_ms": 10, "host": True}],
             "bytes_in": 10**30,
+            "error_code": "PROTOCOL",
+            "scene": {"objects": 12, "meshes": 8, "vertices": 5000, "materials": 4, "images": 2, "collections": 3},
             "unknown": "ignored",
         }
     )
@@ -122,6 +124,8 @@ def test_status_is_bounded_and_atomic(appdir):
     assert "unknown" not in body
     assert len(body["users"][0]["name"]) <= 48
     assert body["bytes_in"] == (1 << 62)
+    assert body["error_code"] == "PROTOCOL"
+    assert body["scene"]["vertices"] == 5000
 
 
 def test_tls_certificate_and_pinning(appdir):

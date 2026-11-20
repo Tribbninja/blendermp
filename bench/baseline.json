@@ -1,0 +1,55 @@
+{
+  "generated": "2026-11-20T09:27:01Z",
+  "machine": {
+    "blender": "5.3.0",
+    "numpy": "2.3.4",
+    "platform": "Windows-11-10.0.26300-SP0",
+    "processor": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+    "python": "3.13.13"
+  },
+  "material": {
+    "apply_ms": 1.886,
+    "graph_ms": 1.022,
+    "links": 6,
+    "nodes": 6,
+    "sanitize_ms": 0.115
+  },
+  "sizes": {
+    "10000": {
+      "apply_ms": 0.034,
+      "changed_vertices": 200,
+      "decode_ms": 0.117,
+      "encode_ms": 0.243,
+      "encoded_bytes": 1433,
+      "read_ms": 0.415,
+      "topology": {
+        "apply_ms": 21.015,
+        "decoded_vertices": 10000,
+        "payload_bytes": 132587,
+        "snapshot_ms": 87.056
+      }
+    },
+    "100000": {
+      "apply_ms": 0.016,
+      "changed_vertices": 200,
+      "decode_ms": 0.184,
+      "encode_ms": 0.254,
+      "encoded_bytes": 1632,
+      "read_ms": 4.3,
+      "topology": {
+        "apply_ms": 202.743,
+        "decoded_vertices": 99856,
+        "payload_bytes": 1354103,
+        "snapshot_ms": 996.507
+      }
+    },
+    "1000000": {
+      "apply_ms": 0.019,
+      "changed_vertices": 200,
+      "decode_ms": 0.222,
+      "encode_ms": 0.277,
+      "encoded_bytes": 1632,
+      "read_ms": 45.37
+    }
+  }
+}

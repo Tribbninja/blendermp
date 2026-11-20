@@ -22,7 +22,7 @@ import json
 import struct
 import zlib
 from dataclasses import dataclass, field
-from enum import IntEnum, IntFlag
+from enum import IntEnum, IntFlag, StrEnum
 from typing import Any
 
 MAGIC = b"BMP1"
@@ -45,6 +45,24 @@ class Capability(IntFlag):
     RESUME = 1 << 7
     ROLES = 1 << 8
     INTEREST = 1 << 9
+
+
+class ErrorCode(StrEnum):
+    """Stable machine-readable codes carried by ``ERROR`` frames."""
+
+    UPDATE_REQUIRED = "UPDATE_REQUIRED"
+    AUTH_FAILED = "AUTH_FAILED"
+    ROLE_DENIED = "ROLE_DENIED"
+    LEASE_HELD = "LEASE_HELD"
+    SCENE_TOO_LARGE = "SCENE_TOO_LARGE"
+    ASSET_TOO_LARGE = "ASSET_TOO_LARGE"
+    RATE_LIMIT = "RATE_LIMIT"
+    PROTOCOL = "PROTOCOL"
+    RESUME_EXPIRED = "RESUME_EXPIRED"
+    UNSUPPORTED_CAP = "UNSUPPORTED_CAP"
+    CONFLICT = "CONFLICT"
+    CHECKPOINT_FAILED = "CHECKPOINT_FAILED"
+    INTERNAL = "INTERNAL"
 
 
 DEFAULT_CAPABILITIES = int(Capability.PRESENCE_VIEW | Capability.SELECTION | Capability.ROLES)

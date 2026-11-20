@@ -89,6 +89,10 @@ surface that cross-process re-parenting causes on some GPUs).
 * **Desktop shell** (Tauri 2, Rust + static HTML/CSS/JS): launches Blender (and closes it when the app closes),
   writes the control request, docks Blender into the stage, shows the server
   browser, participants, chat, diagnostics and a live verification code.
+* **Support diagnostics and crash recovery**: the app and addon export a
+  redacted zip (versions, OS/GPU, logs, network/scene stats, settings/session
+  without keys or PINs). Each Blender writes a heartbeat; an unclean exit shows
+  a recovery notice and can open the newest local checkpoint.
 * **Modular tile workspace with fixed docks**: click **Layout** to enter edit
   mode, then drag Session, Chat or Diagnostics by its top bar onto the **Left**,
   **Right** or **Bottom** dock. Panels reflow live as you hover a dock, swap
@@ -99,7 +103,7 @@ surface that cross-process re-parenting causes on some GPUs).
   same animated transition. Blender is hidden while arranging and returns to the
   viewport when you press Done or Escape.
 
-The protocol and engine have **114 passing tests**, including a real TLS
+The protocol and engine have **126 passing tests**, including a real TLS
 host/client session, certificate-mismatch rejection, relay chat, password
 rejection and host kick over a multiplexed tunnel, the public directory API, and
 1,000-vertex delta round-trips under loss/reordering. The Cloudflare Worker hub
@@ -288,10 +292,12 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   selection locks the object for the client until the host releases it.
 * Checked-in two-Blender harnesses cover textured material graphs
   (`tests/e2e/run_material.ps1`), object details (`run_details.ps1`) and live
-  topology snapshots (`run_topology.ps1`).
+  topology snapshots (`run_topology.ps1`); `run_all.ps1` runs all three.
+* Headless `bench/bench_mesh.py` records read/delta/topology/material timings in
+  `bench/baseline.json`.
 * The production Worker relay was exercised with the host key: no token and a
   wrong token are rejected, a valid host tunnel and client join succeed.
-* `pytest`: 122 passed.
+* `pytest`: 126 passed.
 
 ## Limitations
 
@@ -324,6 +330,21 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
 * Windows-only window docking; other platforms run Blender in its own window.
 * Multires is not supported.
 * Alpha software: back up work before a session.
+
+## Diagnostics
+
+- In the app, open **Diagnostics → Export diagnostics bundle**. The redacted zip
+  is written to `%LOCALAPPDATA%\Blendermp\diagnostics\`.
+- In Blender, **N-panel → Blendermp → Export diagnostics bundle** writes the
+  same kind of zip through a file picker.
+- The bundle contains versions, OS/GPU, `status.json`, heartbeats, recent
+  network/scene stats and the last 500 lines of `ui.log`, `blender.log` and
+  `events.log`. User paths, host keys, relay tokens and PINs are redacted.
+- A heartbeat is written every two seconds. If Blender did not shut down
+  cleanly, the panel shows a crash notice and a **Recover** button that opens the
+  newest local checkpoint (once checkpoints exist).
+- Performance can be re-measured with
+  `blender --background --factory-startup --python bench/bench_mesh.py -- --write-baseline`.
 
 ## Troubleshooting
 

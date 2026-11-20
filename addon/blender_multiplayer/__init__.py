@@ -18,15 +18,19 @@ _VENDOR = _Path(os.environ.get("LOCALAPPDATA", _Path.home() / ".local" / "share"
 if _VENDOR.is_dir() and str(_VENDOR) not in sys.path:
     sys.path.insert(0, str(_VENDOR))
 
+import atexit
 import hashlib
 import json
 import math
+import platform
 import queue
+import re
 import socket
 import tempfile
 import time
 import traceback
 import uuid
+import zipfile
 from pathlib import Path
 
 import bpy
@@ -37,6 +41,8 @@ from bpy_extras.io_utils import ExportHelper
 
 from . import control, ui
 from .core import chunker
+from .core import eventlog
+from .core import heartbeat
 from .core import image_payload
 from .core import material as material_payload
 from .core import object_payload
@@ -48,7 +54,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 1, 16),
+    "version": (0, 1, 17),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -157,6 +163,10 @@ runtime: dict = {
     "tracked": set(),
     "last_control_nonce": None,
     "last_status": 0.0,
+    "scene_stats": {},
+    "last_scene_stats": 0.0,
+    "heartbeat_last": 0.0,
+    "crash_entries": [],
     "last_mesh": 0.0,
     "last_edit": 0.0,
     "mesh_cursor": 0,
@@ -227,6 +237,7 @@ class BMPState(PropertyGroup):
     bytes_in: IntProperty(default=0)
     bytes_out: IntProperty(default=0)
     last_error: StringProperty()
+    last_error_code: StringProperty()
     fingerprint: StringProperty()
     verify_code: StringProperty()
     chat_text: StringProperty()
@@ -253,6 +264,8 @@ class BMPState(PropertyGroup):
     role: StringProperty(default="editor")
     overlay_info: StringProperty()
     direct_code: StringProperty()
+    crash_notice: StringProperty()
+    recovery_available: BoolProperty(default=False)
 
 
 def state(context) -> BMPState:
@@ -375,6 +388,7 @@ def start_host(
     settings.show_selections = True
     settings.show_labels = True
     settings.last_error = ""
+    settings.last_error_code = ""
     runtime["session_started"] = time.monotonic()
     runtime["bootstrapping"] = False
     runtime["bootstraps"] = {}
@@ -406,6 +420,7 @@ def start_host(
     _sync_selection(context)
     _upsert_user(context, name, tuple(settings.color), host=True)
     _push_message(context, "system", f"Hosting room {code}")
+    eventlog.log("info", "HOST_START", "hosting", room=code, relay=bool(relay))
     _ensure_timer()
 
 
@@ -424,6 +439,7 @@ def start_join(context, code: str, relay_url: str | None = None) -> None:
     settings.show_selections = True
     settings.show_labels = True
     settings.last_error = ""
+    settings.last_error_code = ""
     runtime["session_started"] = time.monotonic()
     runtime["bootstrapping"] = True
     runtime["bootstrap_deadline"] = time.monotonic() + 20.0
@@ -461,6 +477,7 @@ def start_join(context, code: str, relay_url: str | None = None) -> None:
     _prime_objects(context)
     _upsert_user(context, name, tuple(settings.color), host=False)
     _push_message(context, "system", f"Joining room {settings.code}")
+    eventlog.log("info", "JOIN_START", "joining", room=settings.code, relay=bool(relay_url))
     _ensure_timer()
 
 
@@ -479,6 +496,13 @@ def stop_session(context, publish: bool = True) -> None:
     session = runtime.get("session")
     if session:
         try:
+            eventlog.log(
+                "info",
+                "SESSION_STOP",
+                "session stopped",
+                state=getattr(session, "state", ""),
+                room=getattr(session, "code", ""),
+            )
             session.stop()
         except Exception:  # noqa: BLE001
             traceback.print_exc()
@@ -827,6 +851,7 @@ def _handle_event(context, kind: str, body: dict) -> None:
         _apply_mesh_snapshot(context, body)
     elif kind == "error":
         settings.last_error = str(body.get("message", "unknown error"))
+        settings.last_error_code = str(body.get("code", ""))[:48]
     elif kind == "disconnected":
         settings.state = "offline"
         _push_message(context, "system", f"Disconnected: {body.get('reason', 'unknown')}")
@@ -3394,6 +3419,53 @@ def _send_presence(context) -> None:
     session.send_presence(body)
 
 
+def _scene_stats(context) -> dict:
+    stats = {
+        "objects": 0,
+        "meshes": 0,
+        "vertices": 0,
+        "materials": len(bpy.data.materials),
+        "images": len(bpy.data.images),
+        "collections": len(bpy.data.collections),
+    }
+    for obj in context.scene.objects:
+        stats["objects"] += 1
+        if obj.type != "MESH":
+            continue
+        stats["meshes"] += 1
+        try:
+            stats["vertices"] += len(obj.data.vertices)
+        except (AttributeError, ReferenceError):
+            pass
+    runtime["scene_stats"] = stats
+    runtime["last_scene_stats"] = time.monotonic()
+    return stats
+
+
+def _heartbeat_tick(context) -> None:
+    now = time.monotonic()
+    if now - runtime.get("heartbeat_last", 0.0) < 2.0:
+        return
+    runtime["heartbeat_last"] = now
+    settings = context.window_manager.bmp
+    heartbeat.write(
+        settings.state,
+        settings.code,
+        {"blender": bpy.app.version_string, "addon": ADDON_VERSION},
+    )
+    entries = runtime.get("crash_entries")
+    if entries and not settings.crash_notice:
+        latest = entries[0]
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(latest.get("stamp", 0))))
+        settings.crash_notice = (
+            f"Blendermp closed unexpectedly on {stamp} (state {latest.get('state', '?')}). "
+            "Check for a recovery checkpoint."
+        )
+        settings.recovery_available = True
+        _push_message(context, "system", settings.crash_notice)
+        eventlog.log("warn", "CRASH_DETECTED", settings.crash_notice, entries=entries[:4])
+
+
 def _write_status(context, force: bool = False) -> None:
     session: SessionService | None = runtime.get("session")
     now = time.monotonic()
@@ -3455,6 +3527,8 @@ def _write_status(context, force: bool = False) -> None:
             "fingerprint": settings.fingerprint,
             "verify_code": settings.verify_code,
             "last_error": settings.last_error,
+            "error_code": settings.last_error_code,
+            "scene": _scene_stats(context) if now - runtime.get("last_scene_stats", 0.0) > 5.0 else runtime.get("scene_stats", {}),
             "relay": bool(stats.get("relay", False)),
             "rtt_ms": live_rtt,
             "bytes_in": stats.get("bytes_in", 0),
@@ -3678,6 +3752,7 @@ def bmp_tick():
         return TICK
     try:
         _poll_control(context)
+        _heartbeat_tick(context)
         session: SessionService | None = runtime.get("session")
         _update_timing(session)
         inbox = runtime["inbox"]
@@ -3715,10 +3790,12 @@ def bmp_tick():
         if session is not None and not session.is_alive():
             settings = context.window_manager.bmp
             settings.last_error = session.failure_reason or "session stopped"
+            settings.last_error_code = getattr(session, "failure_code", "") or "INTERNAL"
             stop_session(context)
         elif session is not None and session.failed:
             settings = context.window_manager.bmp
             settings.last_error = session.failure_reason or "connection failed"
+            settings.last_error_code = getattr(session, "failure_code", "") or "INTERNAL"
             stop_session(context)
     except Exception:  # noqa: BLE001
         traceback.print_exc()
@@ -4011,28 +4088,231 @@ class BMP_OT_ping_mark(Operator):
         return {"FINISHED"}
 
 
-class BMP_OT_export_log(Operator, ExportHelper):
-    bl_idname = "bmp.export_log"
-    bl_label = "Export diagnostics"
-    bl_description = "Write session diagnostics to a text file"
-    filename_ext = ".txt"
-    filter_glob: StringProperty(default="*.txt", options={"HIDDEN"})
+class BMP_OT_recover_checkpoints(Operator):
+    bl_idname = "bmp.recover_checkpoints"
+    bl_label = "Recover Checkpoints"
+    bl_description = "Open the newest local recovery checkpoint, if one exists"
 
     def execute(self, context):
         settings = context.window_manager.bmp
-        session: SessionService | None = runtime.get("session")
-        stats = session.stats() if session else {}
-        lines = [
-            f"Blendermp addon {ADDON_VERSION}",
-            f"Blender {bpy.app.version_string}",
-            f"state={settings.state} host={settings.is_host} code={settings.code}",
-            f"name={settings.name} port={settings.port}",
-            f"rtt_ms={stats.get('rtt_ms')} bytes_in={stats.get('bytes_in')} bytes_out={stats.get('bytes_out')}",
-            f"peers={stats.get('peers')}",
-            f"error={settings.last_error}",
-        ]
-        with open(self.filepath, "w", encoding="utf-8") as handle:
-            handle.write("\n".join(lines))
+        try:
+            files = sorted(
+                (
+                    path
+                    for path in control.checkpoints_dir().rglob("*.blend")
+                    if path.is_file()
+                ),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            files = []
+        if not files:
+            settings.crash_notice = ""
+            settings.recovery_available = False
+            eventlog.log("info", "CHECKPOINT_NONE", "no recovery checkpoint found")
+            self.report({"INFO"}, "No recovery checkpoint found; Blender's autosave may still help")
+            return {"CANCELLED"}
+        path = files[0]
+        eventlog.log("info", "CHECKPOINT_OPEN", "opening recovery checkpoint", checkpoint=path.name)
+        settings.crash_notice = ""
+        settings.recovery_available = False
+        try:
+            bpy.ops.wm.open_mainfile(filepath=str(path))
+        except Exception as exc:  # noqa: BLE001
+            eventlog.log("error", "CHECKPOINT_FAILED", str(exc))
+            self.report({"ERROR"}, f"Could not open checkpoint: {exc}")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class BMP_OT_dismiss_crash(Operator):
+    bl_idname = "bmp.dismiss_crash"
+    bl_label = "Dismiss Crash Notice"
+    bl_description = "Hide the unexpected-exit notice"
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        settings.crash_notice = ""
+        settings.recovery_available = False
+        return {"FINISHED"}
+
+
+SECRET_KEYS = {
+    "hostkey",
+    "host_key",
+    "relaytoken",
+    "relay_token",
+    "token",
+    "pin",
+    "password",
+    "secret",
+    "privatekey",
+    "private_key",
+}
+PATH_USER_RE = re.compile(r"([A-Za-z]:[\\/](?:Users|Documents and Settings)[\\/])[^\\/\s\"']+", re.IGNORECASE)
+SECRET_LINE_RE = re.compile(
+    r'("?(?:hostKey|relay_token|token|pin|password)"?\s*[:=]\s*)"[^"]*"', re.IGNORECASE
+)
+
+
+def _redact_text(text: str) -> str:
+    text = PATH_USER_RE.sub(r"\1<user>", text)
+    text = text.replace(str(control.data_dir()), "<appdata>")
+    text = text.replace(str(Path.home()), "<home>")
+    text = SECRET_LINE_RE.sub(r'\1"<redacted>"', text)
+    return text
+
+
+def _redact_json(value):
+    if isinstance(value, dict):
+        return {
+            key: ("<redacted>" if str(key).lower() in SECRET_KEYS else _redact_json(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_json(item) for item in value[:256]]
+    if isinstance(value, (bytes, bytearray)):
+        return _redact_text(bytes(value).decode("utf-8", "replace"))
+    if isinstance(value, str):
+        return _redact_text(value)
+    return value
+
+
+def _tail_lines(path: Path, count: int = 500) -> str:
+    try:
+        if not path.is_file() or path.stat().st_size > 4 * 1024 * 1024:
+            return ""
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return ""
+    return "\n".join(_redact_text(line) for line in lines[-count:])
+
+
+def _diagnostics_system() -> dict:
+    data = {
+        "platform": platform.platform(),
+        "system": platform.system(),
+        "release": platform.release(),
+        "machine": platform.machine(),
+        "processor": platform.processor()[:200],
+        "python": platform.python_version(),
+        "blender": bpy.app.version_string,
+        "blender_build": bpy.app.build_platform,
+        "addon": ADDON_VERSION,
+    }
+    try:
+        import gpu
+
+        data["gpu_vendor"] = gpu.platform.vendor_get()
+        data["gpu_renderer"] = gpu.platform.renderer_get()
+        data["gpu_version"] = gpu.platform.version_get()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        data["os_version"] = platform.win32_ver()[1] if os.name == "nt" else platform.release()
+    except Exception:  # noqa: BLE001
+        pass
+    return data
+
+
+def export_diagnostics(context, filepath: str) -> dict:
+    """Write a redacted support zip. Returns a small summary."""
+    settings = context.window_manager.bmp
+    session: SessionService | None = runtime.get("session")
+    stats = session.stats() if session else {}
+    network = {
+        "state": settings.state,
+        "relay": bool(stats.get("relay", False)),
+        "rtt_ms": stats.get("rtt_ms"),
+        "bytes_in": stats.get("bytes_in", 0),
+        "bytes_out": stats.get("bytes_out", 0),
+        "peers": len(stats.get("peers", []) or []),
+        "leases": len(runtime.get("lease_owners", {})),
+        "fast_mode": bool(runtime.get("fast_mode", True)),
+        "flags": {
+            "sync_transforms": bool(settings.sync_transforms),
+            "sync_mesh": bool(settings.sync_mesh),
+            "sync_materials": bool(settings.sync_materials),
+            "sync_modifiers": bool(settings.sync_modifiers),
+        },
+        "last_error": settings.last_error,
+        "last_error_code": settings.last_error_code,
+    }
+    scene = _scene_stats(context)
+    versions = {
+        "addon": ADDON_VERSION,
+        "blender": bpy.app.version_string,
+        "protocol": 2,
+        "app": "",
+    }
+    status_body = {}
+    try:
+        status_body = json.loads(control.status_path().read_text(encoding="utf-8"))
+        if isinstance(status_body, dict):
+            versions["app"] = str(status_body.get("addon", ""))
+    except (OSError, json.JSONDecodeError):
+        status_body = {}
+
+    temp = filepath + ".tmp"
+    entries = 0
+    with zipfile.ZipFile(temp, "w", zipfile.ZIP_DEFLATED) as bundle:
+        def add_json(name: str, value) -> None:
+            nonlocal entries
+            bundle.writestr(name, json.dumps(_redact_json(value), indent=2, sort_keys=True))
+            entries += 1
+
+        def add_text(name: str, text: str) -> None:
+            nonlocal entries
+            bundle.writestr(name, _redact_text(text))
+            entries += 1
+
+        add_json("versions.json", versions)
+        add_json("system.json", _diagnostics_system())
+        add_json("health.json", network)
+        add_json("scene.json", scene)
+        add_json("status.json", status_body)
+        add_json("crash.json", {"entries": runtime.get("crash_entries", [])})
+        for name in ("settings.json", "session.json"):
+            path = control.data_dir() / name
+            try:
+                body = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(body, dict):
+                add_json(name, body)
+        for name in ("ui.log", "blender.log", "events.log", "events.log.1"):
+            text = _tail_lines(control.data_dir() / name)
+            if text:
+                add_text(name, text)
+        add_text(
+            "README.txt",
+            "Blendermp support bundle\n"
+            "Absolute user paths, host keys, relay tokens and PINs are redacted.\n"
+            "Attach this zip to a bug report together with what both sides were doing.\n",
+        )
+    os.replace(temp, filepath)
+    eventlog.log("info", "DIAGNOSTICS_EXPORT", "support bundle written", entries=entries)
+    return {"path": filepath, "entries": entries, "bytes": os.path.getsize(filepath)}
+
+
+class BMP_OT_export_log(Operator, ExportHelper):
+    bl_idname = "bmp.export_log"
+    bl_label = "Export diagnostics bundle"
+    bl_description = "Write a redacted support zip (versions, logs, stats) for troubleshooting"
+    filename_ext = ".zip"
+    filter_glob: StringProperty(default="*.zip", options={"HIDDEN"})
+
+    def execute(self, context):
+        try:
+            result = export_diagnostics(context, self.filepath)
+        except Exception as exc:  # noqa: BLE001
+            traceback.print_exc()
+            eventlog.log("error", "DIAGNOSTICS_FAILED", str(exc))
+            self.report({"ERROR"}, f"Could not write diagnostics: {exc}")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Diagnostics written ({result['entries']} files, {result['bytes']} bytes)")
         return {"FINISHED"}
 
 
@@ -4054,6 +4334,8 @@ classes = (
     BMP_OT_request_edit,
     BMP_OT_grant_edit,
     BMP_OT_deny_edit,
+    BMP_OT_recover_checkpoints,
+    BMP_OT_dismiss_crash,
     BMP_OT_export_log,
 )
 
@@ -4066,6 +4348,16 @@ def register() -> None:
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.WindowManager.bmp = bpy.props.PointerProperty(type=BMPState)
+    try:
+        runtime["crash_entries"] = heartbeat.unclean_exits()
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        runtime["crash_entries"] = []
+    atexit.register(heartbeat.mark_clean)
+    try:
+        heartbeat.write("starting", "", {"blender": bpy.app.version_string, "addon": ADDON_VERSION})
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
     ui.register()
     runtime["started"] = time.monotonic()
     bpy.app.timers.register(bmp_tick, first_interval=0.5, persistent=True)
@@ -4077,6 +4369,7 @@ def unregister() -> None:
     if not getattr(bpy, "_blendermp_active", False):
         return
     bpy._blendermp_active = False
+    heartbeat.mark_clean()
     _unregister_remote_draw()
     try:
         bpy.app.timers.unregister(bmp_tick)

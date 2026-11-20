@@ -1,7 +1,7 @@
 # Blendermp Master Roadmap: 0.1.7 -> 1.0
 
 Living implementation plan. Last updated: 2026-11-20.
-Baseline: **0.1.16** (public directory, authenticated relay, TLS pinning, scene
+Baseline: **0.1.17** (public directory, authenticated relay, TLS pinning, scene
 bootstrap, object/transform sync, chunked mesh deltas, live Edit Mode vertex
 streaming, edit leases, presence 2.0, exact remote application, durable settings,
 strict version gate, lease request UX, server-enforced roles, optional LAN direct).
@@ -14,6 +14,7 @@ Progress log:
 - [x] 2026-11-20: Phase 1 lock reliability: lease sweep broadcasts `expiring`/`released`, snapshot-driven owner cleanup, expiry auto-renew, request queue, host-side grant/deny, lock status in the N-panel.
 - [x] 2026-11-20: Phase 1 presence 2.0: edit-mode vertex selection relay/points, 3D cursor, follow-user camera, overlay toggles. Laser pointer removed after poor reliability.
 - [x] 2026-11-20: Phase 1 roles: host assigns viewer/commenter/editor/admin, server-enforced mutating-frame guard, downgrade releases leases, role UI in the desktop member list.
+- [x] 2026-11-20: 0.1.17: Phase 0 complete: redacted diagnostics bundles in the app and addon, stable ERROR codes with UI surfacing, structured events.log, crash heartbeat with recovery-checkpoint picker, headless perf harness + baseline, checked-in two-Blender e2e README/run-all, CI for Python 3.11/3.12, JS, Rust, Worker dry-run and Blender bench.
 - [x] 2026-11-20: 0.1.16: closing the desktop app now closes its Blender window (WM_CLOSE after detaching, so unsaved work still prompts).
 - [x] 2026-11-20: 0.1.15: Phase 2 completion: whitelisted material node graphs and SHA-1 texture transfer with colour-space/alpha parity; object details (parenting/inverse, modifier stacks for all objects, collections/visibility, object colour); repaired corner-edge indices after geometry rebuild so Bevel modifiers cannot crash; checked-in material/details/topology two-Blender harnesses.
 - [x] 2026-11-20: 0.1.14: bundle Blender's cryptography vendor so fresh PCs can host; no Python install step.
@@ -22,7 +23,7 @@ Progress log:
 - [x] 2026-11-20: 0.1.11: removed all display interpolation; transforms/mesh/camera apply immediately at network rate. 60 Hz LAN streaming, client-reported ping, total data stat, stable dock bounds.
 - [x] 2026-11-20: 0.1.10: LAN direct path (dual listener + local directory `direct_code`), 60 Hz transforms/presence on low latency, client-reported ping, total data stat, stable dock bounds (no scrollbar flash).
 - [x] Phase 2: live topology, material graphs/textures, object details.
-- [ ] Phase 0 backlog: checked-in e2e harness, diagnostics bundle, error codes, perf baseline, crash marker.
+- [x] Phase 0: version check, settings, CI (Python/JS/Rust/Worker/Blender bench), diagnostics bundles, error codes, perf baseline, crash marker/recovery hook, checked-in e2e harness.
 
 Purpose: ship every feature discussed in the roadmap in dependency order,
 without regressing latency or reliability. Each phase has a hard exit gate.
@@ -310,9 +311,9 @@ tier = 0 if score >= 3 else 1 if score >= 1 else 2
 Deliverables:
 1. `scripts/check_version.py` + `tests/test_version.py`: fail if any version
    string diverges from `version.json`.
-2. Move `%TEMP%\bmp-e2e-*.py` into `tests/e2e/` with a harness:
-   `host.py`, `client.py`, `run.ps1`, `README.md`; env-injected addon path,
-   temp data dirs, deterministic ports, JSON assertions, cleanup.
+2. Checked-in `tests/e2e/` harness with material/details/topology suites and
+   `run_all.ps1`: env-injected addon path, temp data dirs, deterministic ports,
+   JSON assertions and cleanup.
 3. CI (GitHub Actions):
    - Python 3.11/3.12: `py_compile`, `pytest -q`, `check_version.py`.
    - Node: `node --check desktop/ui/app.js`.
@@ -334,8 +335,8 @@ Deliverables:
 7. Perf harness: `bench/bench_mesh.py` (headless Blender) covering 10k/100k/1M
    vertex read, delta encode/decode, apply, topology snapshot, material graph.
    Record baselines in `bench/baseline.json`.
-8. Crash marker: write `session.json` heartbeat; on startup detect an unclean
-   exit and offer "Recover checkpoints".
+8. Crash marker: per-process `heartbeats/<pid>.json`; on startup detect an
+   unclean exit and offer "Recover checkpoints".
 
 Exit gate: CI green on all jobs; version check catches a deliberate mismatch;
 settings survive reinstall; diagnostics zip contains no secrets; baselines
