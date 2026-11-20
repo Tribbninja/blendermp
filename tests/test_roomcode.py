@@ -20,6 +20,13 @@ def test_roundtrip():
     assert len(normalize(code)) == CODE_LEN
 
 
+def test_normalize_matches_dashed_and_undashed_forms():
+    # The directory returns the code without dashes while the host's signed
+    # identity descriptor keeps them; identity checks must compare normalized.
+    assert normalize("041C1-A24CM-GWPHR") == normalize("041c1a24cmgwphr")
+    assert normalize("041C1-A24CM-GWPHR") == "041C1A24CMGWPHR"
+
+
 def test_code_is_grouped_and_readable():
     code = encode_room("10.0.0.7", 51999)
     assert len(code.split("-")) == 3

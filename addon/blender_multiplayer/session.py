@@ -46,7 +46,7 @@ if __package__:
     from .core import object_payload, protocol, tls
     from .core import transfer
     from .core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, ErrorCode, Frame, MessageType
-    from .core.roomcode import FLAG_RELAY, decode_room, encode_room, room_id
+    from .core.roomcode import FLAG_RELAY, decode_room, encode_room, normalize, room_id
     from .core.version import ADDON_VERSION, compatible
     from .net.relay import RelayClientAgent, RelayHostAgent
     from .sync.leases import LeaseManager, Role, can_edit, can_manage
@@ -61,7 +61,7 @@ else:  # pragma: no cover - allows importing the module standalone (tests)
     from core import object_payload, protocol, tls
     from core import transfer
     from core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, ErrorCode, Frame, MessageType
-    from core.roomcode import FLAG_RELAY, decode_room, encode_room, room_id
+    from core.roomcode import FLAG_RELAY, decode_room, encode_room, normalize, room_id
     from core.version import ADDON_VERSION, compatible
     from net.relay import RelayClientAgent, RelayHostAgent
     from sync.leases import LeaseManager, Role, can_edit, can_manage
@@ -1971,7 +1971,7 @@ class SessionService:
             self._fail("host identity signature is invalid")
             return
         if (
-            descriptor.get("code") != self.code
+            normalize(str(descriptor.get("code", ""))) != normalize(self.code)
             or descriptor.get("cert_fingerprint") != (actual or "")
             or descriptor.get("protocol") != PROTOCOL_VERSION
             or not compatible(self.version, str(descriptor.get("app", "")))

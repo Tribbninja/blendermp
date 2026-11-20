@@ -14,6 +14,7 @@ Progress log:
 - [x] 2026-11-20: Phase 1 lock reliability: lease sweep broadcasts `expiring`/`released`, snapshot-driven owner cleanup, expiry auto-renew, request queue, host-side grant/deny, lock status in the N-panel.
 - [x] 2026-11-20: Phase 1 presence 2.0: edit-mode vertex selection relay/points, 3D cursor, follow-user camera, overlay toggles. Laser pointer removed after poor reliability.
 - [x] 2026-11-20: Phase 1 roles: host assigns viewer/commenter/editor/admin, server-enforced mutating-frame guard, downgrade releases leases, role UI in the desktop member list.
+- [x] 2026-11-21: 0.8.3: identity check compares normalized room codes (directory returns undashed, the host descriptor is dashed), fixing "host identity does not match this session" on relay joins.
 - [x] 2026-11-21: 0.8.2: joins prefer the public relay when the host publishes one (LAN direct only for LAN-only hosts; Windows Firewall commonly blocks the random direct port), and pre-1.0 joins require an exact build match with a clear message.
 - [x] 2026-11-21: 0.8.1: certificate-change recovery (Trust new certificate prompt with the new short code), joins no longer reuse a stale host fingerprint, pin-store tests.
 - [x] 2026-11-21: 0.8.0 fix: relay host-token verification moved into the Room Durable Object (announce pushes the persisted hash; tokens survive eviction); fixes "hub rejected the websocket: 403 Forbidden".
