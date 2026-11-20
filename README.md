@@ -86,7 +86,7 @@ surface that cross-process re-parenting causes on some GPUs).
 * **Presence, chat and 3D pings** between the addon UI and the desktop app, with
   latency and bandwidth telemetry, pause-sync, follow-host frame, and chat
   commands (`/who`, `/ping`, `/leave`, `/me`).
-* **Desktop shell** (Tauri 2, Rust + static HTML/CSS/JS): launches Blender,
+* **Desktop shell** (Tauri 2, Rust + static HTML/CSS/JS): launches Blender (and closes it when the app closes),
   writes the control request, docks Blender into the stage, shows the server
   browser, participants, chat, diagnostics and a live verification code.
 * **Modular tile workspace with fixed docks**: click **Layout** to enter edit

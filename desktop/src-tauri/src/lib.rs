@@ -852,15 +852,15 @@ pub fn run() {
             write_session
         ])
         .on_window_event(|window, event| {
-            // A docked window is owned by the app, so destroying the app window
-            // would destroy Blender with it. Release it on close and let Blender
-            // keep running (the session lives inside Blender).
+            // Closing the app also closes the Blender instance it launched.
+            // Detach first so Blender's save-confirmation dialog is a normal
+            // top-level window, then ask Blender to close. WM_CLOSE lets
+            // Blender prompt for unsaved changes instead of losing work.
             if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                let state = window.app_handle().state::<AppState>();
                 #[cfg(windows)]
                 {
-                    let info = window
-                        .app_handle()
-                        .state::<AppState>()
+                    let info = state
                         .embedded
                         .lock()
                         .ok()
@@ -869,9 +869,29 @@ pub fn run() {
                         win_embed::detach(&info);
                     }
                 }
-                #[cfg(not(windows))]
-                {
-                    let _ = window;
+                let pid = state
+                    .blender_pid
+                    .lock()
+                    .ok()
+                    .and_then(|mut guard| guard.take());
+                if let Some(pid) = pid {
+                    #[cfg(windows)]
+                    {
+                        // PID reuse must never turn app close into closing an
+                        // unrelated program.
+                        if win_embed::is_blender_process(pid)
+                            && !win_embed::request_close(pid)
+                            && win_embed::process_alive(pid)
+                        {
+                            // No window yet (still starting): do not leave an
+                            // invisible Blender process behind.
+                            win_embed::terminate_process(pid);
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let _ = pid;
+                    }
                 }
             }
         })

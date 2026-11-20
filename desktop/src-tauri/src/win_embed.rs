@@ -12,25 +12,28 @@
 //! * Only a window owned by the Blender PID we launched is docked.
 //! * The caller passes the bounds; they are clamped to sane minimums.
 //! * The original window style and owner are restored on detach.
-//! * Nothing is ever closed here; Blender's lifetime belongs to the user.
+//! * Closing the app asks Blender to close normally, so unsaved work can still
+//!   be saved.
 
-use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
+use windows_sys::Win32::Foundation::{BOOL, CloseHandle, HWND, LPARAM, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     BitBlt, ClientToScreen, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC,
     ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HGDIOBJ, RGBQUAD, SRCCOPY,
 };
-use windows_sys::Win32::System::Threading::AttachThreadInput;
+use windows_sys::Win32::System::Threading::{
+    AttachThreadInput, OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetParent,
     GetSystemMetrics, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
     GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
-    SetForegroundWindow, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE,
-    GWL_HWNDPARENT, GWL_STYLE, GW_OWNER, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    PostMessageW, SetForegroundWindow, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    GWL_EXSTYLE, GWL_HWNDPARENT, GWL_STYLE, GW_OWNER, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WS_CAPTION, WS_CHILD,
-    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
-    WS_THICKFRAME, WS_VISIBLE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WM_CLOSE, WS_CAPTION,
+    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
+    WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
 };
 
 const MIN_DOCK_WIDTH: f64 = 80.0;
@@ -43,11 +46,12 @@ struct Search {
     title: Option<String>,
     found: Option<HWND>,
     best_area: i64,
+    include_hidden: bool,
 }
 
 unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let search = &mut *(lparam as *mut Search);
-    if IsWindowVisible(hwnd) == 0 {
+    if !search.include_hidden && IsWindowVisible(hwnd) == 0 {
         return 1;
     }
 
@@ -137,8 +141,20 @@ pub fn find_window_for_pid(pid: u32) -> Option<isize> {
         title: None,
         found: None,
         best_area: 0,
+        include_hidden: false,
     };
     enumerate(&mut search).map(|hwnd| hwnd as isize)
+}
+
+fn find_window_for_pid_including_hidden(pid: u32) -> Option<HWND> {
+    let mut search = Search {
+        pid,
+        title: None,
+        found: None,
+        best_area: 0,
+        include_hidden: true,
+    };
+    enumerate(&mut search)
 }
 
 pub fn find_window_by_title(fragment: &str) -> Option<isize> {
@@ -147,6 +163,7 @@ pub fn find_window_by_title(fragment: &str) -> Option<isize> {
         title: Some(fragment.to_string()),
         found: None,
         best_area: 0,
+        include_hidden: false,
     };
     enumerate(&mut search).map(|hwnd| hwnd as isize)
 }
@@ -418,6 +435,63 @@ pub fn process_alive(pid: u32) -> bool {
         let ok = GetExitCodeProcess(handle, &mut code);
         let _ = CloseHandle(handle);
         ok != 0 && code == STILL_ACTIVE as u32
+    }
+}
+
+/// True only when the tracked PID still points at blender.exe. Guards against
+/// PID reuse after Blender has already exited.
+pub fn is_blender_process(pid: u32) -> bool {
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut buffer = [0u16; 1024];
+        let mut length = buffer.len() as u32;
+        let ok = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            buffer.as_mut_ptr(),
+            &mut length,
+        );
+        let _ = CloseHandle(handle);
+        if ok == 0 || length == 0 {
+            return false;
+        }
+        let path = String::from_utf16_lossy(&buffer[..length as usize]);
+        path.rsplit(|character| character == '\\' || character == '/')
+            .next()
+            .map(|name| name.eq_ignore_ascii_case("blender.exe"))
+            .unwrap_or(false)
+    }
+}
+
+/// Ask Blender to close normally (so it can prompt to save unsaved work).
+/// Returns false when no Blender window could be found.
+pub fn request_close(pid: u32) -> bool {
+    let Some(hwnd) = find_window_for_pid_including_hidden(pid) else {
+        return false;
+    };
+    if unsafe { IsWindow(hwnd) } == 0 {
+        return false;
+    }
+    unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) != 0 }
+}
+
+/// Last-resort cleanup for a Blender process that has no window (for example
+/// one still starting up when the app is closed).
+pub fn terminate_process(pid: u32) {
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if handle.is_null() {
+            return;
+        }
+        let _ = TerminateProcess(handle, 0);
+        let _ = CloseHandle(handle);
     }
 }
 
