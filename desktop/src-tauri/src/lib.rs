@@ -130,7 +130,11 @@ fn normalize_code(value: &str) -> Result<String, String> {
     let cleaned: String = value
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
-        .map(|ch| ch.to_ascii_uppercase())
+        .map(|ch| match ch.to_ascii_uppercase() {
+            'I' | 'L' => '1',
+            'O' => '0',
+            other => other,
+        })
         .collect();
     if cleaned.len() != 15 {
         return Err("room code must be 15 characters".into());
@@ -153,6 +157,233 @@ fn valid_pin(value: &str) -> bool {
 
 fn valid_fingerprint(value: &str) -> bool {
     value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+#[derive(Debug, PartialEq)]
+struct DeepLink {
+    code: String,
+    pin: Option<String>,
+    relay_url: Option<String>,
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                if let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3]) {
+                    if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                        out.push(byte);
+                        index += 3;
+                        continue;
+                    }
+                }
+                out.push(b'%');
+                index += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn parse_deep_link(value: &str) -> Option<DeepLink> {
+    let trimmed = value.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let rest = if lower.starts_with("blender://") {
+        &trimmed["blender://".len()..]
+    } else if lower.starts_with("blendermp://") {
+        &trimmed["blendermp://".len()..]
+    } else {
+        return None;
+    };
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let path = path.trim_matches('/');
+    let mut code = String::new();
+    let mut pin = None;
+    let mut relay_url = None;
+    if !path.is_empty() {
+        let (head, tail) = match path.split_once('/') {
+            Some((head, tail)) => (head, tail),
+            None => (path, ""),
+        };
+        if head.eq_ignore_ascii_case("join") {
+            code = tail.to_string();
+        } else if head.eq_ignore_ascii_case("host") {
+            code = tail.to_string();
+        } else {
+            code = path.to_string();
+        }
+    }
+    for pair in query.split('&').filter(|item| !item.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_decode(key).to_ascii_lowercase();
+        let value = percent_decode(value);
+        match key.as_str() {
+            "code" => {
+                if code.is_empty() {
+                    code = value;
+                }
+            }
+            "pin" | "password" => {
+                if !value.is_empty() && valid_pin(&value) {
+                    pin = Some(value);
+                }
+            }
+            "relay" | "relay_url" => {
+                if value.len() <= 256
+                    && (value.starts_with("ws://") || value.starts_with("wss://"))
+                    && !value.chars().any(|ch| ch.is_control())
+                {
+                    relay_url = Some(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    let code = normalize_code(&code).ok()?;
+    Some(DeepLink {
+        code,
+        pin,
+        relay_url,
+    })
+}
+
+fn deep_link_path() -> PathBuf {
+    data_dir().join("deep-link.json")
+}
+
+fn write_deep_link(link: &str) -> Result<(), String> {
+    let parsed = parse_deep_link(link).ok_or("invalid invite link")?;
+    let directory = data_dir();
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    let body = serde_json::json!({
+        "link": link,
+        "code": parsed.code,
+        "pin": parsed.pin,
+        "relay_url": parsed.relay_url,
+        "stamp": stamp,
+    });
+    let path = deep_link_path();
+    let temp = directory.join(".deep-link.tmp");
+    fs::write(&temp, serde_json::to_vec(&body).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    let _ = fs::remove_file(&path);
+    fs::rename(&temp, &path).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn take_deep_link() -> Option<serde_json::Value> {
+    let path = deep_link_path();
+    let metadata = fs::metadata(&path).ok()?;
+    if metadata.len() > 4096 {
+        let _ = fs::remove_file(&path);
+        return None;
+    }
+    let text = fs::read_to_string(&path).ok()?;
+    let _ = fs::remove_file(&path);
+    let body: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let link = body.get("link")?.as_str()?;
+    let parsed = parse_deep_link(link)?;
+    let stamp = body.get("stamp").and_then(|value| value.as_u64()).unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    if stamp > 0 && now.saturating_sub(stamp) > 300 {
+        return None;
+    }
+    Some(serde_json::json!({
+        "link": link,
+        "code": parsed.code,
+        "pin": parsed.pin,
+        "relay_url": parsed.relay_url,
+    }))
+}
+
+#[cfg(windows)]
+struct InstanceGuard {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn acquire_instance() -> Option<InstanceGuard> {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    let name: Vec<u16> = "Local\\BlendermpDesktop\0".encode_utf16().collect();
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
+    if handle.is_null() {
+        return Some(InstanceGuard { handle });
+    }
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+        }
+        return None;
+    }
+    Some(InstanceGuard { handle })
+}
+
+#[cfg(not(windows))]
+struct InstanceGuard {
+    path: PathBuf,
+}
+
+#[cfg(not(windows))]
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        if !self.path.as_os_str().is_empty() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn acquire_instance() -> Option<InstanceGuard> {
+    let path = data_dir().join("instance.lock");
+    if let Ok(metadata) = fs::metadata(&path) {
+        if let Ok(modified) = metadata.modified() {
+            if modified.elapsed().map(|age| age.as_secs() > 86_400).unwrap_or(false) {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+    match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            use std::io::Write;
+            let _ = writeln!(file, "{}", std::process::id());
+            Some(InstanceGuard { path })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+        Err(_) => Some(InstanceGuard {
+            path: PathBuf::new(),
+        }),
+    }
 }
 
 fn addon_root() -> Option<PathBuf> {
@@ -921,7 +1152,14 @@ fn export_diagnostics(app: tauri::AppHandle) -> Result<String, String> {
 fn startup_flags() -> serde_json::Value {
     let autohost = std::env::args().any(|arg| arg == "--autohost");
     let autojoin = std::env::args().find_map(|arg| arg.strip_prefix("--autojoin=").map(str::to_string));
-    serde_json::json!({ "autohost": autohost, "autojoin": autojoin })
+    let deep_link = std::env::args()
+        .skip(1)
+        .find(|arg| parse_deep_link(arg).is_some());
+    serde_json::json!({
+        "autohost": autohost,
+        "autojoin": autojoin,
+        "deep_link": deep_link,
+    })
 }
 
 #[tauri::command]
@@ -1096,6 +1334,18 @@ pub fn run() {
         }
     }
 
+    let startup_link = std::env::args()
+        .skip(1)
+        .find(|arg| parse_deep_link(arg).is_some());
+    let instance = acquire_instance();
+    if instance.is_none() {
+        if let Some(link) = startup_link.as_deref() {
+            let _ = write_deep_link(link);
+        }
+        return;
+    }
+    let _instance = instance;
+
     let directory_server = directory::start();
     tauri::Builder::default()
         .manage(AppState {
@@ -1122,6 +1372,7 @@ pub fn run() {
             log_client,
             startup_flags,
             write_session,
+            take_deep_link,
             export_diagnostics
         ])
         .on_window_event(|window, event| {
@@ -1203,6 +1454,27 @@ mod tests {
         let redacted = redact_text(&text);
         assert!(!redacted.contains(&home));
         assert!(redacted.contains("<home>"));
+    }
+
+    #[test]
+    fn parses_invite_links() {
+        let plain = parse_deep_link("blender://join/ABCDE-FGHJK-MNPQR").unwrap();
+        assert_eq!(plain.code, "ABCDEFGHJKMNPQR");
+        assert_eq!(plain.pin, None);
+        let query = parse_deep_link("blendermp://join?code=ABCDE-FGHJK-MNPQR&pin=1234").unwrap();
+        assert_eq!(query.code, "ABCDEFGHJKMNPQR");
+        assert_eq!(query.pin.as_deref(), Some("1234"));
+        let bare = parse_deep_link("blender://ABCDE-FGHJK-MNPQR").unwrap();
+        assert_eq!(bare.code, "ABCDEFGHJKMNPQR");
+        assert!(parse_deep_link("https://example.com/join/ABCDE-FGHJK-MNPQR").is_none());
+        assert!(parse_deep_link("blender://join/SHORT").is_none());
+    }
+
+    #[test]
+    fn percent_decodes_query_values() {
+        assert_eq!(percent_decode("hello%20world"), "hello world");
+        assert_eq!(percent_decode("a+b"), "a b");
+        assert_eq!(percent_decode("%zz"), "%zz");
     }
 }
 

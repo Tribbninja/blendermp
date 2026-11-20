@@ -38,6 +38,8 @@ from typing import Any
 if __package__:
     from . import control
     from .core import image_payload
+    from .core import asset_bundle
+    from .core import bookmarks
     from .core import eventlog
     from .core import identity
     from .core import material as material_payload
@@ -46,10 +48,12 @@ if __package__:
     from .core.roomcode import FLAG_RELAY, decode_room, encode_room, room_id
     from .core.version import ADDON_VERSION, compatible
     from .net.relay import RelayClientAgent, RelayHostAgent
-    from .sync.leases import LeaseManager, Role, can_edit
+    from .sync.leases import LeaseManager, Role, can_edit, can_manage
 else:  # pragma: no cover - allows importing the module standalone (tests)
     import control
     from core import image_payload
+    from core import asset_bundle
+    from core import bookmarks
     from core import eventlog
     from core import identity
     from core import material as material_payload
@@ -58,7 +62,7 @@ else:  # pragma: no cover - allows importing the module standalone (tests)
     from core.roomcode import FLAG_RELAY, decode_room, encode_room, room_id
     from core.version import ADDON_VERSION, compatible
     from net.relay import RelayClientAgent, RelayHostAgent
-    from sync.leases import LeaseManager, Role, can_edit
+    from sync.leases import LeaseManager, Role, can_edit, can_manage
 
 RESUME_TTL = 120.0
 MAX_CONTROL = 64 * 1024
@@ -90,6 +94,7 @@ BULK_TYPES = {
     MessageType.IMAGE_ASSET,
     MessageType.ACTION,
     MessageType.BULK,
+    MessageType.ASSET_BUNDLE,
 }
 
 
@@ -775,6 +780,78 @@ class SessionService:
                 quality = max(quality, peer.quality - 1)
             peer.quality = quality
             self._emit("client_stats", {"name": peer.name, **stats, "quality": quality})
+            return
+
+        if frame.type == MessageType.VIEW_BOOKMARK:
+            body = self._json(frame, 8192)
+            bookmark = bookmarks.sanitize(body.get("bookmark"))
+            if bookmark is None:
+                raise Violation("invalid view bookmark")
+            if not can_manage(peer.role):
+                peer.enqueue(
+                    protocol.encode(
+                        protocol.json_frame(
+                            MessageType.ERROR,
+                            {"message": "only an admin can move everyone's view", "code": ErrorCode.ROLE_DENIED.value},
+                        )
+                    ),
+                    critical=True,
+                )
+                return
+            message = {"name": peer.name, "bookmark": bookmark}
+            self._broadcast(protocol.json_frame(MessageType.VIEW_BOOKMARK, message), exclude=peer.peer_id)
+            self._emit("view_bookmark", message)
+            return
+
+        if frame.type == MessageType.ASSET_BUNDLE:
+            if not can_edit(peer.role):
+                peer.enqueue(
+                    protocol.encode(
+                        protocol.json_frame(
+                            MessageType.ERROR,
+                            {"message": "your role does not allow sending assets", "code": ErrorCode.ROLE_DENIED.value},
+                        )
+                    ),
+                    critical=True,
+                )
+                return
+            try:
+                manifest = asset_bundle.decode(frame.payload)
+            except asset_bundle.AssetBundleError as exc:
+                raise Violation(str(exc)) from exc
+            target = manifest.get("target")
+            if not target or target == peer.name:
+                raise Violation("asset bundle needs another target")
+            manifest["sender"] = peer.name
+            manifest["target"] = target
+            manifest["sender_color"] = list(peer.color)
+            if target == self.name:
+                self._emit("asset_bundle", manifest)
+                return
+            target_peer = next(
+                (item for item in self._peers.values() if item.authenticated and item.name == target),
+                None,
+            )
+            if target_peer is None:
+                raise Violation("asset bundle target is not in the room")
+            try:
+                wire = asset_bundle.pack(manifest)
+            except asset_bundle.AssetBundleError as exc:
+                raise Violation(str(exc)) from exc
+            target_peer.enqueue(
+                protocol.encode(Frame(type=MessageType.ASSET_BUNDLE, channel=Channel.BULK, payload=wire)),
+                critical=True,
+            )
+            self._emit("asset_bundle_sent", {"sender": peer.name, "target": target, **asset_bundle.summary(manifest)})
+            eventlog.log(
+                "info",
+                "ASSET_BUNDLE_RELAY",
+                "asset bundle relayed",
+                sender=peer.name,
+                target=target,
+                objects=len(manifest.get("objects", [])),
+                images=len(manifest.get("images", [])),
+            )
             return
 
         if frame.type == MessageType.TRANSFORM:
@@ -2100,6 +2177,27 @@ class SessionService:
                 pass
             return
 
+        if frame.type == MessageType.VIEW_BOOKMARK:
+            body = self._json(frame, 8192)
+            bookmark = bookmarks.sanitize(body.get("bookmark"))
+            if bookmark is not None:
+                self._emit(
+                    "view_bookmark",
+                    {
+                        "name": clean_text(body.get("name"), MAX_NAME),
+                        "bookmark": bookmark,
+                    },
+                )
+            return
+
+        if frame.type == MessageType.ASSET_BUNDLE:
+            try:
+                manifest = asset_bundle.decode(frame.payload)
+            except asset_bundle.AssetBundleError:
+                return
+            self._emit("asset_bundle", manifest)
+            return
+
         if frame.type in (MessageType.SCENE_RESET, MessageType.SCENE_READY):
             body = self._json(frame, 512)
             self._emit("scene_reset" if frame.type == MessageType.SCENE_RESET else "scene_ready", body)
@@ -2211,6 +2309,60 @@ class SessionService:
                     )
 
     # ------------------------------------------------------------------ public API
+    def _send_targeted(self, name: str, frame: Frame, manifest: dict | None = None) -> None:
+        peer = next(
+            (item for item in self._peers.values() if item.authenticated and item.name == name),
+            None,
+        )
+        if peer is None:
+            self._emit("error", {"message": f"{name} is no longer in the room", "code": ErrorCode.PROTOCOL.value})
+            return
+        try:
+            peer.enqueue(protocol.encode(frame), critical=True)
+        except Violation:
+            asyncio.create_task(self._drop_peer(peer))
+            return
+        if manifest is not None:
+            self._emit("asset_bundle_sent", {"sender": self.name, "target": name, **asset_bundle.summary(manifest)})
+
+    def send_asset_bundle(self, target: str, manifest: dict) -> bool:
+        if not isinstance(target, str) or not target:
+            return False
+        manifest = dict(manifest)
+        manifest["target"] = target
+        manifest["sender"] = self.name
+        manifest["sender_color"] = list(self.color)
+        try:
+            wire = asset_bundle.pack(manifest)
+        except asset_bundle.AssetBundleError:
+            return False
+        if len(wire) > MAX_MESH:
+            return False
+        frame = Frame(type=MessageType.ASSET_BUNDLE, channel=Channel.BULK, payload=wire)
+        if self.is_host:
+            loop = self._loop
+            if loop is None or not loop.is_running():
+                return False
+            loop.call_soon_threadsafe(lambda: self._send_targeted(target, frame, manifest))
+            return True
+        self._enqueue(frame)
+        return True
+
+    def send_view_bookmark(self, bookmark: dict) -> bool:
+        clean = bookmarks.sanitize(bookmark)
+        if clean is None:
+            return False
+        body = {"name": self.name, "bookmark": clean}
+        frame = protocol.json_frame(MessageType.VIEW_BOOKMARK, body)
+        if self.is_host:
+            loop = self._loop
+            if loop is None or not loop.is_running():
+                return False
+            loop.call_soon_threadsafe(lambda: self._broadcast(frame))
+            return True
+        self._enqueue(frame)
+        return True
+
     def send_scene_reset(self, target: str, extra: dict | None = None) -> None:
         body = {"target": target}
         if isinstance(extra, dict):

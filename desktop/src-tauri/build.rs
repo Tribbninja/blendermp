@@ -19,6 +19,7 @@ fn main() {
                 "write_settings",
                 "startup_flags",
                 "write_session",
+                "take_deep_link",
                 "log_client",
             ]),
         ),

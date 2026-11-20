@@ -134,9 +134,9 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.5.1";
+const APP_VERSION = "0.6.0";
 const PROTOCOL_VERSION = 2;
-const CAPABILITIES = 1; // core presence view; keep in sync with core/protocol.py
+const CAPABILITIES = 1 | (1 << 10) | (1 << 11); // presence + bookmarks + asset bundles
 const settings = {
   name: "",
   port: 51999,
@@ -379,6 +379,184 @@ function serverCompatibility(server) {
     };
   }
   return { ok: true, reason: "" };
+}
+
+/* ------------------------------------------------------------ deep links */
+function inviteLink(code) {
+  const clean = String(code || "").replace(/[^0-9A-Za-z]/g, "").toUpperCase();
+  return clean.length === 15 ? `blender://join/${clean}` : "";
+}
+
+function parseInviteLink(value) {
+  const raw = String(value || "").trim();
+  if (!/^(blender|blendermp):\/\//i.test(raw)) return null;
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    return null;
+  }
+  const host = String(url.hostname || "").trim();
+  const path = String(url.pathname || "").replace(/^\/+/, "");
+  let code = "";
+  if (host.toLowerCase() === "join" || host.toLowerCase() === "host") {
+    code = path || url.searchParams.get("code") || "";
+  } else if (host) {
+    code = host + path;
+  } else {
+    code = path || url.searchParams.get("code") || "";
+  }
+  code = code
+    .replace(/[^0-9A-Za-z]/g, "")
+    .toUpperCase()
+    .replace(/[IL]/g, "1")
+    .replace(/O/g, "0");
+  if (code.length !== 15) return null;
+  const pin = url.searchParams.get("pin") || url.searchParams.get("password") || "";
+  const relay = url.searchParams.get("relay") || url.searchParams.get("relay_url") || "";
+  return {
+    code,
+    pin: pin.slice(0, 64),
+    relayUrl: /^wss?:\/\//i.test(relay) ? relay.slice(0, 256) : "",
+  };
+}
+
+async function handleInviteLink(value) {
+  const invite = parseInviteLink(value);
+  if (!invite) {
+    toast("That invite link is not valid", "error");
+    return;
+  }
+  if (isActive(state.status)) {
+    const current = String(state.status?.code || "").replace(/[^0-9A-Z]/g, "");
+    if (current === invite.code) {
+      toast("You are already in this room", "ok");
+      return;
+    }
+    if (!window.confirm("Join this room? It replaces the current Blender scene.")) return;
+  }
+  await joinServer(
+    {
+      code: invite.code,
+      name: `Invite ${invite.code.slice(0, 5)}`,
+      host: "invite link",
+      password: Boolean(invite.pin),
+      relay_url: invite.relayUrl,
+      lan: false,
+    },
+    invite.pin,
+  );
+}
+
+async function pollDeepLink() {
+  try {
+    const pending = await invoke("take_deep_link");
+    if (pending && pending.link) await handleInviteLink(pending.link);
+  } catch {
+    /* optional while the app is starting */
+  }
+}
+
+/* ------------------------------------------------------- recent rooms */
+const HISTORY_KEY = "roomHistory";
+
+function loadRoomHistory() {
+  try {
+    const parsed = JSON.parse(store.get(HISTORY_KEY, "[]"));
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((item) => item && typeof item.code === "string" && item.code.length >= 15)
+      .slice(0, 16)
+      .map((item) => ({
+        code: String(item.code).replace(/[^0-9A-Za-z]/g, "").toUpperCase(),
+        name: String(item.name || "Room").slice(0, 48),
+        host: String(item.host || "").slice(0, 48),
+        password: Boolean(item.password),
+        favorite: Boolean(item.favorite),
+        relay_url: String(item.relay_url || "").slice(0, 256),
+        lan: Boolean(item.lan),
+        stamp: Number(item.stamp) || 0,
+      }));
+  } catch {
+    return [];
+  }
+}
+
+function saveRoomHistory(entries) {
+  store.set(HISTORY_KEY, JSON.stringify(entries.slice(0, 16)));
+}
+
+function rememberRoom(server) {
+  const code = String(server?.code || "").replace(/[^0-9A-Za-z]/g, "").toUpperCase();
+  if (code.length !== 15) return;
+  const entries = loadRoomHistory().filter((item) => item.code !== code);
+  entries.unshift({
+    code,
+    name: String(server.name || "Room").slice(0, 48),
+    host: String(server.host || settings.name).slice(0, 48),
+    password: Boolean(server.password),
+    favorite: false,
+    relay_url: String(server.relay_url || "").slice(0, 256),
+    lan: Boolean(server.lan),
+    stamp: Date.now(),
+  });
+  saveRoomHistory(entries);
+  renderRecent();
+}
+
+function toggleFavorite(code) {
+  const clean = String(code || "").replace(/[^0-9A-Za-z]/g, "").toUpperCase();
+  const entries = loadRoomHistory();
+  const entry = entries.find((item) => item.code === clean);
+  if (!entry) return;
+  entry.favorite = !entry.favorite;
+  saveRoomHistory(entries);
+  renderRecent();
+}
+
+function renderRecent() {
+  const list = $("recentList");
+  if (!list) return;
+  const entries = loadRoomHistory();
+  list.replaceChildren();
+  $("recentSection").hidden = entries.length === 0;
+  if (!entries.length) return;
+  for (const entry of entries) {
+    const row = document.createElement("div");
+    row.className = "server-row";
+    const main = document.createElement("div");
+    main.className = "server-main";
+    const name = document.createElement("div");
+    name.className = "server-name";
+    name.textContent = entry.name || entry.code;
+    main.append(name);
+    const meta = document.createElement("div");
+    meta.className = "server-meta";
+    meta.textContent = `${entry.code.slice(0, 5)}-${entry.code.slice(5, 10)}-${entry.code.slice(10)}${entry.favorite ? " - saved" : ""}`;
+    main.append(meta);
+    row.append(main);
+    const star = document.createElement("button");
+    star.className = "mini-btn";
+    star.type = "button";
+    star.textContent = entry.favorite ? "Saved" : "Save";
+    star.addEventListener("click", () => toggleFavorite(entry.code));
+    row.append(star);
+    const join = document.createElement("button");
+    join.className = "mini-btn";
+    join.type = "button";
+    join.textContent = "Join";
+    join.addEventListener("click", () => {
+      if (entry.password) openServerJoin({ ...entry, password: true });
+      else joinServer({ ...entry, password: false });
+    });
+    row.append(join);
+    list.append(row);
+  }
+}
+
+function openInviteLink() {
+  const value = window.prompt("Paste a blender:// invite link");
+  if (value) handleInviteLink(value);
 }
 
 function setPanel(name) {
@@ -983,6 +1161,14 @@ async function joinServer(server, pin = "") {
     state.joinedServerName = server.name || "server";
     state.serverId = "";
     state.pendingServer = null;
+    rememberRoom({
+      code: code.replace(/[^0-9A-Za-z]/g, "").toUpperCase(),
+      name: server.name || "server",
+      host: server.host || settings.name,
+      password: Boolean(pin || server.password),
+      relay_url: relayUrl || "",
+      lan: Boolean(server.lan),
+    });
     $("serverJoinBox").hidden = true;
     toast(`Joining ${server.name || "server"} - replacing this scene with the host's...`, "ok");
     setPanel("session");
@@ -1467,6 +1653,20 @@ function wire() {
   $("joinBtn").addEventListener("click", () => setPanel("servers"));
   $("joinClose").addEventListener("click", () => setPanel("session"));
   $("serverRefresh").addEventListener("click", refreshServerBrowser);
+  $("inviteOpen").addEventListener("click", openInviteLink);
+  $("inviteCopy").addEventListener("click", async () => {
+    const link = inviteLink(state.status?.code || "");
+    if (!link) {
+      toast("Start a room first", "error");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(link);
+      toast("Invite link copied", "ok");
+    } catch {
+      toast(link);
+    }
+  });
   $("directoryCopy").addEventListener("click", async () => {
     const url = state.lanDirectory || state.localDirectory;
     if (!url) return;
@@ -1597,7 +1797,9 @@ async function boot() {
 
   await detectBlender();
   await poll();
+  renderRecent();
   setInterval(poll, 750);
+  setInterval(pollDeepLink, 1000);
   setInterval(embedLoop, 1200);
   setInterval(announceServer, 15000);
   setInterval(() => {
@@ -1609,10 +1811,13 @@ async function boot() {
     if (flags && flags.autohost) await hostRoom();
     if (flags && flags.autojoin) {
       await joinServer({ code: flags.autojoin, name: "server", password: false });
+    } else if (flags && flags.deep_link) {
+      await handleInviteLink(flags.deep_link);
     }
   } catch {
     /* flags are optional */
   }
+  await pollDeepLink();
 }
 
 boot();

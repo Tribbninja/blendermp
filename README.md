@@ -122,6 +122,15 @@ surface that cross-process re-parenting causes on some GPUs).
 * **Large uploads**: images over 10 MB are zlib-compressed before transfer when
   that reduces size, and large mesh geometry snapshots use the higher-ratio
   compression pass. Image payloads are capped at 32 MB and frames at 64 MB.
+* **Send selection**: package selected objects plus their materials and images
+  into a content-addressed bundle, send it to one teammate, preview the summary,
+  and import it with fresh object IDs. Bundles are validated and re-packed by the
+  host before relay.
+* **View bookmarks**: save named viewport bookmarks locally, jump between them,
+  and let a host or admin push one to everyone. Incoming pushes can be disabled.
+* **Deep links and recent rooms**: `blender://join/CODE` (and `blendermp://`)
+  invite links register with the installer, open the running app, and join the
+  room. The server browser keeps recent and saved rooms.
 * **Presence, chat and 3D pings** between the addon UI and the desktop app, with
   latency and bandwidth telemetry, pause-sync, follow-host frame, and chat
   commands (`/who`, `/ping`, `/leave`, `/me`).
@@ -142,7 +151,7 @@ surface that cross-process re-parenting causes on some GPUs).
   same animated transition. Blender is hidden while arranging and returns to the
   viewport when you press Done or Escape.
 
-The protocol and engine have **137 passing tests**, including a real TLS
+The protocol and engine have **149 passing tests**, including a real TLS
 host/client session, certificate-mismatch rejection, relay chat, password
 rejection and host kick over a multiplexed tunnel, the public directory API, and
 1,000-vertex delta round-trips under loss/reordering. The Cloudflare Worker hub
@@ -253,7 +262,7 @@ Tool prerequisites:
 * Node.js LTS (installed by bootstrap; the UI has no build step)
 * Rust + the `x86_64-pc-windows-gnu` toolchain
 * MinGW-w64 / WinLibs (`gcc`, `windres`)
-* Blender 5.x
+* Blender 4.2 LTS or newer (5.x supported)
 * Python 3.11+ for tests, with `numpy`, `pytest`, `cryptography`
 
 Blender's Python disables the user site, so the installer bundles a cp313
@@ -265,7 +274,7 @@ addon still loads and reports a clear error instead of crashing.
 ## Layout
 
 ```
-addon/blender_multiplayer/     Blender 5.x extension (importable package)
+addon/blender_multiplayer/     Blender 4.2+ extension (importable package)
   core/  protocol, varint, room codes, chunker, TLS/certificate pinning
   net/   UDP transport + reliable link, LAN discovery, relay agents
   sync/  mesh mirror, object transforms, leases
@@ -333,13 +342,13 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   (`run_material.ps1`), object details (`run_details.ps1`), live topology
   (`run_topology.ps1`), resume/journal (`run_resume.ps1`), checkpoint restore
   (`run_checkpoint.ps1`), scoped undo (`run_undo.ps1`), armature/pose/action/
-  shape keys (`run_animation.ps1`) and sculpt (`run_sculpt.ps1`);
-  `run_all.ps1` runs all eight.
+  shape keys (`run_animation.ps1`), sculpt (`run_sculpt.ps1`) and collaboration bundles/bookmarks (`run_collab.ps1`);
+  `run_all.ps1` runs all nine.
 * Headless `bench/bench_mesh.py` records read/delta/topology/material timings in
   `bench/baseline.json`.
 * The production Worker relay was exercised with the host key: no token and a
   wrong token are rejected, a valid host tunnel and client join succeed.
-* `pytest`: 137 passed.
+* `pytest`: 149 passed.
 
 ## Limitations
 
@@ -394,6 +403,12 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
 * The split Worker Directory/Room layout and signed announce verification need
   a `wrangler deploy`; existing deployments continue to use the old single Hub.
 * Dependency audits are advisory in CI, not yet a release blocker.
+* Asset bundles carry objects, materials and images, not shader node groups;
+  unsupported graph branches are flattened or skipped by the existing material
+  sanitizer. A bundle is capped at 64 objects, 64 images and 56 MB on the wire.
+* Deep-link protocol registration is performed by the Windows installer; portable
+  or manually copied builds need the `blender`/`blendermp` URL handler registered
+  separately. The app also accepts invite links from the server browser.
 * Windows-only window docking; other platforms run Blender in its own window.
 * Multires is not supported.
 * Alpha software: back up work before a session.
@@ -417,7 +432,7 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
 
 If Blender does not start or the session stays offline, check
 `%LOCALAPPDATA%\Blendermp\blender.log` (Blender and addon output) and
-`%LOCALAPPDATA%\Blendermp\ui.log` (desktop app). Blendermp requires Blender 5.x;
+`%LOCALAPPDATA%\Blendermp\ui.log` (desktop app). Blendermp requires Blender 4.2 LTS or newer;
 on a PC without it, the installer offers to install Blender 5.3 automatically.
 
 ## Security

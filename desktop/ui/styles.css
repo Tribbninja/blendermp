@@ -521,6 +521,8 @@ body.resizing { user-select: none; }
   line-height: 1.5;
   padding: 6px 2px;
 }
+#recentSection { border-top: 0; padding-top: 6px; margin-bottom: 8px; }
+#recentSection .server-list { max-height: 180px; margin-bottom: 4px; }
 .server-join {
   border: 1px solid var(--line);
   border-radius: 8px;

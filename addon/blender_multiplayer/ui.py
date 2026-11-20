@@ -39,6 +39,8 @@ class BMP_PT_main(bpy.types.Panel):
                 box.label(text="Public listing is managed in the desktop app")
             if settings.verify_code:
                 box.label(text=f"Verify: {settings.verify_code}", icon="LOCKED")
+            if settings.code:
+                box.operator("bmp.copy_invite", text="Copy invite link", icon="URL")
 
         row = layout.row(align=True)
         if settings.state == "offline":
@@ -89,6 +91,9 @@ class BMP_PT_main(bpy.types.Panel):
                     follow.name = user.name
                     if settings.follow_user == user.name:
                         row.label(text="following", icon="CHECKMARK")
+                if user.name != settings.name:
+                    send = row.operator("bmp.bundle_send", text="", icon="EXPORT")
+                    send.target = user.name
             if settings.overlay_info:
                 box.label(text=settings.overlay_info, icon="HIDE_OFF")
 
@@ -125,6 +130,38 @@ class BMP_PT_main(bpy.types.Panel):
         if settings.lease_info:
             box.label(text=settings.lease_info[:120], icon="LOCKED")
         box.operator("bmp.share_images", text="Share images", icon="IMAGE_DATA")
+
+        box = layout.box()
+        box.label(text="Collaboration", icon="COMMUNITY")
+        box.prop(settings, "bookmark_name")
+        row = box.row(align=True)
+        row.operator("bmp.bookmark_save", text="Save view", icon="BOOKMARKS")
+        row.operator("bmp.copy_invite", text="Invite link", icon="URL")
+        if settings.bookmarks:
+            column = box.column(align=True)
+            for entry in settings.bookmarks:
+                item = column.row(align=True)
+                item.label(text=entry.name[:32])
+                jump = item.operator("bmp.bookmark_jump", text="", icon="CAMERA_DATA")
+                jump.name = entry.name
+                if settings.is_host or settings.role in {"admin", "owner"}:
+                    push = item.operator("bmp.bookmark_push", text="", icon="FORWARD")
+                    push.name = entry.name
+                remove = item.operator("bmp.bookmark_delete", text="", icon="X")
+                remove.name = entry.name
+        box.prop(settings, "apply_bookmarks")
+        if settings.bundle_count:
+            offer = box.box()
+            offer.alert = True
+            offer.label(
+                text=f"Bundle from {settings.bundle_sender or 'teammate'}: {settings.bundle_info}"[:150],
+                icon="IMPORT",
+            )
+            row = offer.row(align=True)
+            accept = row.operator("bmp.bundle_accept", text="Accept", icon="CHECKMARK")
+            accept.bundle = settings.bundle_id
+            dismiss = row.operator("bmp.bundle_dismiss", text="Dismiss", icon="X")
+            dismiss.bundle = settings.bundle_id
 
         if settings.state != "offline":
             box = layout.box()

@@ -100,6 +100,7 @@
                 <svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15V6a2 2 0 0 1 2-2h9" /></svg>
               </button>
             </div>
+            <button class="mini-btn" id="inviteCopy" type="button">Copy invite link</button>
           </div>
 
           <div class="actions" id="hostActions">
@@ -157,6 +158,7 @@
           <div class="section-head">
             <span>Public servers</span>
             <div class="head-actions">
+              <button class="mini-btn" id="inviteOpen" type="button">Open link</button>
               <button class="icon-btn" id="serverRefresh" title="Refresh">
                 <svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" /></svg>
               </button>
@@ -165,6 +167,12 @@
               </button>
             </div>
           </div>
+          <section class="section" id="recentSection" hidden>
+            <div class="section-head">
+              <span>Recent and saved</span>
+            </div>
+            <div class="server-list" id="recentList"></div>
+          </section>
           <label class="field">
             <span>Search</span>
             <input id="serverSearch" placeholder="Server name or host" autocomplete="off" />
@@ -272,7 +280,7 @@
         <span id="statusLeft">Ready</span>
         <span class="grow"></span>
         <span id="statusMid"></span>
-        <span id="statusRight">v0.5.1</span>
+        <span id="statusRight">v0.6.0</span>
       </div>
     </main>
     </section>

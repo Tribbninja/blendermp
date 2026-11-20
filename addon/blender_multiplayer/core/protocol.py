@@ -45,6 +45,8 @@ class Capability(IntFlag):
     RESUME = 1 << 7
     ROLES = 1 << 8
     INTEREST = 1 << 9
+    BOOKMARKS = 1 << 10
+    ASSET_BUNDLE = 1 << 11
 
 
 class ErrorCode(StrEnum):
@@ -74,6 +76,9 @@ DEFAULT_CAPABILITIES = int(
     | Capability.SCULPT
     | Capability.RESUME
     | Capability.ROLES
+    | Capability.INTEREST
+    | Capability.BOOKMARKS
+    | Capability.ASSET_BUNDLE
 )
 
 
@@ -112,6 +117,8 @@ class MessageType(IntEnum):
     SHAPE_KEYS = 35
     SUBSCRIPTION = 36
     CLIENT_STATS = 37
+    VIEW_BOOKMARK = 42
+    ASSET_BUNDLE = 43
 
 
 class Channel(IntEnum):

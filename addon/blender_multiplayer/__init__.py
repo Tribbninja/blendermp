@@ -20,6 +20,7 @@ if _VENDOR.is_dir() and str(_VENDOR) not in sys.path:
 
 import atexit
 import base64
+import copy
 import hashlib
 import json
 import math
@@ -45,6 +46,8 @@ from bpy_extras.io_utils import ExportHelper
 
 from . import control, ui
 from .core import chunker
+from .core import asset_bundle
+from .core import bookmarks
 from .core import checkpoints
 from .core import eventlog
 from .core import heartbeat
@@ -61,7 +64,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 5, 1),
+    "version": (0, 6, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -201,6 +204,10 @@ runtime: dict = {
     "stats_out": 0,
     "stats_time": 0.0,
     "apply_times": [],
+    "bookmarks_loaded": False,
+    "bundle_offers": {},
+    "bundle_imported": set(),
+    "bundle_sent": {},
     "last_mesh": 0.0,
     "last_edit": 0.0,
     "mesh_cursor": 0,
@@ -260,6 +267,14 @@ class BMPMessage(PropertyGroup):
     stamp: StringProperty()
 
 
+class BMPBookmark(PropertyGroup):
+    name: StringProperty()
+    matrix: FloatVectorProperty(size=16)
+    aspect: FloatProperty(default=1.6)
+    persp: StringProperty(default="PERSP")
+    distance: FloatProperty(default=7.0)
+
+
 class BMPState(PropertyGroup):
     state: StringProperty(default="offline")  # offline|hosting|joining|connected
     code: StringProperty()
@@ -306,6 +321,13 @@ class BMPState(PropertyGroup):
     conflict_count: IntProperty(default=0, min=0)
     conflict_info: StringProperty()
     journal_available: BoolProperty(default=False)
+    bookmark_name: StringProperty(name="Bookmark name", default="View")
+    bookmarks: CollectionProperty(type=BMPBookmark)
+    apply_bookmarks: BoolProperty(name="Accept pushed views", default=True)
+    bundle_count: IntProperty(default=0, min=0)
+    bundle_info: StringProperty()
+    bundle_sender: StringProperty()
+    bundle_id: StringProperty()
 
 
 def state(context) -> BMPState:
@@ -580,9 +602,16 @@ def stop_session(context, publish: bool = True) -> None:
     runtime["bootstraps"].clear()
     runtime["bootstrapping"] = False
     runtime["bootstrap_deadline"] = 0.0
+    settings = context.window_manager.bmp
+    runtime["bundle_offers"].clear()
+    runtime["bundle_imported"].clear()
+    runtime["bundle_sent"].clear()
+    settings.bundle_count = 0
+    settings.bundle_info = ""
+    settings.bundle_sender = ""
+    settings.bundle_id = ""
     runtime["edit_lease_uid"] = None
     runtime["last_edit"] = 0.0
-    settings = context.window_manager.bmp
     settings.rtt_ms = 0
     settings.users.clear()
     if runtime["inbox"] is not None:
@@ -892,6 +921,21 @@ def _handle_event(context, kind: str, body: dict) -> None:
                     "rev": int(body.get("rev", 0)),
                     "indices": indices,
                 }
+    elif kind == "view_bookmark":
+        name = str(body.get("name", ""))[:48]
+        bookmark = body.get("bookmark")
+        if isinstance(bookmark, dict) and name and name != settings.name and settings.apply_bookmarks:
+            if _apply_bookmark(context, bookmark):
+                _push_message(context, "system", f"{name} moved everyone to {bookmark.get('name', 'a view')}")
+    elif kind == "asset_bundle":
+        _handle_bundle_offer(context, body)
+    elif kind == "asset_bundle_sent":
+        target = str(body.get("target", ""))[:48]
+        _push_message(
+            context,
+            "system",
+            f"Sent {body.get('objects', 0)} object(s) to {target or 'teammate'}",
+        )
     elif kind == "image_asset":
         _apply_image(context, body)
     elif kind == "modifier_stack":
@@ -4155,6 +4199,387 @@ def _selected_uids(context) -> list:
     return uids[:10]
 
 
+# --------------------------------------------------------------------------- bookmarks
+def _bookmarks_path() -> Path:
+    return control.data_dir() / "bookmarks.json"
+
+
+def _ensure_bookmarks(context) -> None:
+    if runtime.get("bookmarks_loaded"):
+        return
+    runtime["bookmarks_loaded"] = True
+    settings = context.window_manager.bmp
+    while len(settings.bookmarks):
+        settings.bookmarks.remove(len(settings.bookmarks) - 1)
+    for item in bookmarks.load(_bookmarks_path()):
+        entry = settings.bookmarks.add()
+        entry.name = item["name"]
+        entry.matrix = item["matrix"]
+        entry.aspect = item["aspect"]
+        entry.persp = item["persp"]
+        entry.distance = item["distance"]
+
+
+def _store_bookmarks(context) -> list:
+    settings = context.window_manager.bmp
+    result = []
+    for item in settings.bookmarks:
+        result.append(
+            {
+                "name": item.name,
+                "matrix": list(item.matrix),
+                "aspect": item.aspect,
+                "persp": item.persp,
+                "distance": item.distance,
+            }
+        )
+    return result
+
+
+def _save_bookmarks(context) -> None:
+    try:
+        bookmarks.save(_bookmarks_path(), _store_bookmarks(context))
+    except (OSError, ValueError):
+        traceback.print_exc()
+
+
+def _bookmark_from_view(context, name: str) -> dict | None:
+    view = _viewport_view(context)
+    if view is None:
+        return None
+    return {
+        "name": name,
+        "matrix": view["matrix"],
+        "aspect": view["aspect"],
+        "persp": view["persp"],
+        "distance": view["distance"],
+    }
+
+
+def _find_bookmark(context, name: str):
+    wanted = str(name).strip().lower()
+    for item in context.window_manager.bmp.bookmarks:
+        if item.name.strip().lower() == wanted:
+            return item
+    return None
+
+
+def _apply_bookmark(context, bookmark: dict) -> bool:
+    from mathutils import Matrix
+
+    clean = bookmarks.sanitize(bookmark)
+    if clean is None or context.screen is None:
+        return False
+    area = next((item for item in context.screen.areas if item.type == "VIEW_3D"), None)
+    if area is None or area.spaces.active is None:
+        return False
+    region = area.spaces.active.region_3d
+    if region is None:
+        return False
+    values = clean["matrix"]
+    matrix = Matrix((values[0:4], values[4:8], values[8:12], values[12:16]))
+    try:
+        region.view_perspective = clean["persp"] if clean["persp"] in {"PERSP", "ORTHO"} else "PERSP"
+        region.view_matrix = matrix.inverted()
+        region.view_distance = clean["distance"]
+        return True
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return False
+
+
+# --------------------------------------------------------------------------- asset bundles
+BUNDLE_TYPES = {"MESH", "CAMERA", "LIGHT", "ARMATURE", "EMPTY"}
+
+
+def _bundle_objects(context) -> list:
+    """Selected objects plus the dependencies needed to rebuild them."""
+    selected = [
+        obj
+        for obj in list(context.selected_objects)
+        if not obj.get("bmp_ping") and obj.type in BUNDLE_TYPES
+    ]
+    active = context.active_object
+    if active is not None and active.type in BUNDLE_TYPES and active not in selected and not active.get("bmp_ping"):
+        selected.append(active)
+    result = []
+    seen = set()
+    queue = list(selected)
+    while queue and len(result) < asset_bundle.MAX_OBJECTS:
+        obj = queue.pop(0)
+        if obj is None or obj.name in seen or obj.get("bmp_ping") or obj.type not in BUNDLE_TYPES:
+            continue
+        seen.add(obj.name)
+        result.append(obj)
+        parent = getattr(obj, "parent", None)
+        if parent is not None:
+            queue.append(parent)
+        for mod in list(getattr(obj, "modifiers", []) or []):
+            target = getattr(mod, "object", None)
+            if target is not None:
+                queue.append(target)
+        for constraint in list(getattr(obj, "constraints", []) or []):
+            target = getattr(constraint, "target", None)
+            if target is not None:
+                queue.append(target)
+    result.sort(key=_parent_depth)
+    return result
+
+
+def _bundle_manifest(context, objects) -> dict:
+    payloads = []
+    images = {}
+    for obj in objects[: asset_bundle.MAX_OBJECTS]:
+        try:
+            body = _object_create_payload(obj)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+            continue
+        if body.get("kind") not in object_payload.KINDS:
+            continue
+        payloads.append(
+            {
+                "uid": body.get("uuid"),
+                "kind": body.get("kind"),
+                "meta": body.get("meta") or {},
+                "geometry": body.get("geometry", b""),
+            }
+        )
+        for slot in getattr(obj, "material_slots", [])[:16]:
+            if slot.material is None:
+                continue
+            for image in _material_images(slot.material):
+                if image.name in images:
+                    continue
+                data, format_hint = _image_bytes(context, image)
+                if not data or len(data) > image_payload.MAX_IMAGE:
+                    continue
+                digest = hashlib.sha1(data).hexdigest()
+                images[image.name] = {
+                    "name": image.name[:64],
+                    "format": format_hint,
+                    "sha1": digest,
+                    "data": data,
+                }
+    if not payloads:
+        raise ValueError("nothing supported is selected")
+    settings = context.window_manager.bmp
+    return {
+        "objects": payloads,
+        "images": list(images.values())[: asset_bundle.MAX_IMAGES],
+        "label": f"{len(payloads)} object(s) from {settings.name}",
+    }
+
+
+def _remap_bundle_meta(meta: dict, mapping: dict, image_names: dict) -> dict:
+    result = copy.deepcopy(meta)
+    parent = result.get("parent")
+    result["parent"] = mapping.get(parent) if isinstance(parent, str) else None
+    materials = result.get("materials")
+    if isinstance(materials, list):
+        for item in materials:
+            if not isinstance(item, dict):
+                continue
+            for node in item.get("nodes") or []:
+                if not isinstance(node, dict):
+                    continue
+                image = node.get("image")
+                if isinstance(image, str) and image in image_names:
+                    node["image"] = image_names[image]
+    modifiers = result.get("modifiers")
+    if isinstance(modifiers, list):
+        for item in modifiers:
+            if not isinstance(item, dict):
+                continue
+            props = item.get("props")
+            if not isinstance(props, dict):
+                continue
+            target = props.get("object_uid")
+            if isinstance(target, str):
+                props["object_uid"] = mapping.get(target)
+                if props["object_uid"] is None:
+                    props.pop("object_uid", None)
+    details = result.get("details")
+    if isinstance(details, dict):
+        parent_uid = details.get("parent")
+        if isinstance(parent_uid, str):
+            details["parent"] = mapping.get(parent_uid)
+        for item in details.get("constraints") or []:
+            if not isinstance(item, dict):
+                continue
+            target = item.get("target")
+            if isinstance(target, str):
+                item["target"] = mapping.get(target)
+                if item["target"] is None:
+                    item.pop("target", None)
+    return result
+
+
+def _import_bundle(context, manifest: dict) -> int:
+    if not isinstance(manifest, dict):
+        return 0
+    bundle_id = str(manifest.get("id", ""))
+    if not bundle_id:
+        try:
+            bundle_id = asset_bundle.content_id(manifest)
+        except asset_bundle.AssetBundleError:
+            return 0
+    if bundle_id in runtime["bundle_imported"]:
+        _push_message(context, "system", "That bundle is already in this scene")
+        return 0
+
+    image_names = {}
+    for item in manifest.get("images", [])[: asset_bundle.MAX_IMAGES]:
+        if not isinstance(item, dict):
+            continue
+        sha1 = str(item.get("sha1", ""))
+        if sha1 and sha1 in runtime["received_images"]:
+            image_names[str(item.get("name", ""))] = runtime["received_images"][sha1]
+            continue
+        _apply_image(
+            context,
+            {
+                "name": item.get("name", "Image"),
+                "format": item.get("format", "png"),
+                "sha1": sha1,
+                "data": item.get("data", b""),
+            },
+        )
+        if sha1 and sha1 in runtime["received_images"]:
+            image_names[str(item.get("name", ""))] = runtime["received_images"][sha1]
+
+    objects = [item for item in manifest.get("objects", []) if isinstance(item, dict)]
+    mapping = {}
+    for item in objects:
+        try:
+            mapping[str(item.get("uid"))] = str(uuid.uuid4())
+        except Exception:  # noqa: BLE001
+            continue
+    pending = list(objects)
+    ordered = []
+    seen = set()
+    while pending:
+        progress = False
+        for item in list(pending):
+            uid = str(item.get("uid"))
+            parent = (item.get("meta") or {}).get("parent")
+            if not parent or parent not in mapping or parent in seen:
+                ordered.append(item)
+                seen.add(uid)
+                pending.remove(item)
+                progress = True
+        if not progress:
+            ordered.extend(pending)
+            break
+
+    imported = []
+    for item in ordered:
+        old_uid = str(item.get("uid"))
+        new_uid = mapping.get(old_uid)
+        if not new_uid:
+            continue
+        body = {
+            "uuid": new_uid,
+            "kind": item.get("kind"),
+            "meta": _remap_bundle_meta(item.get("meta") or {}, mapping, image_names),
+            "geometry": item.get("geometry", b""),
+        }
+        try:
+            _apply_object_create(context, body)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+            continue
+        obj = obj_sync.find(new_uid)
+        if obj is not None:
+            imported.append(obj)
+
+    if not imported:
+        _push_message(context, "system", "The bundle could not be imported")
+        return 0
+    for obj in context.selected_objects:
+        try:
+            obj.select_set(False)
+        except Exception:  # noqa: BLE001
+            pass
+    for obj in imported:
+        try:
+            obj.select_set(True)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        context.view_layer.objects.active = imported[-1]
+    except Exception:  # noqa: BLE001
+        pass
+    runtime["bundle_imported"].add(bundle_id)
+    if len(runtime["bundle_imported"]) > 128:
+        runtime["bundle_imported"] = set(list(runtime["bundle_imported"])[-64:])
+    eventlog.log(
+        "info",
+        "ASSET_BUNDLE_IMPORT",
+        "asset bundle imported",
+        bundle=bundle_id,
+        objects=len(imported),
+        images=len(image_names),
+    )
+    return len(imported)
+
+
+def _refresh_bundle_ui(settings) -> None:
+    offers = runtime.get("bundle_offers", {})
+    settings.bundle_count = len(offers)
+    if not offers:
+        settings.bundle_info = ""
+        settings.bundle_sender = ""
+        settings.bundle_id = ""
+        return
+    newest = max(offers.items(), key=lambda item: item[1].get("stamp", 0.0))
+    bundle_id, entry = newest
+    summary = entry.get("summary") or {}
+    settings.bundle_id = bundle_id
+    settings.bundle_sender = entry.get("sender", "")
+    settings.bundle_info = (
+        f"{summary.get('objects', 0)} object(s), {summary.get('images', 0)} image(s)"
+        f" - {summary.get('vertices', 0):,} verts"
+    )
+
+
+def _handle_bundle_offer(context, manifest: dict) -> None:
+    try:
+        summary = asset_bundle.summary(manifest)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return
+    bundle_id = summary.get("id", "")
+    if not bundle_id:
+        return
+    offers = runtime.setdefault("bundle_offers", {})
+    offers[bundle_id] = {
+        "manifest": manifest,
+        "sender": str(manifest.get("sender", ""))[:48] or "someone",
+        "summary": summary,
+        "stamp": time.monotonic(),
+    }
+    while len(offers) > 4:
+        oldest = min(offers, key=lambda key: offers[key].get("stamp", 0.0))
+        offers.pop(oldest, None)
+    _refresh_bundle_ui(context.window_manager.bmp)
+    sender = offers[bundle_id]["sender"]
+    _push_message(
+        context,
+        "system",
+        f"{sender} sent {summary.get('objects', 0)} object(s). Accept it in Collaboration.",
+    )
+    eventlog.log(
+        "info",
+        "ASSET_BUNDLE_OFFER",
+        "asset bundle received",
+        bundle=bundle_id,
+        sender=sender,
+        objects=summary.get("objects", 0),
+        images=summary.get("images", 0),
+    )
+
+
 def _camera_segments(matrix, aspect: float, distance: float = 7.0) -> list:
     """A camera-shaped wire pyramid that shows both position and gaze.
 
@@ -5039,6 +5464,7 @@ def bmp_tick():
         return TICK
     try:
         _poll_control(context)
+        _ensure_bookmarks(context)
         _heartbeat_tick(context)
         session: SessionService | None = runtime.get("session")
         _update_timing(session)
@@ -5406,6 +5832,242 @@ class BMP_OT_toggle_mute(Operator):
             muted.add(uid)
             self.report({"INFO"}, f"{obj.name} sync muted")
         runtime["subscription_sig"] = None
+        return {"FINISHED"}
+
+
+class BMP_OT_bookmark_save(Operator):
+    bl_idname = "bmp.bookmark_save"
+    bl_label = "Save View Bookmark"
+    bl_description = "Save the current viewport as a named bookmark"
+    bl_options = {"REGISTER"}
+
+    name: StringProperty(name="Name", default="View", maxlen=48)
+
+    def invoke(self, context, event):
+        self.name = context.window_manager.bmp.bookmark_name or "View"
+        return context.window_manager.invoke_props_dialog(self, width=320)
+
+    def execute(self, context):
+        _ensure_bookmarks(context)
+        name = self.name.strip()[:48]
+        if not name:
+            self.report({"ERROR"}, "Enter a bookmark name")
+            return {"CANCELLED"}
+        bookmark = _bookmark_from_view(context, name)
+        if bookmark is None:
+            self.report({"ERROR"}, "Open a 3D viewport first")
+            return {"CANCELLED"}
+        clean = bookmarks.sanitize(bookmark)
+        if clean is None:
+            self.report({"ERROR"}, "Could not read the current view")
+            return {"CANCELLED"}
+        settings = context.window_manager.bmp
+        entry = _find_bookmark(context, name)
+        if entry is None:
+            entry = settings.bookmarks.add()
+        entry.name = clean["name"]
+        entry.matrix = clean["matrix"]
+        entry.aspect = clean["aspect"]
+        entry.persp = clean["persp"]
+        entry.distance = clean["distance"]
+        settings.bookmark_name = clean["name"]
+        _save_bookmarks(context)
+        self.report({"INFO"}, f"Saved view {clean['name']}")
+        return {"FINISHED"}
+
+
+class BMP_OT_bookmark_jump(Operator):
+    bl_idname = "bmp.bookmark_jump"
+    bl_label = "Jump to Bookmark"
+    bl_description = "Move the viewport to a saved bookmark"
+
+    name: StringProperty()
+
+    def execute(self, context):
+        _ensure_bookmarks(context)
+        entry = _find_bookmark(context, self.name)
+        if entry is None:
+            self.report({"WARNING"}, "Bookmark not found")
+            return {"CANCELLED"}
+        bookmark = {
+            "name": entry.name,
+            "matrix": list(entry.matrix),
+            "aspect": entry.aspect,
+            "persp": entry.persp,
+            "distance": entry.distance,
+        }
+        if not _apply_bookmark(context, bookmark):
+            self.report({"ERROR"}, "Open a 3D viewport first")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class BMP_OT_bookmark_delete(Operator):
+    bl_idname = "bmp.bookmark_delete"
+    bl_label = "Delete Bookmark"
+    bl_description = "Delete a saved view bookmark"
+
+    name: StringProperty()
+
+    def execute(self, context):
+        _ensure_bookmarks(context)
+        settings = context.window_manager.bmp
+        wanted = self.name.strip().lower()
+        for index, item in enumerate(settings.bookmarks):
+            if item.name.strip().lower() == wanted:
+                settings.bookmarks.remove(index)
+                _save_bookmarks(context)
+                return {"FINISHED"}
+        return {"CANCELLED"}
+
+
+class BMP_OT_bookmark_push(Operator):
+    bl_idname = "bmp.bookmark_push"
+    bl_label = "Push View Bookmark"
+    bl_description = "Move everyone in the room to this view (admin only)"
+
+    name: StringProperty()
+
+    def execute(self, context):
+        _ensure_bookmarks(context)
+        settings = context.window_manager.bmp
+        session: SessionService | None = runtime.get("session")
+        if session is None:
+            self.report({"ERROR"}, "Not connected")
+            return {"CANCELLED"}
+        if not settings.is_host and settings.role not in {"admin", "owner"}:
+            self.report({"ERROR"}, "Only a host or admin can move everyone's view")
+            return {"CANCELLED"}
+        entry = _find_bookmark(context, self.name)
+        if entry is None:
+            self.report({"WARNING"}, "Bookmark not found")
+            return {"CANCELLED"}
+        bookmark = {
+            "name": entry.name,
+            "matrix": list(entry.matrix),
+            "aspect": entry.aspect,
+            "persp": entry.persp,
+            "distance": entry.distance,
+        }
+        if not session.send_view_bookmark(bookmark):
+            self.report({"ERROR"}, "Could not push the view")
+            return {"CANCELLED"}
+        _apply_bookmark(context, bookmark)
+        _push_message(context, "system", f"Moved everyone to {entry.name}")
+        return {"FINISHED"}
+
+
+class BMP_OT_bundle_send(Operator):
+    bl_idname = "bmp.bundle_send"
+    bl_label = "Send Selection"
+    bl_description = "Send the selected objects, materials and images to a teammate"
+
+    target: StringProperty()
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        session: SessionService | None = runtime.get("session")
+        target = self.target.strip()[:48]
+        if session is None:
+            self.report({"ERROR"}, "Not connected")
+            return {"CANCELLED"}
+        if not target or target == settings.name:
+            self.report({"ERROR"}, "Choose another person in the room")
+            return {"CANCELLED"}
+        objects = _bundle_objects(context)
+        if not objects:
+            self.report({"ERROR"}, "Select one or more supported objects")
+            return {"CANCELLED"}
+        try:
+            manifest = _bundle_manifest(context, objects)
+        except Exception as exc:  # noqa: BLE001
+            traceback.print_exc()
+            self.report({"ERROR"}, f"Could not package the selection: {exc}")
+            return {"CANCELLED"}
+        summary = asset_bundle.summary(manifest)
+        bundle_id = summary.get("id", "")
+        key = f"{bundle_id}:{target}"
+        now = time.monotonic()
+        if now - runtime["bundle_sent"].get(key, 0.0) < 10.0:
+            self.report({"INFO"}, "That selection was just sent to this person")
+            return {"CANCELLED"}
+        try:
+            wire = asset_bundle.pack(manifest)
+        except Exception as exc:  # noqa: BLE001
+            traceback.print_exc()
+            self.report({"ERROR"}, f"Bundle failed: {exc}")
+            return {"CANCELLED"}
+        if len(wire) > MAX_MESH:
+            self.report({"ERROR"}, f"Bundle is too large ({len(wire) // 1048576} MB)")
+            return {"CANCELLED"}
+        if not session.send_asset_bundle(target, manifest):
+            self.report({"ERROR"}, "The bundle is too large or could not be sent")
+            return {"CANCELLED"}
+        runtime["bundle_sent"][key] = now
+        if len(runtime["bundle_sent"]) > 64:
+            runtime["bundle_sent"] = dict(list(runtime["bundle_sent"].items())[-32:])
+        eventlog.log(
+            "info",
+            "ASSET_BUNDLE_SEND",
+            "asset bundle sent",
+            target=target,
+            objects=summary.get("objects", 0),
+            images=summary.get("images", 0),
+        )
+        self.report({"INFO"}, f"Sent {summary.get('objects', 0)} object(s) to {target}")
+        return {"FINISHED"}
+
+
+class BMP_OT_bundle_accept(Operator):
+    bl_idname = "bmp.bundle_accept"
+    bl_label = "Accept Bundle"
+    bl_description = "Import the offered objects into this scene"
+
+    bundle: StringProperty()
+
+    def execute(self, context):
+        offers = runtime.get("bundle_offers", {})
+        entry = offers.get(self.bundle)
+        if not isinstance(entry, dict):
+            self.report({"WARNING"}, "That bundle is no longer available")
+            return {"CANCELLED"}
+        count = _import_bundle(context, entry.get("manifest") or {})
+        offers.pop(self.bundle, None)
+        _refresh_bundle_ui(context.window_manager.bmp)
+        if count == 0:
+            self.report({"WARNING"}, "Nothing was imported")
+            return {"CANCELLED"}
+        _push_message(context, "system", f"Imported {count} object(s) from {entry.get('sender', 'a teammate')}")
+        self.report({"INFO"}, f"Imported {count} object(s)")
+        return {"FINISHED"}
+
+
+class BMP_OT_bundle_dismiss(Operator):
+    bl_idname = "bmp.bundle_dismiss"
+    bl_label = "Dismiss Bundle"
+    bl_description = "Discard this incoming bundle"
+
+    bundle: StringProperty()
+
+    def execute(self, context):
+        runtime.get("bundle_offers", {}).pop(self.bundle, None)
+        _refresh_bundle_ui(context.window_manager.bmp)
+        return {"FINISHED"}
+
+
+class BMP_OT_copy_invite(Operator):
+    bl_idname = "bmp.copy_invite"
+    bl_label = "Copy Invite Link"
+    bl_description = "Copy a blender:// invite link for this room"
+
+    def execute(self, context):
+        code = context.window_manager.bmp.code
+        if not code:
+            self.report({"ERROR"}, "Start or join a room first")
+            return {"CANCELLED"}
+        link = f"blender://join/{code.replace('-', '')}"
+        context.window_manager.clipboard = link
+        self.report({"INFO"}, "Invite link copied")
         return {"FINISHED"}
 
 
@@ -5779,6 +6441,7 @@ class BMP_OT_export_log(Operator, ExportHelper):
 classes = (
     BMPUser,
     BMPMessage,
+    BMPBookmark,
     BMPState,
     BMP_OT_host,
     BMP_OT_join,
@@ -5800,6 +6463,14 @@ classes = (
     BMP_OT_conflict_take_host,
     BMP_OT_undo_shared,
     BMP_OT_toggle_mute,
+    BMP_OT_bookmark_save,
+    BMP_OT_bookmark_jump,
+    BMP_OT_bookmark_delete,
+    BMP_OT_bookmark_push,
+    BMP_OT_bundle_send,
+    BMP_OT_bundle_accept,
+    BMP_OT_bundle_dismiss,
+    BMP_OT_copy_invite,
     BMP_OT_checkpoint_create,
     BMP_OT_checkpoint_restore,
     BMP_OT_restore_journal,

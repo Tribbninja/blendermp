@@ -114,6 +114,24 @@ The desktop app drives the addon through two JSON files in
 * **Platforms.** Docking stays Windows-only. macOS/Linux builds launch Blender
   as a separate window; CI checks the Rust shell on all three platforms.
 
+## Phase 6 collaboration hardening
+
+* **Asset bundles.** Bundles are content-addressed with SHA-256, capped at 64
+  objects, 64 images, 96 MB uncompressed and 56 MB on the wire, and are decoded,
+  validated and re-packed by the host before relay. Geometry is validated with
+  the same mesh decoder as live sync; materials go through the shader allow-list;
+  images are format-checked and digest-verified. Imported objects always receive
+  fresh UUIDs, so a bundle cannot overwrite an existing scene object.
+* **View bookmarks.** Incoming pushes are sanitized (finite matrix, bounded
+  aspect/distance, known perspective mode) and only a host/admin may broadcast
+  one. A client can turn off pushed views locally.
+* **Invite links.** The installer registers `blender://` and `blendermp://` URL
+  handlers for the current user. The app validates the code before writing a
+  pending invite, forwards it to the already-running instance, and joins only
+  after the normal version/protocol checks. Generated links carry only the room
+  code; an optional `pin=` query is accepted for convenience and should be
+  treated as sensitive.
+
 Dependency audits are expected before release (`pip-audit`, `cargo audit`,
 `npm audit`); they are advisory in the current CI matrix.
 

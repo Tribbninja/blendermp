@@ -9,7 +9,7 @@ Unicode true
 
 !define APPNAME "Blendermp"
 !ifndef VERSION
-!define VERSION "0.5.1"
+!define VERSION "0.6.0"
 !endif
 !define PUBLISHER "Blendermp"
 !define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Blendermp"
@@ -219,6 +219,16 @@ Section "Blendermp" SecMain
     WriteRegDWORD HKCU "${UNINSTKEY}" "NoModify" 1
     WriteRegDWORD HKCU "${UNINSTKEY}" "NoRepair" 1
 
+    ; Invite links: blender://join/CODE and blendermp://join/CODE.
+    WriteRegStr HKCU "Software\Classes\blender" "" "URL:Blendermp invite"
+    WriteRegStr HKCU "Software\Classes\blender" "URL Protocol" ""
+    WriteRegStr HKCU "Software\Classes\blender\DefaultIcon" "" "$INSTDIR\blendermp.exe,0"
+    WriteRegStr HKCU "Software\Classes\blender\shell\open\command" "" '"$INSTDIR\blendermp.exe" "%1"'
+    WriteRegStr HKCU "Software\Classes\blendermp" "" "URL:Blendermp invite"
+    WriteRegStr HKCU "Software\Classes\blendermp" "URL Protocol" ""
+    WriteRegStr HKCU "Software\Classes\blendermp\DefaultIcon" "" "$INSTDIR\blendermp.exe,0"
+    WriteRegStr HKCU "Software\Classes\blendermp\shell\open\command" "" '"$INSTDIR\blendermp.exe" "%1"'
+
     CreateDirectory "$SMPROGRAMS\Blendermp"
     CreateShortcut "$SMPROGRAMS\Blendermp\Blendermp.lnk" "$INSTDIR\blendermp.exe"
     CreateShortcut "$SMPROGRAMS\Blendermp\Uninstall.lnk" "$INSTDIR\Uninstall.exe"
@@ -237,6 +247,8 @@ Section "Uninstall"
     RMDir "$SMPROGRAMS\Blendermp"
     DeleteRegKey HKCU "${UNINSTKEY}"
     DeleteRegKey HKCU "Software\Blendermp"
+    DeleteRegKey HKCU "Software\Classes\blender"
+    DeleteRegKey HKCU "Software\Classes\blendermp"
     RMDir /r "$INSTDIR\addon"
     RMDir /r "$INSTDIR\extension"
     Delete "$INSTDIR\blendermp.exe"
