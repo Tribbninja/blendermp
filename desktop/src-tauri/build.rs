@@ -10,6 +10,7 @@ fn main() {
                 "blender_running",
                 "embed_blender",
                 "set_embed_bounds",
+                "dock_looks_black",
                 "detach_blender",
                 "focus_blender",
                 "set_blender_visible",

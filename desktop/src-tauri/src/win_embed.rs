@@ -15,17 +15,22 @@
 //! * Nothing is ever closed here; Blender's lifetime belongs to the user.
 
 use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
-use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+use windows_sys::Win32::Graphics::Gdi::{
+    BitBlt, ClientToScreen, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC,
+    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HGDIOBJ, RGBQUAD, SRCCOPY,
+};
 use windows_sys::Win32::System::Threading::AttachThreadInput;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetParent,
-    GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SetForegroundWindow, SetParent,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_HWNDPARENT, GWL_STYLE, GW_OWNER,
-    SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
+    GetSystemMetrics, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
+    SetForegroundWindow, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE,
+    GWL_HWNDPARENT, GWL_STYLE, GW_OWNER, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WS_CAPTION, WS_CHILD,
+    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+    WS_THICKFRAME, WS_VISIBLE,
 };
 
 const MIN_DOCK_WIDTH: f64 = 80.0;
@@ -449,5 +454,141 @@ pub fn focus(info: &EmbedInfo) {
         if attached {
             let _ = AttachThreadInput(foreground_thread, child_thread, 0);
         }
+    }
+}
+
+/// Returns `Some(true)` when the docked region is effectively a black/empty
+/// rectangle, `Some(false)` when real content is visible, and `None` when the
+/// check cannot be trusted (another app is in front, the window is hidden, or
+/// the screen capture failed).
+///
+/// This is a safety net for GPUs/drivers where an owned Blender window reports
+/// a valid size but never composites. The app then falls back to a separate
+/// Blender window instead of leaving a black viewport.
+pub fn looks_black(info: &EmbedInfo) -> Option<bool> {
+    let child = info.hwnd as HWND;
+    let parent = info.parent as HWND;
+    unsafe {
+        if IsWindow(child) == 0 || IsWindow(parent) == 0 {
+            return Some(true);
+        }
+        if IsIconic(parent) != 0 || IsWindowVisible(parent) == 0 {
+            return None;
+        }
+        let foreground = GetForegroundWindow();
+        if foreground != parent && foreground != child {
+            return None;
+        }
+
+        let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        if GetWindowRect(child, &mut rect) == 0 {
+            return None;
+        }
+        let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        let left = rect.left.max(vx);
+        let top = rect.top.max(vy);
+        let right = rect.right.min(vx + vw);
+        let bottom = rect.bottom.min(vy + vh);
+        let width = right - left;
+        let height = bottom - top;
+        if width < 80 || height < 60 {
+            return Some(true);
+        }
+
+        let screen = GetDC(std::ptr::null_mut());
+        if screen.is_null() {
+            return None;
+        }
+        let memory = CreateCompatibleDC(screen);
+        if memory.is_null() {
+            let _ = ReleaseDC(std::ptr::null_mut(), screen);
+            return None;
+        }
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: 0,
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            bmiColors: [RGBQUAD {
+                rgbBlue: 0,
+                rgbGreen: 0,
+                rgbRed: 0,
+                rgbReserved: 0,
+            }],
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let dib = CreateDIBSection(
+            memory,
+            &bmi,
+            DIB_RGB_COLORS,
+            &mut bits,
+            std::ptr::null_mut(),
+            0,
+        );
+        if dib.is_null() || bits.is_null() {
+            let _ = DeleteDC(memory);
+            let _ = ReleaseDC(std::ptr::null_mut(), screen);
+            return None;
+        }
+        let old = SelectObject(memory, dib as HGDIOBJ);
+        let copied = BitBlt(
+            memory,
+            0,
+            0,
+            width,
+            height,
+            screen,
+            left,
+            top,
+            SRCCOPY,
+        );
+        let mut lit = 0usize;
+        let mut sampled = 0usize;
+        if copied != 0 {
+            let data = std::slice::from_raw_parts(
+                bits as *const u8,
+                (width as usize) * (height as usize) * 4,
+            );
+            let step = 2usize;
+            let mut y = 0usize;
+            while y < height as usize {
+                let mut x = 0usize;
+                while x < width as usize {
+                    let index = (y * width as usize + x) * 4;
+                    let blue = data[index];
+                    let green = data[index + 1];
+                    let red = data[index + 2];
+                    if red.max(green).max(blue) > 24 {
+                        lit += 1;
+                    }
+                    sampled += 1;
+                    x += step;
+                }
+                y += step;
+            }
+        }
+        let _ = SelectObject(memory, old);
+        let _ = DeleteObject(dib as HGDIOBJ);
+        let _ = DeleteDC(memory);
+        let _ = ReleaseDC(std::ptr::null_mut(), screen);
+
+        if copied == 0 || sampled == 0 {
+            return None;
+        }
+        // Blender's chrome (top bar, headers, icons) always produces far more
+        // than 0.2% lit pixels; the empty app stage (#0b0b0d) produces none.
+        Some(lit * 500 < sampled)
     }
 }

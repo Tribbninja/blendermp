@@ -13,6 +13,7 @@
     "allow-blender-running",
     "allow-embed-blender",
     "allow-set-embed-bounds",
+    "allow-dock-looks-black",
     "allow-detach-blender",
     "allow-focus-blender",
     "allow-set-blender-visible",

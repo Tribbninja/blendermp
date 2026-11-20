@@ -60,6 +60,7 @@ const store = {
 };
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
+const APP_VERSION = "0.1.1";
 const storedDirectory = store.get("directory", DEFAULT_HUB);
 // Drop the localhost values used while developing the Worker hub; a deployment
 // URL (or a deliberately configured hub) is kept.
@@ -87,6 +88,9 @@ const state = {
   dockEnabled: true,
   embedError: "",
   blenderHidden: false,
+  verifyAt: 0,
+  verifyTries: 0,
+  verifyBlack: 0,
   panel: "session",
   latency: [],
   lastBytes: null,
@@ -95,6 +99,7 @@ const state = {
   messagesKey: "",
   blenderBusy: false,
   lastError: "",
+  addonWarned: false,
   servers: [],
   pendingServer: null,
   serverQuery: "",
@@ -124,7 +129,7 @@ const demoStatus = {
   bytes_in: 184320,
   bytes_out: 92160,
   blender: "5.3.0",
-  addon: "0.1.1",
+  addon: APP_VERSION,
   users: [
     { name: "isaac", color: [0.37, 0.91, 0.83, 1], ping_ms: 0, host: true },
     { name: "maya", color: [0.55, 0.63, 0.98, 1], ping_ms: 24, host: false },
@@ -377,8 +382,8 @@ function renderState(status) {
 
   const blender = status?.blender;
   $("blenderLabel").textContent = blender ? `Blender ${blender}` : settings.blender ? "Blender ready" : "Blender 5.x not detected";
-  $("statusRight").textContent = blender ? `Blender ${blender}` : "v0.1.1";
-  $("stageMode").textContent = state.embedded ? "embedded - native" : active ? "Blender separate" : "no Blender window";
+  $("statusRight").textContent = blender ? `Blender ${blender} · v${APP_VERSION}` : `v${APP_VERSION}`;
+  $("stageMode").textContent = state.embedded ? "Blender docked" : active ? "Blender separate" : "no Blender window";
   $("statusLeft").textContent = active
     ? `${labels[value]} - ${hosting ? serverDisplayName() : state.joinedServerName || "server"}`
     : "Ready";
@@ -573,6 +578,17 @@ function applyStatus(status) {
     state.lastError = "";
   }
   const hosting = status.state === "hosting" && Boolean(status.is_host);
+  const addonVersion = String(status.addon || "").trim();
+  if (addonVersion && addonVersion !== APP_VERSION) {
+    if (!state.addonWarned) {
+      state.addonWarned = true;
+      const message = `Blender is running addon ${addonVersion}, but the app is ${APP_VERSION}. Close Blender completely, then launch it from the app again.`;
+      log(`addon version mismatch: ${message}`);
+      toast(message, "error");
+    }
+  } else if (addonVersion) {
+    state.addonWarned = false;
+  }
   if (hosting) {
     state.offlineStreak = 0;
     if (!state.wasHosting && settings.public) announceServer();
@@ -632,9 +648,22 @@ async function launchBlender() {
       await invoke("focus_blender").catch(() => {});
       return;
     }
+    // A running Blender is reused even if its window is currently hidden or
+    // being recreated. Launching another copy created duplicate players and
+    // multiple docked windows when the first window was slow to appear.
+    const running = await invoke("blender_running").catch(() => false);
+    if (running) {
+      log("Blender is already running; reusing it");
+      state.dockEnabled = true;
+      const found = await invoke("find_blender_window").catch(() => null);
+      if (found) await embedNow();
+      else toast("Blender is running; waiting for its window", "ok");
+      return;
+    }
     const existing = await invoke("find_blender_window").catch(() => null);
     if (existing) {
       log("reusing the running Blender window");
+      state.dockEnabled = true;
       if (state.embedded) await invoke("focus_blender").catch(() => {});
       else await embedNow();
       return;
@@ -939,7 +968,7 @@ function announceServer() {
     password: Boolean(settings.pin),
     relay: Boolean(status.relay),
     relay_url: hubRelayUrl(),
-    version: "0.1.1",
+    version: APP_VERSION,
   };
   Promise.allSettled(
     targets.map(async (url) => {
@@ -1004,6 +1033,9 @@ async function embedNow() {
     });
     state.embedded = true;
     state.embedError = "";
+    state.verifyAt = Date.now() + 4000;
+    state.verifyTries = 0;
+    state.verifyBlack = 0;
     renderEmbed();
     toast("Blender docked", "ok");
   } catch (error) {
@@ -1047,6 +1079,36 @@ async function poll() {
   }
 }
 
+async function verifyDock() {
+  const verdict = await invoke("dock_looks_black").catch(() => null);
+  state.verifyTries += 1;
+  if (verdict === true) {
+    state.verifyBlack += 1;
+    // Give a slow Blender a second chance to finish painting before falling
+    // back; two black reads in a row mean the surface really is not showing.
+    if (state.verifyBlack < 2) {
+      state.verifyAt = Date.now() + 2000;
+      return;
+    }
+    state.verifyAt = 0;
+    log("dock render check: black; switching to a separate window");
+    state.dockEnabled = false;
+    await invoke("detach_blender").catch(() => {});
+    state.embedded = false;
+    renderEmbed();
+    toast("Blender can't display inside the app on this PC - it is open in its own window now.", "error");
+    return;
+  }
+  if (verdict === false) {
+    state.verifyAt = 0;
+    state.verifyBlack = 0;
+    log("dock render check: ok");
+    return;
+  }
+  // The app is minimized or another window is in front; retry for a few loops.
+  if (state.verifyTries >= 8) state.verifyAt = 0;
+}
+
 async function embedLoop() {
   if (!isTauri || state.embedBusy) return;
   state.embedBusy = true;
@@ -1074,6 +1136,7 @@ async function embedLoop() {
     if (box.width < 80 || box.height < 60) return;
     if (state.embedded) {
       await updateBounds();
+      if (state.verifyAt && Date.now() >= state.verifyAt) await verifyDock();
       return;
     }
     const found = await invoke("find_blender_window").catch(() => null);
@@ -1088,6 +1151,9 @@ async function embedLoop() {
     });
     state.embedded = true;
     state.embedError = "";
+    state.verifyAt = Date.now() + 4000;
+    state.verifyTries = 0;
+    state.verifyBlack = 0;
     renderEmbed();
     log("embed ok");
   } catch (error) {

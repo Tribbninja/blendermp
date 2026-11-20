@@ -426,6 +426,23 @@ fn detach_blender(state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn dock_looks_black(state: State<AppState>) -> Result<Option<bool>, String> {
+    #[cfg(windows)]
+    {
+        let guard = state.embedded.lock().map_err(|_| "state lock poisoned".to_string())?;
+        Ok(match guard.as_ref() {
+            Some(info) => win_embed::looks_black(info),
+            None => None,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        Ok(Some(false))
+    }
+}
+
+#[tauri::command]
 fn set_blender_visible(state: State<AppState>, visible: bool) -> Result<(), String> {
     #[cfg(windows)]
     {
@@ -705,6 +722,7 @@ pub fn run() {
             blender_running,
             embed_blender,
             set_embed_bounds,
+            dock_looks_black,
             detach_blender,
             set_blender_visible,
             focus_blender,
