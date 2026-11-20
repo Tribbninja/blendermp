@@ -33,6 +33,7 @@ code = encode_room("127.0.0.1", PORT)
 bmp.start_join(context, code)
 start = time.monotonic()
 result_path = os.path.join(TEMP, "client-result.json")
+checks = {}
 
 
 def view_distance():
@@ -56,6 +57,7 @@ def finish(reason):
         "materials": [material.name for material in bpy.data.materials if material.name.startswith("Bundle")],
         "images": [image.name for image in bpy.data.images if image.name.startswith("Bundle")],
         "bookmark_distance": globals().get("bookmark_distance"),
+        "laser": checks.get("laser"),
         "instance": instance.name if instance is not None else None,
         "instance_type": getattr(instance, "instance_type", None) if instance is not None else None,
         "instance_collection": (
@@ -78,6 +80,10 @@ def finish(reason):
 def tick():
     elapsed = time.monotonic() - start
     texts = [message.text for message in wm.bmp.messages]
+    if "laser" not in checks:
+        entry = bmp.runtime.get("lasers", {}).get("testhost")
+        if entry and entry.get("points"):
+            checks["laser"] = [round(float(value), 3) for value in entry["points"][0]]
     if "loaded" not in globals() and any(text == "Host scene loaded" for text in texts):
         globals()["loaded"] = elapsed
     if "loaded" in globals() and "accepted" not in globals() and wm.bmp.bundle_count > 0:

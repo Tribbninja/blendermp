@@ -91,6 +91,11 @@ def finish(reason):
 def tick():
     elapsed = time.monotonic() - start
     joined = any(user.name == "testclient" for user in wm.bmp.users)
+    if joined and "laser" not in globals() and elapsed > 5.0:
+        session = bmp.runtime.get("session")
+        if session is not None:
+            session.send_laser([[1.0, 2.0, 3.0]])
+            globals()["laser"] = elapsed
     if "created" not in globals() and joined and elapsed > 6.0:
         # Stop normal object sync so the bundle is the only way this asset can
         # arrive; otherwise the host would stream it before the offer.

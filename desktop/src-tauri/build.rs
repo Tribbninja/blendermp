@@ -20,6 +20,7 @@ fn main() {
                 "startup_flags",
                 "write_session",
                 "take_deep_link",
+                "open_dashboard",
                 "log_client",
             ]),
         ),

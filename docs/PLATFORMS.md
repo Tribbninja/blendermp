@@ -11,6 +11,7 @@ a normal Blender window and hides the dock controls.
 - TLS vendor: the installer places the cp313 `cryptography` tree in
   `%LOCALAPPDATA%\Blendermp\python`.
 - Docking uses an owned top-level window and the Win32 bridge.
+- The detached dashboard is served by the local directory listener and opened in the system browser, so it works on every supported platform.
 - The NSIS installer registers the current user as the handler for `blender://` and `blendermp://` invite links. A portable copy needs those registry entries added manually.
 
 ## macOS

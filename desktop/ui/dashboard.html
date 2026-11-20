@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Blendermp dashboard</title>
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="dashboard.css" />
+</head>
+<body class="dashboard-body">
+  <main class="dashboard">
+    <header class="dash-head">
+      <div>
+        <div class="wordmark">Blendermp <span class="tag">dashboard</span></div>
+        <div class="statusline">
+          <span class="dot" id="dashDot"></span>
+          <span id="dashState">Offline</span>
+          <span class="sep">/</span>
+          <span id="dashRoom">no room</span>
+        </div>
+      </div>
+      <div class="head-actions">
+        <button class="mini-btn" id="dashFocus" type="button">Focus Blender</button>
+        <button class="mini-btn danger" id="dashLeave" type="button">Leave</button>
+      </div>
+    </header>
+
+    <section class="dash-stats">
+      <div><b id="dashUsers">0</b><small>people</small></div>
+      <div><b id="dashLeases">0</b><small>leases</small></div>
+      <div><b id="dashQueue">0</b><small>queued</small></div>
+      <div><b id="dashPing">-</b><small>ms</small></div>
+    </section>
+
+    <section class="dash-card">
+      <div class="section-head"><span>People</span><span id="dashRole">editor</span></div>
+      <ul class="members" id="dashPeople"><li class="empty">No one here yet.</li></ul>
+    </section>
+
+    <section class="dash-card">
+      <div class="section-head"><span>Edit leases</span><span id="dashLeaseCount">0</span></div>
+      <ul class="dash-list" id="dashLeasesList"><li class="empty">No active leases.</li></ul>
+    </section>
+
+    <section class="dash-card">
+      <div class="section-head"><span>Sync queue</span><span>per peer</span></div>
+      <ul class="dash-list" id="dashSync"><li class="empty">No peer telemetry yet.</li></ul>
+    </section>
+
+    <section class="dash-card dash-history">
+      <div class="section-head"><span>Recent chat</span><span id="dashHistoryCount">0</span></div>
+      <div class="messages" id="dashMessages"><div class="message empty">No messages yet.</div></div>
+      <form class="composer" id="dashChatForm">
+        <input id="dashChatInput" placeholder="Message the room..." maxlength="2000" autocomplete="off" />
+        <button class="send" type="submit" title="Send">
+          <svg viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-2.5-6.5L4 12z" /></svg>
+        </button>
+      </form>
+    </section>
+
+    <section class="dash-card">
+      <div class="section-head"><span>Notifications</span><span id="dashDndLabel">on</span></div>
+      <label class="check"><input type="checkbox" id="dashDnd" /><span>Do not disturb</span></label>
+      <label class="check"><input type="checkbox" id="dashSound" /><span>Sound on new messages</span></label>
+      <p class="fine">Chat, joins, leases and errors are mirrored from Blender.</p>
+    </section>
+
+    <section class="dash-card">
+      <div class="section-head"><span>Accessibility</span><span>shared with main app</span></div>
+      <label class="field">
+        <span>Contrast</span>
+        <select id="dashContrast">
+          <option value="normal">Normal</option>
+          <option value="high">High contrast</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Text size</span>
+        <select id="dashFont">
+          <option value="normal">Normal</option>
+          <option value="large">Large</option>
+        </select>
+      </label>
+      <label class="check"><input type="checkbox" id="dashMotion" /><span>Reduce motion</span></label>
+    </section>
+
+    <div class="dash-toasts" id="dashToasts"></div>
+  </main>
+
+  <script src="a11y.js"></script>
+  <script src="dashboard.js"></script>
+</body>
+</html>

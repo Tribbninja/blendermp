@@ -59,7 +59,7 @@ enum Action {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SessionRequest {
+pub(crate) struct SessionRequest {
     action: Action,
     code: Option<String>,
     name: Option<String>,
@@ -75,7 +75,7 @@ struct SessionRequest {
     role: Option<String>,
 }
 
-fn data_dir() -> PathBuf {
+pub(crate) fn data_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("XDG_DATA_HOME").map(PathBuf::from))
@@ -1149,6 +1149,26 @@ fn export_diagnostics(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn open_dashboard(state: State<AppState>) -> Result<(), String> {
+    let handle = state
+        .directory
+        .as_ref()
+        .ok_or_else(|| "local dashboard server is unavailable".to_string())?;
+    let url = format!(
+        "http://127.0.0.1:{}/dashboard/?token={}",
+        handle.port, handle.token
+    );
+    log_client(format!("opening dashboard on port {}", handle.port));
+    #[cfg(windows)]
+    let spawned = Command::new("cmd").args(["/C", "start", "", &url]).spawn();
+    #[cfg(target_os = "macos")]
+    let spawned = Command::new("open").arg(&url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let spawned = Command::new("xdg-open").arg(&url).spawn();
+    spawned.map(|_| ()).map_err(|error| format!("could not open browser: {error}"))
+}
+
+#[tauri::command]
 fn startup_flags() -> serde_json::Value {
     let autohost = std::env::args().any(|arg| arg == "--autohost");
     let autojoin = std::env::args().find_map(|arg| arg.strip_prefix("--autojoin=").map(str::to_string));
@@ -1290,6 +1310,10 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn write_session_from_dashboard(request: SessionRequest) -> Result<(), String> {
+    write_session(request)
+}
+
 #[tauri::command]
 fn local_directory(state: State<AppState>) -> Option<serde_json::Value> {
     let handle = state.directory.as_ref()?;
@@ -1373,6 +1397,7 @@ pub fn run() {
             startup_flags,
             write_session,
             take_deep_link,
+            open_dashboard,
             export_diagnostics
         ])
         .on_window_event(|window, event| {
@@ -1381,6 +1406,13 @@ pub fn run() {
             // top-level window, then ask Blender to close. WM_CLOSE lets
             // Blender prompt for unsaved changes instead of losing work.
             if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                if window.label() != "main" {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                    }
+                    let _ = window.hide();
+                    return;
+                }
                 let state = window.app_handle().state::<AppState>();
                 #[cfg(windows)]
                 {
@@ -1416,6 +1448,9 @@ pub fn run() {
                     {
                         let _ = pid;
                     }
+                }
+                if let Some(dashboard) = window.app_handle().get_webview_window("dashboard") {
+                    let _ = dashboard.destroy();
                 }
             }
         })

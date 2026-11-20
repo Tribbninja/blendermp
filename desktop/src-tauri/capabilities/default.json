@@ -23,6 +23,7 @@
     "allow-startup-flags",
     "allow-write-session",
     "allow-take-deep-link",
+    "allow-open-dashboard",
     "allow-log-client",
     "allow-export-diagnostics"
   ]

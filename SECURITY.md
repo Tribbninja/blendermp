@@ -134,6 +134,15 @@ The desktop app drives the addon through two JSON files in
   a safe arithmetic/math subset (no attribute access, quotes, brackets or
   unknown identifiers). Collection-instance imports create local collections and
   never execute embedded code.
+* **Dashboard window.** The detached dashboard is a static page served by the
+  local directory listener on `127.0.0.1` and opened in the system browser. Data
+  and command endpoints require a per-launch 128-bit token; the page reads the
+  bounded `status.json` document and can send only the normal host-validated
+  chat/kick/role/leave requests. Closing it does not close the main app or
+  Blender.
+* **Laser pointer.** Laser frames carry at most 64 finite 3D points, are rate
+  limited, and are drawn as short-lived overlays. They never become scene objects
+  or execute code.
 * **Invite links.** The installer registers `blender://` and `blendermp://` URL
   handlers for the current user. The app validates the code before writing a
   pending invite, forwards it to the already-running instance, and joins only

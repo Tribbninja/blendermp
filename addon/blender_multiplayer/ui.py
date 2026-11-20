@@ -50,6 +50,7 @@ class BMP_PT_main(bpy.types.Panel):
             if settings.state == "connected":
                 row.operator("bmp.ping", text="Ping", icon="SORTTIME")
             row.operator("bmp.ping_mark", text="Ping cursor", icon="CURSOR")
+            row.operator("bmp.laser", text="Laser", icon="CURSOR")
             row.operator("bmp.undo_shared", text="Undo my edit", icon="LOOP_BACK")
 
         if settings.last_error:
@@ -119,6 +120,10 @@ class BMP_PT_main(bpy.types.Panel):
         box.prop(settings, "show_cameras")
         box.prop(settings, "show_selections")
         box.prop(settings, "show_labels")
+        box.prop(settings, "show_lasers")
+        box.prop(settings, "overlay_opacity")
+        box.prop(settings, "overlay_scale")
+        box.prop(settings, "colorblind_safe")
         row = box.row(align=True)
         row.operator("bmp.track_mesh", text="Track selected", icon="MESH_DATA")
         row.operator("bmp.untrack_mesh", text="", icon="X")

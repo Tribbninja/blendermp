@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover - allows importing the module standalone
 
 APP_DIR = "Blendermp"
 MAX_CONTROL_BYTES = 4096
-MAX_STATUS_BYTES = 32 * 1024
+MAX_STATUS_BYTES = 64 * 1024
 ALLOWED_ACTIONS = {"host", "join", "leave", "chat", "kick", "role"}
 NAME_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,48}$")
 HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -246,6 +246,14 @@ def read_session() -> dict[str, Any] | None:
     return result
 
 
+def _safe_int(value, low: int, high: int, default: int = 0) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(low, min(high, number))
+
+
 def write_status(data: dict[str, Any]) -> None:
     """Write a bounded, sanitised status document atomically."""
     safe: dict[str, Any] = {}
@@ -295,6 +303,32 @@ def write_status(data: dict[str, Any]) -> None:
                 "stamp": str(item.get("stamp", ""))[:16],
             }
             for item in messages[-20:]
+            if isinstance(item, dict)
+        ]
+
+    leases = data.get("leases")
+    if isinstance(leases, list):
+        safe["leases"] = [
+            {
+                "object": str(item.get("object", ""))[:64],
+                "owner": str(item.get("owner", ""))[:48],
+                "requests": [str(name)[:48] for name in (item.get("requests") or [])[:4]],
+            }
+            for item in leases[:64]
+            if isinstance(item, dict)
+        ]
+
+    sync = data.get("sync")
+    if isinstance(sync, list):
+        safe["sync"] = [
+            {
+                "name": str(item.get("name", ""))[:48],
+                "queue": _safe_int(item.get("queue"), 0, 1 << 20),
+                "pending": _safe_int(item.get("pending"), 0, 1 << 20),
+                "quality": _safe_int(item.get("quality"), 0, 4),
+                "rtt_ms": round(max(0.0, min(5000.0, float(item.get("rtt_ms", 0.0) or 0.0))), 1),
+            }
+            for item in sync[:64]
             if isinstance(item, dict)
         ]
 

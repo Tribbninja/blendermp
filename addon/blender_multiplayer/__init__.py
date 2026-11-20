@@ -46,6 +46,7 @@ from bpy_extras.io_utils import ExportHelper
 
 from . import control, ui
 from .core import chunker
+from .core import accessibility
 from .core import asset_bundle
 from .core import bookmarks
 from .core import checkpoints
@@ -64,7 +65,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 7, 0),
+    "version": (0, 8, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -111,7 +112,10 @@ def _role_name(value) -> str:
         return "editor"
 
 
-def effective_color(name: str, color) -> tuple:
+def effective_color(name: str, color, colorblind: bool = False) -> tuple:
+    if colorblind:
+        digest = hashlib.sha256(str(name).encode("utf-8")).digest()
+        return accessibility.palette()[digest[0] % len(accessibility.palette())]
     try:
         values = tuple(float(value) for value in color)[:4]
     except (TypeError, ValueError):
@@ -147,6 +151,8 @@ runtime: dict = {
     "remote_selections": {},
     "remote_points": [],
     "lasers": {},
+    "laser_active": False,
+    "overlay_scale": 1.0,
     "last_transform": 0.0,
     "fast_mode": True,
     "transform_interval": 1.0 / 60.0,
@@ -306,6 +312,10 @@ class BMPState(PropertyGroup):
     show_cameras: BoolProperty(name="Show cameras", default=True)
     show_selections: BoolProperty(name="Show selections", default=True)
     show_labels: BoolProperty(name="Show name tags", default=True)
+    show_lasers: BoolProperty(name="Show laser pointers", default=True)
+    overlay_opacity: FloatProperty(name="Overlay opacity", default=0.85, min=0.2, max=1.0)
+    overlay_scale: FloatProperty(name="Overlay scale", default=1.0, min=0.5, max=2.0)
+    colorblind_safe: BoolProperty(name="Colour-blind-safe colours", default=False)
     host_name: StringProperty()
     sync_transforms: BoolProperty(name="Sync object transforms", default=True)
     users: CollectionProperty(type=BMPUser)
@@ -596,6 +606,8 @@ def stop_session(context, publish: bool = True) -> None:
     runtime["remote_debug"] = {}
     runtime["remote_selections"].clear()
     runtime["remote_points"] = []
+    runtime["lasers"].clear()
+    runtime["laser_active"] = False
     runtime["selection_digest"].clear()
     runtime["last_edit_sel"] = 0.0
     runtime["selection"].clear()
@@ -5027,7 +5039,7 @@ def _handle_bundle_offer(context, manifest: dict) -> None:
     )
 
 
-def _camera_segments(matrix, aspect: float, distance: float = 7.0) -> list:
+def _camera_segments(matrix, aspect: float, distance: float = 7.0, scale: float = 1.0) -> list:
     """A camera-shaped wire pyramid that shows both position and gaze.
 
     The widget is sized from the remote orbit distance so it stays readable at
@@ -5041,7 +5053,7 @@ def _camera_segments(matrix, aspect: float, distance: float = 7.0) -> list:
         orbit = 7.0
     if not math.isfinite(orbit) or orbit <= 0.0:
         orbit = 7.0
-    size = max(0.15, min(0.6, orbit * 0.06))
+    size = max(0.15, min(0.6, orbit * 0.06)) * max(0.5, min(2.0, float(scale or 1.0)))
     forward = size
     height = size * 0.35
     width = height * max(0.6, min(2.6, float(aspect or 1.6)))
@@ -5183,6 +5195,13 @@ def _smooth_view(name: str, values, now: float):
     location, rotation = rigid
     return Matrix.Translation(location) @ rotation.to_matrix().to_4x4()
 
+def _with_opacity(color, opacity: float):
+    values = tuple(float(value) for value in color[:4])
+    if len(values) < 4:
+        values = values + (1.0,) * (4 - len(values))
+    return values[:3] + (max(0.0, min(1.0, values[3] * float(opacity))),)
+
+
 def _sync_remote_visuals(context) -> None:
     session: SessionService | None = runtime.get("session")
     now = time.monotonic()
@@ -5202,6 +5221,11 @@ def _sync_remote_visuals(context) -> None:
 
     show_cameras = bool(getattr(settings, "show_cameras", True))
     show_selections = bool(getattr(settings, "show_selections", True))
+    show_lasers = bool(getattr(settings, "show_lasers", True))
+    colorblind = bool(getattr(settings, "colorblind_safe", False))
+    opacity = float(getattr(settings, "overlay_opacity", 0.85) or 0.85)
+    overlay_scale = float(getattr(settings, "overlay_scale", 1.0) or 1.0)
+    runtime["overlay_scale"] = max(0.5, min(2.0, overlay_scale))
 
     lines = []
     labels = []
@@ -5210,15 +5234,50 @@ def _sync_remote_visuals(context) -> None:
     point_total = 0
     max_segment = 0.0
     seen_users = set()
+
+    if show_lasers:
+        now_laser = time.monotonic()
+        for name, entry in list(runtime.get("lasers", {}).items()):
+            stamp = float(entry.get("stamp", 0.0))
+            if now_laser - stamp > 1.2:
+                runtime["lasers"].pop(name, None)
+                continue
+            raw_points = entry.get("points") or []
+            if not raw_points:
+                continue
+            try:
+                point = Vector((float(raw_points[0][0]), float(raw_points[0][1]), float(raw_points[0][2])))
+            except (TypeError, ValueError, IndexError):
+                continue
+            color = effective_color(name, DEFAULT_COLOR, colorblind)
+            laser_color = _with_opacity((1.0, 0.82, 0.12, 1.0), opacity)
+            size = max(0.04, min(0.8, 0.12 * max(0.5, overlay_scale)))
+            segments = [
+                (point - Vector((size, 0.0, 0.0)), point + Vector((size, 0.0, 0.0))),
+                (point - Vector((0.0, size, 0.0)), point + Vector((0.0, size, 0.0))),
+                (point - Vector((0.0, 0.0, size)), point + Vector((0.0, 0.0, size))),
+            ]
+            lines.append((laser_color, segments))
+            points.append((laser_color, [point]))
+            labels.append((point + Vector((0.0, 0.0, size * 1.4)), f"{name} *", color))
+            total += len(segments)
+            point_total += 1
+            max_segment = max(max_segment, size * 2.0)
+
     for user in settings.users:
         if user.name == settings.name:
             continue
         seen_users.add(user.name)
-        color = effective_color(user.name, user.color)
+        color = _with_opacity(effective_color(user.name, user.color, colorblind), opacity)
         if show_cameras and user.has_view:
             matrix = _smooth_view(user.name, list(user.view), now)
             if matrix is not None:
-                segments = _camera_segments(matrix, user.view_aspect, user.view_distance)
+                segments = _camera_segments(
+                    matrix,
+                    user.view_aspect,
+                    user.view_distance,
+                    max(0.5, min(2.0, overlay_scale)),
+                )
                 lines.append((color, segments))
                 total += len(segments)
                 for first, second in segments:
@@ -5316,8 +5375,9 @@ def _draw_remote_lines() -> None:
             return
         gpu.state.blend_set("ALPHA")
         gpu.state.depth_test_set("NONE")
+        overlay_scale = float(runtime.get("overlay_scale", 1.0) or 1.0)
         try:
-            gpu.state.line_width_set(2.0)
+            gpu.state.line_width_set(max(1.0, 2.0 * overlay_scale))
         except Exception:  # noqa: BLE001
             pass
         for color, batch in batches:
@@ -5329,7 +5389,7 @@ def _draw_remote_lines() -> None:
             pass
         if point_batches:
             try:
-                gpu.state.point_size_set(4.0)
+                gpu.state.point_size_set(max(2.0, 4.0 * overlay_scale))
             except Exception:  # noqa: BLE001
                 pass
             for color, batch in point_batches:
@@ -5371,9 +5431,10 @@ def _draw_remote_labels() -> None:
     height = float(region.height)
     matrix = region_data.perspective_matrix
     font = 0
-    lift = 8
+    overlay_scale = float(runtime.get("overlay_scale", 1.0) or 1.0)
+    lift = 8.0 * overlay_scale
     try:
-        blf.size(font, 12.0, 72.0)
+        blf.size(font, 12.0 * overlay_scale, 72.0)
     except Exception:  # noqa: BLE001
         try:
             blf.size(font, 12)
@@ -5656,7 +5717,7 @@ def _write_status(context, force: bool = False) -> None:
     users = [
         {
             "name": user.name,
-            "color": list(effective_color(user.name, user.color)),
+            "color": list(effective_color(user.name, user.color, settings.colorblind_safe)),
             "ping_ms": user.ping_ms,
             "host": user.host,
             "active": user.active,
@@ -5668,6 +5729,30 @@ def _write_status(context, force: bool = False) -> None:
         {"author": item.author, "text": item.text, "stamp": item.stamp}
         for item in list(settings.messages)[-20:]
     ]
+    leases = []
+    for key, owner in list(runtime.get("lease_owners", {}).items())[:64]:
+        obj = obj_sync.find(key)
+        leases.append(
+            {
+                "object": obj.name[:64] if obj is not None else key[:8],
+                "owner": str(owner)[:48],
+                "requests": [
+                    str(name)[:48]
+                    for name in (runtime.get("lease_requests", {}).get(key) or [])[:4]
+                ],
+            }
+        )
+    sync_queue = [
+        {
+            "name": str(peer.get("name", ""))[:48],
+            "queue": int(peer.get("queue", 0) or 0),
+            "pending": int(peer.get("pending", 0) or 0),
+            "quality": int(peer.get("quality", 0) or 0),
+            "rtt_ms": float(peer.get("rtt_ms", 0.0) or 0.0),
+        }
+        for peer in stats.get("peers", [])
+        if isinstance(peer, dict)
+    ][:64]
     control.write_status(
         {
             "state": state,
@@ -5695,6 +5780,8 @@ def _write_status(context, force: bool = False) -> None:
             "peers": stats.get("peers", []),
             "users": users,
             "messages": messages,
+            "leases": leases,
+            "sync": sync_queue,
             "blender": bpy.app.version_string,
             "addon": ADDON_VERSION,
             "pid": os.getpid(),
@@ -6235,6 +6322,92 @@ class BMP_OT_follow_user(Operator):
             return {"CANCELLED"}
         settings.follow_user = "" if settings.follow_user == target else target
         return {"FINISHED"}
+
+
+def _laser_point(context, event):
+    try:
+        from bpy_extras import view3d_utils
+    except ImportError:
+        return None
+    region = getattr(context, "region", None)
+    region_data = getattr(context, "region_data", None)
+    if region is None or region_data is None:
+        return None
+    try:
+        coord = (float(event.mouse_region_x), float(event.mouse_region_y))
+        origin = view3d_utils.region_2d_to_origin_3d(region, region_data, coord)
+        direction = view3d_utils.region_2d_to_vector_3d(region, region_data, coord)
+        depsgraph = context.evaluated_depsgraph_get()
+        hit, location, _normal, _index, _obj, _matrix = context.scene.ray_cast(
+            depsgraph, origin, direction
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if not hit:
+        try:
+            distance = max(1.0, float(region_data.view_distance))
+        except (TypeError, ValueError):
+            distance = 7.0
+        location = origin + direction * distance
+    values = [float(location[0]), float(location[1]), float(location[2])]
+    if not all(math.isfinite(value) and abs(value) < 1e7 for value in values):
+        return None
+    return values
+
+
+class BMP_OT_laser(Operator):
+    bl_idname = "bmp.laser"
+    bl_label = "Laser Pointer"
+    bl_description = "Point at the scene; move the mouse and click or press Esc to stop"
+    bl_options = {"REGISTER"}
+
+    def invoke(self, context, event):
+        session: SessionService | None = runtime.get("session")
+        if session is None:
+            self.report({"ERROR"}, "Not connected")
+            return {"CANCELLED"}
+        if context.area is None or context.area.type != "VIEW_3D":
+            self.report({"ERROR"}, "Open a 3D viewport first")
+            return {"CANCELLED"}
+        self._session = session
+        self._last = 0.0
+        runtime["laser_active"] = True
+        try:
+            context.window.cursor_modal_set("CROSSHAIR")
+        except Exception:  # noqa: BLE001
+            pass
+        context.window_manager.modal_handler_add(self)
+        self.report({"INFO"}, "Laser pointer active - move the mouse, click or Esc to stop")
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        session: SessionService | None = runtime.get("session")
+        if session is None or session is not self._session or not session.is_alive():
+            self._stop(context)
+            return {"CANCELLED"}
+        if event.type in {"MOUSEMOVE", "INBETWEEN_MOUSEMOVE"}:
+            now = time.monotonic()
+            if now - self._last >= 1.0 / 30.0:
+                self._last = now
+                point = _laser_point(context, event)
+                if point is not None:
+                    session.send_laser([point])
+                    runtime["lasers"][context.window_manager.bmp.name] = {
+                        "points": [point],
+                        "stamp": now,
+                    }
+            return {"RUNNING_MODAL"}
+        if event.type in {"LEFTMOUSE", "RIGHTMOUSE", "ESC"} and event.value == "PRESS":
+            self._stop(context)
+            return {"CANCELLED"}
+        return {"RUNNING_MODAL"}
+
+    def _stop(self, context) -> None:
+        runtime["laser_active"] = False
+        try:
+            context.window.cursor_modal_restore()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class BMP_OT_ping(Operator):
@@ -6904,6 +7077,7 @@ classes = (
     BMP_OT_track_mesh,
     BMP_OT_untrack_mesh,
     BMP_OT_ping,
+    BMP_OT_laser,
     BMP_OT_ping_mark,
     BMP_OT_follow_user,
     BMP_OT_share_images,
@@ -6944,6 +7118,8 @@ def register() -> None:
         if keyconfig is not None:
             keymap = keyconfig.keymaps.new(name="3D View", space_type="VIEW_3D")
             item = keymap.keymap_items.new("bmp.undo_shared", "Z", "PRESS", ctrl=True, alt=True)
+            addon_keymaps.append((keymap, item))
+            item = keymap.keymap_items.new("bmp.laser", "L", "PRESS", ctrl=True, shift=True)
             addon_keymaps.append((keymap, item))
     except Exception:  # noqa: BLE001
         traceback.print_exc()

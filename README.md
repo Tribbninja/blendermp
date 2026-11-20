@@ -138,6 +138,16 @@ surface that cross-process re-parenting causes on some GPUs).
 * **Deep links and recent rooms**: `blender://join/CODE` (and `blendermp://`)
   invite links register with the installer, open the running app, and join the
   room. The server browser keeps recent and saved rooms.
+* **Detachable dashboard**: a separate browser window mirrors people, edit leases,
+  per-peer sync queues, recent chat and errors, with role/kick/chat/leave
+  controls and optional sound or do-not-disturb notifications.
+* **Laser pointer**: hold the pointer over the 3D view and move the mouse to send
+  a bright, short-lived crosshair to everyone. It is separate from selection and
+  camera overlays and can be hidden per client.
+* **Accessibility and theming**: Okabe-Ito colour-blind-safe palette, high
+  contrast, larger text, reduced motion, overlay opacity/scale, focus rings and
+  notification sound toggles. Preferences are shared between the main app and
+  dashboard.
 * **Presence, chat and 3D pings** between the addon UI and the desktop app, with
   latency and bandwidth telemetry, pause-sync, follow-host frame, and chat
   commands (`/who`, `/ping`, `/leave`, `/me`).
@@ -158,7 +168,7 @@ surface that cross-process re-parenting causes on some GPUs).
   same animated transition. Blender is hidden while arranging and returns to the
   viewport when you press Done or Escape.
 
-The protocol and engine have **156 passing tests**, including a real TLS
+The protocol and engine have **160 passing tests**, including a real TLS
 host/client session, certificate-mismatch rejection, relay chat, password
 rejection and host kick over a multiplexed tunnel, the public directory API, and
 1,000-vertex delta round-trips under loss/reordering. The Cloudflare Worker hub
@@ -355,7 +365,7 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   `bench/baseline.json`.
 * The production Worker relay was exercised with the host key: no token and a
   wrong token are rejected, a valid host tunnel and client join succeed.
-* `pytest`: 156 passed.
+* `pytest`: 160 passed.
 
 ## Limitations
 
@@ -420,6 +430,8 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
 * Asset bundles carry objects, materials and images, not shader node groups;
   unsupported graph branches are flattened or skipped by the existing material
   sanitizer. A bundle is capped at 64 objects, 64 images and 56 MB on the wire.
+* The detached dashboard is a token-protected localhost page opened in the system browser; it requires the desktop app's directory listener.
+* Laser markers expire after about 1.2 seconds and are not scene objects.
 * Deep-link protocol registration is performed by the Windows installer; portable
   or manually copied builds need the `blender`/`blendermp` URL handler registered
   separately. The app also accepts invite links from the server browser.

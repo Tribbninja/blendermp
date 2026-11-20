@@ -63,6 +63,7 @@ Check ([math]::Abs([double]$client.bookmark_distance - 42.0) -le 0.1) "bookmark 
 Check ($client.instance_type -eq 'COLLECTION') "instance type was '$($client.instance_type)'"
 Check ($client.instance_collection -eq 'InstancedSet') "instance collection was '$($client.instance_collection)'"
 Check (($client.instance_objects -join ',') -match 'InstCube') "instance objects: $($client.instance_objects -join ',')"
+Check ($null -ne $client.laser -and [math]::Abs($client.laser[0] - 1.0) -le 0.01) "laser point was $($client.laser -join ',')"
 if ($null -ne $hostResult) {
     Check (($hostResult.messages -join '|') -match 'Sent .* object') 'host did not confirm the send'
 }

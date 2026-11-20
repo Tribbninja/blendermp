@@ -13,6 +13,12 @@ const tauriInternals = window.__TAURI_INTERNALS__;
 const tauriGlobal = window.__TAURI__;
 const isTauri = Boolean((tauriInternals && tauriInternals.invoke) || (tauriGlobal && tauriGlobal.core));
 const demoMode = new URLSearchParams(location.search).get("demo") === "1";
+const dashboardMode = Boolean(window.__BMP_DASHBOARD__) || new URLSearchParams(location.search).get("dashboard") === "1";
+if (dashboardMode) {
+  // The dashboard window loads index.html with an initialization flag. Let
+  // dashboard.js own that window instead of starting the main app twice.
+  return;
+}
 
 async function invoke(command, args = {}) {
   if (tauriInternals && tauriInternals.invoke) return tauriInternals.invoke(command, args);
@@ -134,7 +140,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.7.0";
+const APP_VERSION = "0.8.0";
 const PROTOCOL_VERSION = 3;
 const CAPABILITIES = 1 | (1 << 10) | (1 << 11) | (1 << 12); // presence, bookmarks, bundles, chunks
 const settings = {
@@ -301,6 +307,26 @@ function toast(message, kind = "") {
   host.prepend(item);
   while (host.children.length > 3) host.lastElementChild.remove();
   setTimeout(() => item.remove(), 4200);
+}
+
+let notificationAudio = null;
+function notificationBeep() {
+  if (!window.BMPA11y?.sound || window.BMPA11y?.dnd) return;
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    notificationAudio = notificationAudio || new AudioCtx();
+    const oscillator = notificationAudio.createOscillator();
+    const gain = notificationAudio.createGain();
+    oscillator.frequency.value = 740;
+    gain.gain.value = 0.03;
+    oscillator.connect(gain);
+    gain.connect(notificationAudio.destination);
+    oscillator.start();
+    oscillator.stop(notificationAudio.currentTime + 0.09);
+  } catch {
+    /* sound is optional */
+  }
 }
 
 function initials(name) {
@@ -844,7 +870,12 @@ function renderMessages(status) {
   const messages = Array.isArray(status?.messages) ? status.messages.slice(-60) : [];
   const key = `${messages.length}:${messages[messages.length - 1]?.text || ""}:${messages[messages.length - 1]?.stamp || ""}`;
   if (key === state.messagesKey) return;
+  const previousKey = state.messagesKey;
   state.messagesKey = key;
+  const latest = messages[messages.length - 1];
+  if (previousKey && latest && latest.author && latest.author !== settings.name) {
+    notificationBeep();
+  }
 
   const host = $("messages");
   host.replaceChildren();
@@ -1038,6 +1069,45 @@ async function exportDiagnostics() {
   } catch (error) {
     log(`export_diagnostics failed: ${error}`);
     toast(`Diagnostics failed: ${error}`, "error");
+  }
+}
+
+async function openDashboard() {
+  if (isTauri) {
+    try {
+      await invoke("open_dashboard");
+      log("dashboard opened");
+    } catch (error) {
+      log(`open_dashboard failed: ${error}`);
+      toast(`Dashboard failed: ${error}`, "error");
+    }
+    return;
+  }
+  const popup = window.open(
+    "dashboard.html",
+    "bmp-dashboard",
+    "width=560,height=760,resizable=yes,scrollbars=yes",
+  );
+  if (!popup) toast("Popup blocked - allow popups for the dashboard", "error");
+}
+
+function syncAccessibilityControls() {
+  const a11y = window.BMPA11y;
+  if (!a11y) return;
+  const contrast = $("setContrast");
+  const font = $("setFontScale");
+  const motion = $("setMotion");
+  const sound = $("setSound");
+  if (contrast) contrast.value = a11y.contrast || "normal";
+  if (font) font.value = a11y.font || "normal";
+  if (motion) motion.checked = a11y.reducedMotion;
+  if (sound) sound.checked = a11y.sound;
+  if (store.loaded) {
+    store.set("contrast", a11y.contrast || "normal");
+    store.set("fontScale", a11y.font || "normal");
+    store.set("reducedMotion", a11y.reducedMotion ? "1" : "0");
+    store.set("sound", a11y.sound ? "1" : "0");
+    store.set("dnd", a11y.dnd ? "1" : "0");
   }
 }
 
@@ -1714,6 +1784,15 @@ function wire() {
   $("refreshBtn").addEventListener("click", poll);
   $("detectBtn").addEventListener("click", detectBlender);
   $("exportDiagnostics").addEventListener("click", exportDiagnostics);
+  document.querySelectorAll('.rail-btn[data-view="dashboard"]').forEach((button) => {
+    button.addEventListener("click", openDashboard);
+  });
+  $("openDashboard").addEventListener("click", openDashboard);
+  $("setContrast").addEventListener("change", () => window.BMPA11y?.set("contrast", $("setContrast").value));
+  $("setFontScale").addEventListener("change", () => window.BMPA11y?.set("font", $("setFontScale").value));
+  $("setMotion").addEventListener("change", () => window.BMPA11y?.set("motion", $("setMotion").checked ? "1" : "0"));
+  $("setSound").addEventListener("change", () => window.BMPA11y?.set("sound", $("setSound").checked ? "1" : "0"));
+  document.addEventListener("bmp-a11y", syncAccessibilityControls);
   $("saveSettings").addEventListener("click", () => {
     settings.name = $("setName").value.trim() || settings.name;
     settings.port = Math.max(1024, Math.min(65535, Number($("setPort").value) || 51999));
@@ -1744,6 +1823,7 @@ function wire() {
 async function boot() {
   await loadSettings();
   applyStoredSettings();
+  window.BMPA11y?.apply();
   wire();
   window.BMPLayout?.init({
     content: {
@@ -1777,6 +1857,7 @@ async function boot() {
   $("setRelay").value = settings.relay;
   $("setUseRelay").checked = settings.useRelay;
   $("setBlender").value = settings.blender;
+  syncAccessibilityControls();
 
   if (state.demo) {
     applyStatus(demoStatus);

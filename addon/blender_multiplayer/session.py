@@ -2813,6 +2813,9 @@ class SessionService:
                     "caps": peer.caps,
                     "role": int(peer.role),
                     "rtt_ms": round(max(0.0, float(peer.rtt_ms)), 1),
+                    "queue": int(peer.queue.qsize()),
+                    "pending": len(peer.pending),
+                    "quality": int(peer.quality),
                 }
                 for peer in self._peers.values()
                 if peer.authenticated

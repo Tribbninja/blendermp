@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Blendermp</title>
   <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="dashboard.css" />
 </head>
 <body>
   <div class="app" id="app">
@@ -27,6 +28,9 @@
       </button>
       <button class="rail-btn" data-view="diagnostics" title="Diagnostics">
         <svg viewBox="0 0 24 24"><path d="M3 12h4l2-6 4 12 2-6h6" /></svg>
+      </button>
+      <button class="rail-btn" data-view="dashboard" title="Open dashboard">
+        <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M3 9h18M9 9v11" /></svg>
       </button>
       <button class="rail-btn" data-view="settings" title="Settings">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" /><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1" /></svg>
@@ -236,6 +240,26 @@
             <button class="btn soft" id="detectBtn">Detect Blender</button>
             <button class="btn ghost" id="saveSettings">Save</button>
           </div>
+          <section class="section">
+            <div class="section-head"><span>Accessibility</span><span>shared with dashboard</span></div>
+            <label class="field">
+              <span>Contrast</span>
+              <select id="setContrast">
+                <option value="normal">Normal</option>
+                <option value="high">High contrast</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Text size</span>
+              <select id="setFontScale">
+                <option value="normal">Normal</option>
+                <option value="large">Large</option>
+              </select>
+            </label>
+            <label class="check"><input type="checkbox" id="setMotion" /><span>Reduce motion</span></label>
+            <label class="check"><input type="checkbox" id="setSound" /><span>Notification sounds</span></label>
+            <button class="btn ghost wide" id="openDashboard" type="button">Open dashboard window</button>
+          </section>
           <p class="fine">No custom cryptography. TLS 1.3, pinned host certificate, server-validated edits.</p>
         </section>
       </div>
@@ -280,7 +304,7 @@
         <span id="statusLeft">Ready</span>
         <span class="grow"></span>
         <span id="statusMid"></span>
-        <span id="statusRight">v0.7.0</span>
+        <span id="statusRight">v0.8.0</span>
       </div>
     </main>
     </section>
@@ -318,6 +342,8 @@
   </div>
 
   <script src="layout.js"></script>
+  <script src="a11y.js"></script>
   <script src="app.js"></script>
+  <script src="dashboard.js"></script>
 </body>
 </html>
