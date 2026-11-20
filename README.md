@@ -183,12 +183,41 @@ surface that cross-process re-parenting causes on some GPUs).
   same animated transition. Blender is hidden while arranging and returns to the
   viewport when you press Done or Escape.
 
-The protocol and engine have **173 passing tests**, including a real TLS
-host/client session, certificate-mismatch rejection, relay chat, password
-rejection and host kick over a multiplexed tunnel, the public directory API, and
-1,000-vertex delta round-trips under loss/reordering. The Cloudflare Worker hub
-was also exercised locally with `wrangler dev`: announce/list, host and client
+The protocol and engine have **205 passing unit tests** and **12 two-Blender or
+headless e2e suites**, including a real TLS host/client session,
+certificate-mismatch rejection, relay chat, password rejection and host kick
+over a multiplexed tunnel, the public directory API, 1,000-vertex delta
+round-trips under loss/reordering, live Boolean/modifier sync, and the AI,
+bridge, broadcast and recording foundation check. The Cloudflare Worker hub was
+also exercised locally with `wrangler dev`: announce/list, host and client
 through the WebSocket relay, and kick.
+
+## AI copilot (Ollama)
+
+1. Install [Ollama](https://ollama.com/) and pull a tool-capable model:
+   `ollama pull qwen2.5:7b`.
+2. In Blender's Blendermp panel, enable **AI Copilot**, set the URL
+   (`http://127.0.0.1:11434`), model and timeout.
+3. Press **Test** to confirm the server and model are available.
+4. Type a request, press **Ask**, review the proposed edits, then **Apply all**.
+
+The model receives a compact scene snapshot (objects, types, locations,
+selection, materials) so small local models do not have to guess names. Edits
+are applied only after confirmation, through the same sync/lease path as a
+manual edit. A slow first load is normal; raise the timeout if the GPU is busy.
+
+## Live view and cross-engine
+
+* **Recording & Replay**: the Recording box writes every local send and remote
+  event to `%LOCALAPPDATA%\Blendermp\recordings`. Replay feeds it back at the
+  original rate and speed.
+* **Live Broadcast**: start the live view and open the token-protected
+  localhost page. It shows chat, transforms, object creates/deletes, locks and
+  errors over Server-Sent Events. No external JS or second window.
+* **Cross-engine Bridge**: choose Unity, Unreal or Godot and press Start. The
+  TCP bridge sends transforms, visibility, materials and triangle meshes.
+  Reference receivers are in `integrations/` (Unity C#, Unreal Python, Godot 4
+  GDScript, plus a console receiver).
 
 ## Cross-network
 

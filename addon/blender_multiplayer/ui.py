@@ -71,6 +71,7 @@ class BMP_PT_main(bpy.types.Panel):
             row = ai_box.row(align=True)
             row.prop(settings, "ai_model", text="")
             row.operator("bmp.ai_test", text="Test", icon="PLUGIN")
+            ai_box.prop(settings, "ai_timeout")
             row = ai_box.row(align=True)
             row.prop(settings, "ai_prompt", text="")
             row.operator("bmp.ai_ask", text="", icon="PLAY")

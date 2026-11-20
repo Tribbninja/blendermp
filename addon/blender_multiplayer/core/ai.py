@@ -117,6 +117,11 @@ class OllamaClient:
                     f"Ollama has no model '{self.model}'. Run: ollama pull {self.model}"
                 ) from exc
             raise RuntimeError(f"Ollama HTTP {exc.code}: {detail or exc.reason}") from exc
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"Ollama did not answer within {self.timeout:.0f}s. The model may "
+                "still be loading, or the GPU is busy."
+            ) from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Ollama unreachable at {self.base_url}: {exc}") from exc
         except json.JSONDecodeError as exc:

@@ -341,6 +341,7 @@ class BMPState(PropertyGroup):
     ai_enabled: BoolProperty(name="Enable AI copilot", default=False)
     ai_url: StringProperty(name="Ollama URL", default="http://127.0.0.1:11434")
     ai_model: StringProperty(name="Ollama model", default="qwen2.5:7b")
+    ai_timeout: IntProperty(name="Timeout (seconds)", default=180, min=10, max=900)
     ai_prompt: StringProperty(name="Ask the copilot", default="")
     ai_status: StringProperty(name="AI status", default="idle")
     ai_pending_text: StringProperty(name="AI pending edits", default="")
@@ -7581,11 +7582,17 @@ class BMP_OT_ai_ask(Operator):
         if runtime.get("ai_session") is None:
             handlers = _ai_handlers()
             tools = ai_core.build_default_tools(context, handlers)
-            client = ai_core.OllamaClient(settings.ai_url, settings.ai_model)
+            client = ai_core.OllamaClient(
+                settings.ai_url,
+                settings.ai_model,
+                timeout=float(settings.ai_timeout),
+            )
             runtime["ai_session"] = ai_core.AISession(client, tools)
         else:
             runtime["ai_session"].client = ai_core.OllamaClient(
-                settings.ai_url, settings.ai_model
+                settings.ai_url,
+                settings.ai_model,
+                timeout=float(settings.ai_timeout),
             )
         prompt = settings.ai_prompt.strip()
         if not prompt:
@@ -7614,7 +7621,11 @@ class BMP_OT_ai_test(Operator):
         settings = context.window_manager.bmp
         from .core import ai as ai_core
 
-        client = ai_core.OllamaClient(settings.ai_url, settings.ai_model)
+        client = ai_core.OllamaClient(
+            settings.ai_url,
+            settings.ai_model,
+            timeout=float(min(60, settings.ai_timeout)),
+        )
         ok, message = client.health()
         if ok:
             settings.ai_status = "ready"

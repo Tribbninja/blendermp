@@ -213,3 +213,53 @@ def test_ollama_client_error_raises():
     client = ai.OllamaClient("http://127.0.0.1:1", model="m", timeout=1)
     with pytest.raises(RuntimeError):
         client.chat([{"role": "user", "content": "hi"}])
+
+
+def test_ollama_client_reads_tool_calls_over_http():
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    payload = {
+        "message": {
+            "role": "assistant",
+            "content": "moving",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "move_object",
+                        "arguments": {"name": "Cube", "location": [1, 2, 3]},
+                    }
+                }
+            ],
+        }
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            return
+
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        client = ai.OllamaClient(f"http://127.0.0.1:{port}", "m", timeout=5)
+        message = client.chat([{"role": "user", "content": "move"}], [])
+        assert message["content"] == "moving"
+        call = message["tool_calls"][0]["function"]
+        assert call["name"] == "move_object"
+        assert call["arguments"]["location"] == [1, 2, 3]
+    finally:
+        server.shutdown()
+        server.server_close()
