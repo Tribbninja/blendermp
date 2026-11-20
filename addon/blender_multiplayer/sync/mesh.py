@@ -129,7 +129,17 @@ class MeshMirror:
         if indices.size and int(indices.max()) >= self.shadow.shape[0]:
             raise ValueError("delta index outside the local mesh")
         chunker.apply_positions(self.shadow, indices, values)
-        mesh.vertices.foreach_set("co", self.shadow.ravel())
+        if indices.size and indices.size < max(64, self.shadow.shape[0] // 4):
+            # A small drag: touching only the changed vertices avoids copying
+            # the whole position buffer through foreach_set.
+            for index, value in zip(indices, values):
+                mesh.vertices[int(index)].co = (
+                    float(value[0]),
+                    float(value[1]),
+                    float(value[2]),
+                )
+        else:
+            mesh.vertices.foreach_set("co", self.shadow.ravel())
         mesh.update()
         self.hashes = chunker.chunk_hashes(self.shadow)
         self.rev = rev
@@ -189,3 +199,79 @@ class MeshMirror:
         self.shadow = self.read_positions(mesh)
         self.counts = self.counts_of(mesh)
         self.hashes = chunker.chunk_hashes(self.shadow)
+
+
+class EditMirror:
+    """Position mirror for a mesh that is currently in Edit Mode.
+
+    Blender does not write edit-mode vertex positions into ``mesh.vertices``
+    until the user leaves Edit Mode; they live in the BMesh. This class reads and
+    writes that BMesh directly so vertex dragging can be streamed live.
+    """
+
+    def __init__(self) -> None:
+        self.shadow: np.ndarray | None = None
+        self.hashes: np.ndarray | None = None
+        self.count = 0
+        self.rev = 0
+
+    @staticmethod
+    def read(bm) -> np.ndarray:
+        bm.verts.ensure_lookup_table()
+        count = len(bm.verts)
+        flat = np.empty(count * 3, dtype=np.float32)
+        # Blender 5.x has no foreach_get on BMesh sequences; keep the fast path
+        # for builds that do and fall back to a Python loop.
+        try:
+            bm.verts.foreach_get("co", flat)
+            return flat.reshape(-1, 3)
+        except (AttributeError, TypeError, RuntimeError):
+            pass
+        for index, vert in enumerate(bm.verts):
+            flat[index * 3] = vert.co.x
+            flat[index * 3 + 1] = vert.co.y
+            flat[index * 3 + 2] = vert.co.z
+        return flat.reshape(-1, 3)
+
+    def matches(self, bm) -> bool:
+        return self.shadow is not None and len(bm.verts) == self.shadow.shape[0]
+
+    def remember(self, bm) -> None:
+        self.shadow = self.read(bm)
+        self.count = self.shadow.shape[0]
+        self.hashes = chunker.chunk_hashes(self.shadow)
+
+    def poll(self, bm, epsilon: float = 1e-5) -> tuple[int, bytes] | None:
+        if not self.matches(bm):
+            return None
+        positions = self.read(bm)
+        scan = chunker.diff_positions(
+            self.shadow,
+            positions,
+            epsilon=epsilon,
+            previous_hashes=self.hashes,
+        )
+        self.hashes = scan.hashes
+        if scan.count == 0:
+            self.shadow = positions
+            return None
+        self.shadow = positions
+        self.rev = (self.rev + 1) & 0xFFFFFFFF
+        return self.rev, chunker.encode_delta(self.rev, scan.indices, scan.values)
+
+    def apply_delta(self, bm, payload: bytes) -> None:
+        if not self.matches(bm):
+            self.remember(bm)
+        rev, indices, values = chunker.decode_delta(payload)
+        if self.shadow is None:
+            return
+        if indices.size and int(indices.max()) >= self.shadow.shape[0]:
+            raise ValueError("delta index outside the local edit mesh")
+        chunker.apply_positions(self.shadow, indices, values)
+        bm.verts.ensure_lookup_table()
+        bm_verts = bm.verts
+        for index, value in zip(indices, values):
+            bm_verts[int(index)].co = (float(value[0]), float(value[1]), float(value[2]))
+        bm.normal_update()
+        self.hashes = chunker.chunk_hashes(self.shadow)
+        self.rev = rev

@@ -1,4 +1,4 @@
-"""Blendermp - collaborative Blender sessions.
+﻿"""Blendermp - collaborative Blender sessions.
 
 The addon talks to the desktop app through two small JSON files in the user's
 local data folder. That keeps the integration dependency-free and lets the app
@@ -34,38 +34,48 @@ from bpy.types import Operator, Panel, PropertyGroup
 from bpy_extras.io_utils import ExportHelper
 
 from . import control, ui
+from .core import chunker
 from .core import image_payload
 from .core import material as material_payload
 from .core import object_payload
 from .session import MAX_MESH, SessionService
 from .sync import objects as obj_sync
-from .sync.mesh import MeshMirror
+from .sync.mesh import EditMirror, MeshMirror
 
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 1, 0),
+    "version": (0, 1, 2),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
     "category": "Network",
 }
 
-ADDON_VERSION = "0.1.1"
+ADDON_VERSION = "0.1.2"
 TICK = 1.0 / 30.0
 CONTROL_POLL = 0.5
 STATUS_WRITE = 0.5
-MESH_POLL = 1.0 / 12.0
+MESH_POLL = 1.0 / 20.0
+EDIT_POLL = 1.0 / 30.0
 
 runtime: dict = {
     "session": None,
     "inbox": queue.Queue(),
     "mirrors": {},
+    "edit_mirrors": {},
     "object_shadow": {},
+    "lease_owners": {},
+    "local_transform": {},
+    "edit_lease_uid": None,
+    "bootstrapping": False,
+    "bootstrap_deadline": 0.0,
+    "bootstraps": {},
     "tracked": set(),
     "last_control_nonce": None,
     "last_status": 0.0,
     "last_mesh": 0.0,
+    "last_edit": 0.0,
     "mesh_cursor": 0,
     "pings": [],
     "known_objects": set(),
@@ -239,6 +249,8 @@ def start_host(
     settings.is_host = True
     settings.state = "hosting"
     settings.last_error = ""
+    runtime["bootstrapping"] = False
+    runtime["bootstraps"] = {}
     name = settings.name or f"user-{uuid.uuid4().hex[:4]}"
     settings.name = name
     print(f"BMP host code={code} relay={relay_url or relay}", flush=True)
@@ -279,6 +291,9 @@ def start_join(context, code: str, relay_url: str | None = None) -> None:
     settings.is_host = False
     settings.state = "joining"
     settings.last_error = ""
+    runtime["bootstrapping"] = True
+    runtime["bootstrap_deadline"] = time.monotonic() + 20.0
+    runtime["bootstraps"] = {}
     bridge = None
     relay: tuple[str, int] | None = None
     print(f"BMP join code={settings.code} relay={relay_url}", flush=True)
@@ -341,7 +356,15 @@ def stop_session(context, publish: bool = True) -> None:
         except Exception:  # noqa: BLE001
             traceback.print_exc()
     runtime["mirrors"].clear()
+    runtime["edit_mirrors"].clear()
     runtime["object_shadow"].clear()
+    runtime["lease_owners"].clear()
+    runtime["local_transform"].clear()
+    runtime["bootstraps"].clear()
+    runtime["bootstrapping"] = False
+    runtime["bootstrap_deadline"] = 0.0
+    runtime["edit_lease_uid"] = None
+    runtime["last_edit"] = 0.0
     settings = context.window_manager.bmp
     settings.rtt_ms = 0
     settings.users.clear()
@@ -386,19 +409,38 @@ def _handle_event(context, kind: str, body: dict) -> None:
     elif kind == "welcome":
         settings.state = "connected"
         settings.host_name = body.get("name", "")
-        _push_message(context, "system", "Connected")
+        if body.get("you"):
+            settings.name = body["you"]
+        runtime["bootstrapping"] = True
+        runtime["bootstrap_deadline"] = time.monotonic() + 20.0
+        _push_message(context, "system", "Connected - loading host scene")
         _upsert_user(context, body.get("name", "host"), body.get("color", (1, 1, 1, 1)), host=True)
         for peer in body.get("peers", []):
             _upsert_user(context, peer.get("name", "?"), peer.get("color", (1, 1, 1, 1)))
-        # send our full mesh for tracked objects so the newcomer sees them
-        _send_snapshots(context)
+        # The host now streams its scene; the client does not upload its own.
     elif kind == "relay":
         _push_message(context, "system", body.get("message", "Relay connected"))
     elif kind == "relay_error":
         settings.last_error = str(body.get("message", "relay error"))[:180]
     elif kind == "peer_join":
-        _upsert_user(context, body.get("name", "?"), body.get("color", (1, 1, 1, 1)))
-        _push_message(context, "system", f"{body.get('name', 'someone')} joined")
+        name = body.get("name", "?")
+        _upsert_user(context, name, body.get("color", (1, 1, 1, 1)))
+        _push_message(context, "system", f"{name} joined")
+        if settings.is_host:
+            _queue_scene_bootstrap(context, name)
+    elif kind == "scene_reset":
+        target = body.get("target")
+        if target and target != settings.name:
+            return
+        _clear_scene(context)
+        runtime["bootstrapping"] = True
+        runtime["bootstrap_deadline"] = time.monotonic() + 30.0
+        _push_message(context, "system", "Replacing local scene with the host's")
+    elif kind == "scene_ready":
+        target = body.get("target")
+        if target and target != settings.name:
+            return
+        _finish_scene_bootstrap(context, body)
     elif kind == "peer_leave":
         _remove_user(context, body.get("name", "?"))
         _push_message(context, "system", f"{body.get('name', 'someone')} left")
@@ -426,6 +468,17 @@ def _handle_event(context, kind: str, body: dict) -> None:
             finally:
                 runtime["applying_frame"] = False
     elif kind == "lease":
+        leases = body.get("leases")
+        if isinstance(leases, dict):
+            runtime["lease_owners"] = {
+                key: info["owner"]
+                for key, info in leases.items()
+                if isinstance(key, str) and isinstance(info, dict) and isinstance(info.get("owner"), str)
+            }
+        key = body.get("key")
+        owner = body.get("owner")
+        if isinstance(key, str) and isinstance(owner, str):
+            runtime["lease_owners"][key] = owner
         action = body.get("action")
         if action in {"denied", "held"}:
             _push_message(context, "system", f"Locked by {body.get('owner', 'someone')}")
@@ -456,7 +509,13 @@ def _handle_event(context, kind: str, body: dict) -> None:
     elif kind == "rtt":
         settings.rtt_ms = int(body.get("ms", 0))
     elif kind == "transform":
-        obj_sync.apply(body.get("uuid"), body.get("matrix", []))
+        uid = body.get("uuid")
+        values = body.get("matrix", [])
+        if not _should_ignore_remote_transform(context, uid):
+            if obj_sync.apply(uid, values):
+                # Remember the applied matrix so the next local sync does not
+                # treat the remote move as a local change and echo it back.
+                runtime["object_shadow"][uid] = tuple(round(float(v), 6) for v in values)
     elif kind == "mesh_delta":
         _apply_mesh_delta(context, body)
     elif kind == "mesh_snapshot":
@@ -468,6 +527,24 @@ def _handle_event(context, kind: str, body: dict) -> None:
         _push_message(context, "system", f"Disconnected: {body.get('reason', 'unknown')}")
 
 
+def _should_ignore_remote_transform(context, uid: str) -> bool:
+    """Do not move an object while the local user is moving/editing it."""
+    now = time.monotonic()
+    if now - runtime["local_transform"].get(uid, 0.0) < 0.35:
+        return True
+    obj = obj_sync.find(uid)
+    if obj is not None and context.active_object is obj and context.mode in {"EDIT_MESH", "SCULPT"}:
+        return True
+    window = getattr(context, "window", None)
+    if window is not None:
+        try:
+            if window.modal_operators:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+    return False
+
+
 def _apply_mesh_delta(context, body: dict) -> None:
     uid = body.get("uuid")
     payload = body.get("payload", b"")
@@ -476,11 +553,40 @@ def _apply_mesh_delta(context, body: dict) -> None:
     obj = obj_sync.find(uid)
     if obj is None or obj.type != "MESH":
         return
-    if context.active_object == obj and context.mode in {"EDIT_MESH", "SCULPT"}:
-        return  # never fight the local sculpt
+    if context.active_object == obj and context.mode == "EDIT_MESH":
+        _apply_edit_delta(context, obj, uid, bytes(payload))
+        return
+    if context.active_object == obj and context.mode == "SCULPT":
+        return  # sculpt data is not a BMesh; leave the local sculpt alone
     mirror = runtime["mirrors"].setdefault(uid, MeshMirror())
     try:
         mirror.apply_delta(obj.data, bytes(payload))
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+
+
+def _apply_edit_delta(context, obj, uid: str, payload: bytes) -> None:
+    """Apply a vertex delta to an object that is currently in Edit Mode."""
+    try:
+        import bmesh
+    except ImportError:  # pragma: no cover - Blender always has bmesh
+        return
+    try:
+        bm = bmesh.from_edit_mesh(obj.data)
+    except Exception:  # noqa: BLE001
+        return
+    mirror = runtime["edit_mirrors"].get(uid)
+    if mirror is None:
+        mirror = EditMirror()
+        mirror.remember(bm)
+        runtime["edit_mirrors"][uid] = mirror
+    if not mirror.matches(bm):
+        # Topology changed remotely. Rebuilding a live edit mesh is unsafe;
+        # the editor's final snapshot applies once this user leaves Edit Mode.
+        return
+    try:
+        mirror.apply_delta(bm, payload)
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
     except Exception:  # noqa: BLE001
         traceback.print_exc()
 
@@ -636,7 +742,7 @@ def _material_signature(data: dict) -> tuple:
 def _sync_materials(context) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
-    if session is None or settings.paused or not settings.sync_materials:
+    if session is None or settings.paused or not settings.sync_materials or runtime.get("bootstrapping"):
         return
     now = time.monotonic()
     if now - runtime["last_material"] < 0.25:
@@ -753,7 +859,7 @@ def _modifier_signature(snapshot: list) -> str:
 def _sync_modifiers(context) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
-    if session is None or settings.paused or not settings.sync_modifiers:
+    if session is None or settings.paused or not settings.sync_modifiers or runtime.get("bootstrapping"):
         return
     now = time.monotonic()
     if now - runtime["last_modifier"] < 0.5:
@@ -1021,7 +1127,180 @@ def _prime_objects(context) -> None:
             uid = str(uuid.uuid4())
             obj["bmp_uuid"] = uid
         known.add(uid)
+        if obj.type == "MESH":
+            runtime["tracked"].add(obj.name)
     runtime["known_objects"] = known
+
+
+def _parent_depth(obj) -> int:
+    depth = 0
+    seen = 0
+    while obj is not None and obj.parent is not None and seen < 64:
+        depth += 1
+        obj = obj.parent
+        seen += 1
+    return depth
+
+
+def _send_object_details(session: SessionService, obj) -> None:
+    uid = obj.get("bmp_uuid")
+    if not uid:
+        return
+    for index, slot in enumerate(getattr(obj, "material_slots", []) or []):
+        material = slot.material
+        if material is None:
+            continue
+        data = material_values(material)
+        session.send_material(uid, index, data)
+        runtime["material_shadow"][(uid, index)] = _material_signature(data)
+    if hasattr(obj, "modifiers"):
+        snapshot = modifier_snapshot(obj)
+        session.send_modifier_stack(uid, snapshot)
+        runtime["modifier_shadow"][uid] = _modifier_signature(snapshot)
+
+
+def _world_values(world):
+    if world is None or not getattr(world, "use_nodes", False) or world.node_tree is None:
+        return None
+    for node in world.node_tree.nodes:
+        if node.type != "BACKGROUND":
+            continue
+        try:
+            color = [float(v) for v in node.inputs["Color"].default_value][:3]
+            strength = float(node.inputs["Strength"].default_value)
+        except (KeyError, TypeError, ValueError):
+            return None
+        return {"color": color, "strength": max(0.0, min(1000.0, strength))}
+    return None
+
+
+def _queue_scene_bootstrap(context, target: str) -> None:
+    session: SessionService | None = runtime.get("session")
+    if session is None or not session.is_host:
+        return
+    objects = [obj for obj in context.scene.objects if not obj.get("bmp_ping")]
+    objects.sort(key=_parent_depth)
+    camera = context.scene.camera
+    runtime["bootstraps"][target] = {
+        "objects": [obj.name for obj in objects],
+        "camera": camera.get("bmp_uuid") if camera is not None else None,
+        "world": _world_values(context.scene.world),
+    }
+    session.send_scene_reset(target)
+    _push_message(context, "system", f"Sending scene to {target}")
+
+
+def _pump_scene_bootstrap(context) -> None:
+    session: SessionService | None = runtime.get("session")
+    bootstraps = runtime.get("bootstraps")
+    if session is None or not session.is_host or not bootstraps:
+        return
+    for target in list(bootstraps):
+        entry = bootstraps.get(target)
+        if not isinstance(entry, dict):
+            continue
+        queue = entry.get("objects") or []
+        sent = 0
+        while queue and sent < 2:
+            name = queue.pop(0)
+            obj = bpy.data.objects.get(name)
+            if obj is None or obj.get("bmp_ping"):
+                continue
+            _send_object_create(session, obj)
+            _send_object_details(session, obj)
+            if obj.type == "MESH":
+                runtime["tracked"].add(obj.name)
+            sent += 1
+        if not queue:
+            session.send_scene_ready(
+                target,
+                {"camera": entry.get("camera"), "world": entry.get("world")},
+            )
+            del bootstraps[target]
+
+
+def _clear_scene(context) -> None:
+    try:
+        if context.mode != "OBJECT" and context.active_object is not None:
+            bpy.ops.object.mode_set(mode="OBJECT")
+    except Exception:  # noqa: BLE001
+        pass
+    for obj in list(bpy.data.objects):
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        bpy.data.orphans_purge(do_recursive=True)
+    except TypeError:
+        try:
+            bpy.data.orphans_purge()
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception:  # noqa: BLE001
+        pass
+    runtime["mirrors"].clear()
+    runtime["edit_mirrors"].clear()
+    runtime["object_shadow"].clear()
+    runtime["material_shadow"].clear()
+    runtime["modifier_shadow"].clear()
+    runtime["tracked"].clear()
+    runtime["known_objects"].clear()
+    runtime["lease_owners"].clear()
+    runtime["edit_lease_uid"] = None
+
+
+def _finish_scene_bootstrap(context, body: dict | None = None) -> None:
+    runtime["bootstrapping"] = False
+    runtime["bootstrap_deadline"] = 0.0
+    runtime["mirrors"].clear()
+    runtime["edit_mirrors"].clear()
+    runtime["object_shadow"].clear()
+    runtime["material_shadow"].clear()
+    runtime["modifier_shadow"].clear()
+    runtime["tracked"].clear()
+    runtime["known_objects"].clear()
+    for obj in context.scene.objects:
+        uid = obj.get("bmp_uuid")
+        if not uid:
+            continue
+        runtime["known_objects"].add(uid)
+        runtime["object_shadow"][uid] = tuple(round(float(v), 6) for row in obj.matrix_world for v in row)
+        if obj.type == "MESH":
+            mirror = MeshMirror()
+            mirror.remember(obj.data)
+            runtime["mirrors"][uid] = mirror
+            runtime["tracked"].add(obj.name)
+        for index, slot in enumerate(getattr(obj, "material_slots", []) or []):
+            if slot.material:
+                data = material_values(slot.material)
+                runtime["material_shadow"][(uid, index)] = _material_signature(data)
+        if hasattr(obj, "modifiers"):
+            snapshot = modifier_snapshot(obj)
+            runtime["modifier_shadow"][uid] = _modifier_signature(snapshot)
+    if isinstance(body, dict):
+        camera = body.get("camera")
+        if isinstance(camera, str):
+            camera_obj = obj_sync.find(camera)
+            if camera_obj is not None:
+                context.scene.camera = camera_obj
+        world_values = body.get("world")
+        world = context.scene.world
+        if isinstance(world_values, dict) and world is not None:
+            world.use_nodes = True
+            tree = world.node_tree
+            if tree is not None:
+                for node in tree.nodes:
+                    if node.type != "BACKGROUND":
+                        continue
+                    color = world_values.get("color")
+                    if isinstance(color, list) and len(color) == 3:
+                        node.inputs["Color"].default_value = tuple(float(v) for v in color) + (1.0,)
+                    strength = world_values.get("strength")
+                    if isinstance(strength, (int, float)):
+                        node.inputs["Strength"].default_value = float(strength)
+                    break
+    _push_message(context, "system", "Host scene loaded")
 
 
 def _send_object_create(session: SessionService, obj) -> None:
@@ -1055,6 +1334,8 @@ def _send_object_create(session: SessionService, obj) -> None:
         session.send_object_create(uid, kind, meta, geometry)
     except Exception:  # noqa: BLE001
         traceback.print_exc()
+    if kind == object_payload.KIND_MESH:
+        runtime["tracked"].add(obj.name)
 
 
 def _apply_object_create(context, body: dict) -> None:
@@ -1070,7 +1351,11 @@ def _apply_object_create(context, body: dict) -> None:
             mesh = bpy.data.meshes.new(name)
             obj = bpy.data.objects.new(name, mesh)
             mirror = MeshMirror()
-            mirror.apply_snapshot(mesh, body.get("geometry", b""))
+            geometry = body.get("geometry", b"")
+            if geometry:
+                mirror.apply_snapshot(mesh, geometry)
+            else:
+                mirror.remember(mesh)
             runtime["mirrors"][uid] = mirror
         elif kind == object_payload.KIND_CAMERA:
             data = bpy.data.cameras.new(name)
@@ -1121,6 +1406,8 @@ def _apply_object_create(context, body: dict) -> None:
     target.objects.link(obj)
     obj["bmp_uuid"] = uid
     runtime["known_objects"].add(uid)
+    if obj.type == "MESH":
+        runtime["tracked"].add(obj.name)
     obj_sync.apply(uid, meta.get("matrix", []))
     parent_uid = meta.get("parent")
     if parent_uid:
@@ -1137,7 +1424,11 @@ def _apply_object_delete(context, body: dict) -> None:
     obj = obj_sync.find(uid)
     runtime["known_objects"].discard(uid)
     runtime["mirrors"].pop(uid, None)
+    runtime["edit_mirrors"].pop(uid, None)
     runtime["object_shadow"].pop(uid, None)
+    runtime["lease_owners"].pop(uid, None)
+    if obj is not None:
+        runtime["tracked"].discard(obj.name)
     if obj is None:
         return
     if context.active_object is obj and context.mode != "OBJECT":
@@ -1154,7 +1445,7 @@ def _apply_object_delete(context, body: dict) -> None:
 def _sync_transforms(context) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
-    if session is None or not settings.sync_transforms or settings.paused:
+    if session is None or not settings.sync_transforms or settings.paused or runtime.get("bootstrapping"):
         return
     known = runtime["known_objects"]
     current = set()
@@ -1189,26 +1480,95 @@ def _sync_transforms(context) -> None:
             continue
         if current != previous:
             shadow[uid] = current
+            runtime["local_transform"][uid] = time.monotonic()
             session.send_transform(uid, current)
     for stale in list(shadow.keys() - seen):
         del shadow[stale]
 
 
+def _sync_edit_mesh(context, session: SessionService, obj) -> None:
+    """Stream vertex moves while an object is in Edit Mode.
+
+    Blender keeps edit-mode positions in a BMesh, so ``obj.data.vertices`` is
+    stale until the user leaves the mode. This reads the BMesh and sends only
+    changed vertices, at up to 30 Hz.
+    """
+    settings = context.window_manager.bmp
+    if not settings.sync_mesh or settings.paused:
+        return
+    now = time.monotonic()
+    count = len(obj.data.vertices)
+    interval = EDIT_POLL if count <= 20000 else (1.0 / 15.0 if count <= 80000 else 1.0 / 10.0)
+    if now - runtime["last_edit"] < interval:
+        return
+    runtime["last_edit"] = now
+
+    uid = obj.get("bmp_uuid") or str(uuid.uuid4())
+    obj["bmp_uuid"] = uid
+    runtime["tracked"].add(obj.name)
+    owner = runtime["lease_owners"].get(uid)
+    if owner is not None and owner != settings.name:
+        if runtime.get("edit_lease_uid") != uid:
+            runtime["edit_lease_uid"] = uid
+            _push_message(context, "system", f"Live edit locked by {owner}")
+        return
+    if runtime.get("edit_lease_uid") != uid:
+        runtime["edit_lease_uid"] = uid
+        session.send_lease(uid, "acquire")
+    try:
+        import bmesh
+        bm = bmesh.from_edit_mesh(obj.data)
+    except Exception:  # noqa: BLE001
+        return
+    mirror = runtime["edit_mirrors"].get(uid)
+    if mirror is None or not mirror.matches(bm):
+        # Seed from the object's pre-edit mesh, not from the BMesh. If the user
+        # entered Edit Mode and moved a vertex before this first tick, the BMesh
+        # already contains the new position; obj.data still has the old one.
+        mirror = EditMirror()
+        try:
+            positions = MeshMirror.read_positions(obj.data)
+            if positions.shape[0] == len(bm.verts):
+                mirror.shadow = positions
+                mirror.count = positions.shape[0]
+                mirror.hashes = chunker.chunk_hashes(positions)
+            else:
+                mirror.remember(bm)
+        except Exception:  # noqa: BLE001
+            mirror.remember(bm)
+        runtime["edit_mirrors"][uid] = mirror
+    try:
+        delta = mirror.poll(bm)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return
+    if delta is not None:
+        rev, payload = delta
+        session.send_mesh(obj, "delta", payload, rev)
+
+
 def _sync_mesh(context) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
-    if session is None or not settings.sync_mesh or settings.paused:
+    if session is None or not settings.sync_mesh or settings.paused or runtime.get("bootstrapping"):
         return
+    active = context.active_object
+    editing = active is not None and active.type == "MESH" and context.mode == "EDIT_MESH"
+    if editing:
+        _sync_edit_mesh(context, session, active)
+    elif runtime["edit_mirrors"]:
+        runtime["edit_mirrors"].clear()
+        runtime["edit_lease_uid"] = None
+
     now = time.monotonic()
     if now - runtime["last_mesh"] < MESH_POLL:
         return
     runtime["last_mesh"] = now
 
-    active = context.active_object
-    if active is not None and active.type == "MESH" and context.mode in {"EDIT_MESH", "SCULPT"}:
-        runtime["tracked"].add(active.name)
-
     names = sorted(name for name in runtime["tracked"] if name in bpy.data.objects)
+    if editing:
+        # The edit fast path already streams this object.
+        names = [name for name in names if name != active.name]
     if not names:
         return
     cursor = runtime.get("mesh_cursor", 0) % len(names)
@@ -1351,6 +1711,16 @@ def bmp_tick():
             _sync_materials(context)
             _sync_modifiers(context)
             _send_presence(context)
+        _pump_scene_bootstrap(context)
+        if (
+            runtime.get("bootstrapping")
+            and runtime.get("bootstrap_deadline")
+            and time.monotonic() > runtime["bootstrap_deadline"]
+        ):
+            runtime["bootstrapping"] = False
+            runtime["bootstrap_deadline"] = 0.0
+            _push_message(context, "system", "Host scene timed out; using the local scene")
+            _prime_objects(context)
         # Keep writing while offline too, so the desktop app always sees the
         # current state and never stays stuck on "connected".
         _write_status(context)

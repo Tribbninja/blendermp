@@ -649,6 +649,7 @@ class SessionService:
         welcome = {
             "peer_id": peer.peer_id,
             "name": self.name,
+            "you": peer.name,
             "color": list(self.color),
             "peers": peers,
             "fingerprint": self.fingerprint,
@@ -1093,6 +1094,11 @@ class SessionService:
                 pass
             return
 
+        if frame.type in (MessageType.SCENE_RESET, MessageType.SCENE_READY):
+            body = self._json(frame, 512)
+            self._emit("scene_reset" if frame.type == MessageType.SCENE_RESET else "scene_ready", body)
+            return
+
         if frame.type == MessageType.ERROR:
             body = self._json(frame, 1024)
             self._emit("error", {"message": clean_text(body.get("message"), 200)})
@@ -1135,6 +1141,15 @@ class SessionService:
                 self._leases.sweep(now)
 
     # ------------------------------------------------------------------ public API
+    def send_scene_reset(self, target: str) -> None:
+        self._enqueue(protocol.json_frame(MessageType.SCENE_RESET, {"target": target}))
+
+    def send_scene_ready(self, target: str, extra: dict | None = None) -> None:
+        body = {"target": target}
+        if isinstance(extra, dict):
+            body.update(extra)
+        self._enqueue(protocol.json_frame(MessageType.SCENE_READY, body))
+
     def send_presence(self, body: dict[str, Any]) -> None:
         payload = {
             "scene": clean_text(body.get("scene"), 64),

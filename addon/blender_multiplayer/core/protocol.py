@@ -1,4 +1,4 @@
-"""BMP/1 wire protocol.
+﻿"""BMP/1 wire protocol.
 
 Every message is a single frame::
 
@@ -26,7 +26,7 @@ from enum import IntEnum
 from typing import Any
 
 MAGIC = b"BMP1"
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 HEADER = struct.Struct("<4sBBBBIII")
 HEADER_SIZE = HEADER.size  # 20 bytes
 MAX_PAYLOAD = 32 * 1024 * 1024
@@ -56,6 +56,8 @@ class MessageType(IntEnum):
     MODIFIER_STACK = 21
     IMAGE_ASSET = 22
     KICK = 23
+    SCENE_RESET = 24
+    SCENE_READY = 25
 
 
 class Channel(IntEnum):

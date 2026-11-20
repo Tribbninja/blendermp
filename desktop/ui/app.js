@@ -1,4 +1,4 @@
-/* Blendermp desktop shell.
+﻿/* Blendermp desktop shell.
  *
  * No framework and no bundler: the webview loads this file directly, which keeps
  * the attack surface small (strict CSP, no inline script) and the install tiny.
@@ -60,7 +60,7 @@ const store = {
 };
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.1.1";
+const APP_VERSION = "0.1.2";
 const storedDirectory = store.get("directory", DEFAULT_HUB);
 // Drop the localhost values used while developing the Worker hub; a deployment
 // URL (or a deliberately configured hub) is kept.
@@ -382,7 +382,7 @@ function renderState(status) {
 
   const blender = status?.blender;
   $("blenderLabel").textContent = blender ? `Blender ${blender}` : settings.blender ? "Blender ready" : "Blender 5.x not detected";
-  $("statusRight").textContent = blender ? `Blender ${blender} · v${APP_VERSION}` : `v${APP_VERSION}`;
+  $("statusRight").textContent = blender ? `Blender ${blender} Â· v${APP_VERSION}` : `v${APP_VERSION}`;
   $("stageMode").textContent = state.embedded ? "Blender docked" : active ? "Blender separate" : "no Blender window";
   $("statusLeft").textContent = active
     ? `${labels[value]} - ${hosting ? serverDisplayName() : state.joinedServerName || "server"}`
@@ -747,7 +747,7 @@ async function joinServer(server, pin = "") {
     state.serverId = "";
     state.pendingServer = null;
     $("serverJoinBox").hidden = true;
-    toast(`Joining ${server.name || "server"}...`, "ok");
+    toast(`Joining ${server.name || "server"} - replacing this scene with the host's...`, "ok");
     setPanel("session");
     await launchBlender();
   } catch (error) {

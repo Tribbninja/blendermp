@@ -6,11 +6,11 @@ window, not video capture, so it keeps full GPU performance and avoids the black
 surface that cross-process re-parenting causes on some GPUs).
 
 > **Status: alpha vertical slice.** Hosting, the public server browser, TLS
-> pinning, presence, chat, object transforms, mesh streaming and window docking
-> work.
+> pinning, presence, chat, object transforms, mesh streaming, live Edit Mode
+> vertex edits and window docking work.
 > Cross-network sessions use the self-hosted relay or the Cloudflare Worker hub.
-> Edit-mode topology sync and the long feature list in the plan are not
-> implemented yet.
+> Edit-mode topology (extrude/subdivide), full node graphs, animation and
+> simulations are not implemented yet.
 
 ![Blendermp UI](docs/ui-preview.jpeg)
 
@@ -25,6 +25,12 @@ surface that cross-process re-parenting causes on some GPUs).
   host ticks Public and clients anywhere find it in the browser. TLS stays
   end-to-end; the Worker only forwards ciphertext. A self-hosted Python
   relay/directory (`docs/RELAY.md`) is the fallback.
+* **Scene bootstrap on join**: the host streams its existing objects, meshes,
+  materials and modifiers; the joining Blender replaces its local scene with
+  that snapshot before live sync starts, so both start identical.
+* **Live Edit Mode vertex sync**: vertex moves stream as compact deltas at up to
+  30 Hz in both directions, without leaving Edit Mode. Structural edits apply
+  when the editor leaves Edit Mode.
 * **TLS 1.3 everywhere**, self-signed host certificate, SHA-256 fingerprint
   pinning and a short verification code (no custom crypto).
 * **Host-authoritative protocol**: validated message types, size/rate limits,
@@ -64,7 +70,7 @@ surface that cross-process re-parenting causes on some GPUs).
   same animated transition. Blender is hidden while arranging and returns to the
   viewport when you press Done or Escape.
 
-The protocol and engine have **103 passing tests**, including a real TLS
+The protocol and engine have **106 passing tests**, including a real TLS
 host/client session, certificate-mismatch rejection, relay chat, password
 rejection and host kick over a multiplexed tunnel, the public directory API, and
 1,000-vertex delta round-trips under loss/reordering. The Cloudflare Worker hub
@@ -208,7 +214,8 @@ scripts/                       bootstrap, dev launcher, packaging
 
 1. **Transforms**: the addon polls `matrix_world`, diffs against a shadow, and
    sends 16 float32 values over the transform channel. The host validates and
-   relays; receivers apply to `matrix_world`.
+   relays; receivers apply to `matrix_world` and update their shadow so a remote
+   move is never echoed back.
 2. **Meshes**: positions are read with `foreach_get` into preallocated numpy
    buffers, split into 8,192-vertex chunks, hashed with a vectorised XOR reduce,
    and only changed chunks are diffed. Deltas carry varint index jumps and either
@@ -219,9 +226,16 @@ scripts/                       bootstrap, dev launcher, packaging
    polygons, UVs, smooth flags and material indices, then resume deltas.
 4. **Presence/chat/pings** are JSON control frames; the host rewrites identities
    so names cannot be spoofed.
-5. **Relay mode** wraps the same TLS connection in a multiplexed tunnel; the host
+5. **Scene bootstrap**: when a client joins, the host sends `SCENE_RESET`, then
+   each object (mesh geometry, materials, modifiers) over a few ticks, then
+   `SCENE_READY`. The client clears its scene, applies the snapshot and seeds all
+   shadows so nothing is echoed back.
+6. **Live Edit Mode**: the editor's BMesh is sampled at up to 30 Hz and only
+   changed vertices are sent. Receivers in Object Mode write them through
+   `foreach_set`; receivers already in Edit Mode apply them through BMesh.
+7. **Relay mode** wraps the same TLS connection in a multiplexed tunnel; the host
    keeps one outbound connection, so no public port is needed.
-6. **The app and addon talk through validated JSON files** in
+8. **The app and addon talk through validated JSON files** in
    `%LOCALAPPDATA%\Blendermp`, which keeps the integration dependency-free.
 
 See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
@@ -237,15 +251,22 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   `blender --command extension install-file`.
 * The app launches Blender, docks its window, and reports the live server
   status, fingerprint and verification code.
-* `pytest`: 103 passed.
+* Two real Blender 5.3 instances: the host's scene, material and modifier
+  bootstrap arrive on the client; object moves and live Edit Mode vertex drags
+  propagate **both ways** without snapping back.
+* `pytest`: 106 passed.
 
 ## Limitations
 
 * **No direct NAT hole punching.** Cross-network sessions use the Cloudflare
   Worker hub or the self-hosted relay. Direct LAN connections still bypass it.
-* Multiple tracked meshes share one 12 Hz polling budget, so many large meshes
-  update more slowly.
-* Geometry-node graphs, images, animation and full node graphs are not replicated yet.
+* Multiple tracked meshes share the object-mode polling budget (20 Hz), so many
+  large meshes update more slowly. The actively edited mesh has its own 30 Hz
+  fast path.
+* Edit Mode streams vertex positions live. Structural changes (extrude,
+  subdivide, delete) sync when the editor leaves Edit Mode, not during the drag.
+* Worlds, compositor node trees, animation/armatures, simulations and linked
+  libraries are not replicated yet.
 * Modifier sync covers the common parameter set; unsupported modifier types only
   replicate type/name/visibility.
 * New objects are replicated for meshes, empties, cameras and lights; curves,
