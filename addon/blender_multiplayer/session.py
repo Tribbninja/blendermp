@@ -2734,6 +2734,7 @@ class SessionService:
         text = clean_text(text, MAX_CHAT)
         if text:
             self._enqueue(protocol.json_frame(MessageType.CHAT, {"text": text, "name": self.name}))
+            self._tap("chat", {"name": self.name, "text": text})
 
     def send_transform(self, uid: str, matrix) -> None:
         try:

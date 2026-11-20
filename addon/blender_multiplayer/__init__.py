@@ -408,10 +408,8 @@ def _push_message(context, author: str, text: str) -> None:
     item.stamp = time.strftime("%H:%M")
     while len(messages) > 200:
         messages.remove(0)
-    _broadcast_event(
-        "chat" if author != "system" else "system",
-        {"name": author, "text": text},
-    )
+    if author == "system":
+        _broadcast_event("system", {"name": author, "text": text})
 
 
 def _broadcast_event(kind: str, body) -> None:
@@ -4816,6 +4814,8 @@ def _ai_handlers() -> dict:
 
     # ------------------------------------------------------------ lifecycle
     def create_primitive(args, ctx):
+        if bpy.context.mode != "OBJECT":
+            return {"error": "switch to Object Mode first"}
         ptype = str(args.get("type", "cube")).lower()
         name = str(args.get("name", "")).strip() or ptype
         loc = args.get("location", [0.0, 0.0, 0.0])
@@ -4930,10 +4930,19 @@ def _ai_handlers() -> dict:
                 item.select_set(False)
             obj.select_set(True)
             bpy.context.view_layer.objects.active = obj
-            bpy.ops.view3d.view_selected()
+            screen = getattr(bpy.context, "screen", None)
+            for area in getattr(screen, "areas", []):
+                if area.type != "VIEW_3D":
+                    continue
+                region = next(
+                    (item for item in area.regions if item.type == "WINDOW"), None
+                )
+                with bpy.context.temp_override(area=area, region=region):
+                    bpy.ops.view3d.view_selected()
+                return {"ok": True, "name": obj.name}
         except Exception as exc:  # noqa: BLE001
             return {"error": f"could not frame in this view: {exc}"[:200]}
-        return {"ok": True, "name": obj.name}
+        return {"error": "no 3D viewport is open"}
 
     def set_object_visibility(args, ctx):
         obj = _obj(args)
@@ -5081,6 +5090,8 @@ def _ai_handlers() -> dict:
             modifier.object = operand
             applied = False
             if bool(args.get("apply", False)):
+                if bpy.context.mode != "OBJECT":
+                    return {"error": "switch to Object Mode first"}
                 for item in bpy.context.selected_objects:
                     item.select_set(False)
                 obj.select_set(True)

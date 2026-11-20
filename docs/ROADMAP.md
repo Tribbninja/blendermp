@@ -829,7 +829,7 @@ This release turns the Phase 6 scaffolds into working features:
   are detected by the transform poller, and Boolean modifiers sync their
   operation and operand UID so live booleans match on both sides. The details
   e2e suite asserts the Boolean target.
-* **Tests**: 204 unit tests and 12 two-Blender/headless e2e suites, including
+* **Tests**: 205 unit tests and 12 two-Blender/headless e2e suites, including
   `run_foundation.ps1` for AI tools, mesh export, bridge, broadcast and the
   recording tap.
 

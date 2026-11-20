@@ -365,6 +365,7 @@ let events = [];
 function describe(kind, body) {
   if (!body || typeof body !== 'object') return String(body);
   if (kind === 'chat') return (body.name || '?') + ': ' + (body.text || '');
+  if (kind === 'system') return body.text || '';
   if (kind === 'transform') {
     const m = body.matrix || [];
     const p = m.length >= 15 ? [m[12], m[13], m[14]].map(v => Number(v).toFixed(2)).join(', ') : '';
