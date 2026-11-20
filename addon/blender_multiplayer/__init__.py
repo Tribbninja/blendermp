@@ -65,7 +65,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 8, 3),
+    "version": (0, 8, 4),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -5227,6 +5227,21 @@ def _smooth_view(name: str, values, now: float):
     location, rotation = rigid
     return Matrix.Translation(location) @ rotation.to_matrix().to_4x4()
 
+def _readable_label(color) -> tuple[float, float, float]:
+    """Brighten dark per-user colours so name tags stay legible on any theme."""
+    try:
+        red, green, blue = (max(0.0, min(1.0, float(color[index]))) for index in range(3))
+    except (TypeError, ValueError, IndexError):
+        return (1.0, 1.0, 1.0)
+    luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+    if luminance < 0.6:
+        mix = (0.6 - luminance) / max(0.0001, 1.0 - luminance)
+        red += (1.0 - red) * mix
+        green += (1.0 - green) * mix
+        blue += (1.0 - blue) * mix
+    return (red, green, blue)
+
+
 def _with_opacity(color, opacity: float):
     values = tuple(float(value) for value in color[:4])
     if len(values) < 4:
@@ -5301,21 +5316,22 @@ def _sync_remote_visuals(context) -> None:
             continue
         seen_users.add(user.name)
         color = _with_opacity(effective_color(user.name, user.color, colorblind), opacity)
-        if show_cameras and user.has_view:
+        if user.has_view:
             matrix = _smooth_view(user.name, list(user.view), now)
             if matrix is not None:
-                segments = _camera_segments(
-                    matrix,
-                    user.view_aspect,
-                    user.view_distance,
-                    max(0.5, min(2.0, overlay_scale)),
-                )
-                lines.append((color, segments))
-                total += len(segments)
-                for first, second in segments:
-                    max_segment = max(max_segment, float((second - first).length))
                 origin = matrix.translation
                 widget = max(0.15, min(0.6, float(user.view_distance) * 0.06))
+                if show_cameras:
+                    segments = _camera_segments(
+                        matrix,
+                        user.view_aspect,
+                        user.view_distance,
+                        max(0.5, min(2.0, overlay_scale)),
+                    )
+                    lines.append((color, segments))
+                    total += len(segments)
+                    for first, second in segments:
+                        max_segment = max(max_segment, float((second - first).length))
                 labels.append(
                     (origin + Vector((0.0, 0.0, widget * 0.5)), user.name, color)
                 )
@@ -5466,20 +5482,12 @@ def _draw_remote_labels() -> None:
     overlay_scale = float(runtime.get("overlay_scale", 1.0) or 1.0)
     lift = 8.0 * overlay_scale
     try:
-        blf.size(font, 12.0 * overlay_scale, 72.0)
+        blf.size(font, 15.0 * overlay_scale, 72.0)
     except Exception:  # noqa: BLE001
         try:
-            blf.size(font, 12)
+            blf.size(font, 15)
         except Exception:  # noqa: BLE001
             pass
-    shadow_native = False
-    try:
-        blf.enable(font, blf.SHADOW)
-        blf.shadow(font, 3, 0.0, 0.0, 0.0, 1.0)
-        blf.shadow_offset(font, 1, -1)
-        shadow_native = True
-    except Exception:  # noqa: BLE001
-        shadow_native = False
     drawn = []
     for position, name, color in labels:
         clip = matrix @ Vector((position[0], position[1], position[2], 1.0))
@@ -5495,19 +5503,27 @@ def _draw_remote_labels() -> None:
             text_width, _text_height = blf.dimensions(font, name)
             left = round(x - text_width * 0.5)
             base = round(y)
-            if not shadow_native:
-                blf.color(font, 0.015, 0.015, 0.02, 0.95)
-                blf.position(font, left + 1, base - 1, 0.0)
+            # A crisp 1px outline reads much better than the blurry native
+            # blf shadow, especially at small sizes on high-DPI screens.
+            outline = max(1, int(round(overlay_scale)))
+            blf.color(font, 0.0, 0.0, 0.0, 0.95)
+            for offset_x, offset_y in (
+                (-outline, 0),
+                (outline, 0),
+                (0, -outline),
+                (0, outline),
+                (-outline, -outline),
+                (outline, outline),
+                (-outline, outline),
+                (outline, -outline),
+            ):
+                blf.position(font, left + offset_x, base + offset_y, 0.0)
                 blf.draw(font, name)
-            blf.color(font, float(color[0]), float(color[1]), float(color[2]), 1.0)
+            red, green, blue = _readable_label(color)
+            blf.color(font, red, green, blue, 1.0)
             blf.position(font, left, base, 0.0)
             blf.draw(font, name)
             drawn.append((name, x, y))
-        except Exception:  # noqa: BLE001
-            pass
-    if shadow_native:
-        try:
-            blf.disable(font, blf.SHADOW)
         except Exception:  # noqa: BLE001
             pass
 
