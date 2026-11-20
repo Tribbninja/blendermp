@@ -1,10 +1,12 @@
+import hashlib
+
 import pytest
 
 from core import image_payload
 
 
 def test_image_roundtrip():
-    data = b"\x89PNG\r\n\x1a\n" + b"x" * 100
+    data = b"\x89PNG\r\n\x1a\n" + b"x" * 1000
     payload = image_payload.encode("Texture", "png", data)
     body = image_payload.decode(payload)
     assert body["name"] == "Texture"
@@ -34,3 +36,14 @@ def test_image_decode_truncated():
 def test_image_name_is_bounded():
     body = image_payload.decode(image_payload.encode("n" * 500, "jpg", b"abc"))
     assert len(body["name"]) <= image_payload.MAX_NAME
+
+
+def test_image_digest_roundtrip_and_integrity():
+    data = b"\x89PNG\r\n\x1a\n" + b"y" * 64
+    body = image_payload.decode(image_payload.encode("Texture", "png", data))
+    assert body["sha1"] == hashlib.sha1(data).hexdigest()
+    payload = bytearray(image_payload.encode("Texture", "png", data))
+    payload[-1] ^= 0xFF
+    with pytest.raises(image_payload.ImagePayloadError):
+        image_payload.decode(bytes(payload))
+

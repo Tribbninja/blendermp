@@ -194,6 +194,13 @@ class MeshMirror:
         self.counts = self.counts_of(mesh)
         self.hashes = chunker.chunk_hashes(self.shadow)
         self.rev = 0
+        # Building corners directly leaves their edge indices unset, which
+        # makes Blender's Bevel modifier read out of bounds. Validate once
+        # here to rebuild the corner/edge links before modifiers run.
+        try:
+            mesh.validate(clean_customdata=False)
+        except TypeError:
+            mesh.validate()
         mesh.update()
 
     def remember(self, mesh) -> None:

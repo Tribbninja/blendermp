@@ -7,10 +7,12 @@ only accept a conservative format list.
 
 from __future__ import annotations
 
+import hashlib
 import struct
 import re
 
 HEADER = struct.Struct("<HBBI")
+DIGEST_SIZE = 20
 MAX_IMAGE = 16 * 1024 * 1024
 MAX_NAME = 64
 MAX_FORMAT = 12
@@ -33,16 +35,25 @@ def encode(name: str, format_hint: str, data: bytes) -> bytes:
         raise ImagePayloadError("image data is empty or too large")
     encoded_name = name.encode("utf-8", "replace")
     encoded_format = format_hint.encode("ascii")
-    return HEADER.pack(len(encoded_name), len(encoded_format), len(data), 0) + encoded_name + encoded_format + data
+    digest = hashlib.sha1(data).digest()
+    return (
+        HEADER.pack(len(encoded_name), len(encoded_format), 0, len(data))
+        + digest
+        + encoded_name
+        + encoded_format
+        + data
+    )
 
 
 def decode(payload: bytes) -> dict:
-    if len(payload) < HEADER.size:
+    if len(payload) < HEADER.size + DIGEST_SIZE:
         raise ImagePayloadError("image frame is truncated")
-    name_len, format_len, data_len, _flags = HEADER.unpack_from(payload, 0)
+    name_len, format_len, _flags, data_len = HEADER.unpack_from(payload, 0)
     if name_len > MAX_NAME or format_len > MAX_FORMAT or data_len > MAX_IMAGE:
         raise ImagePayloadError("image frame exceeds its limits")
     offset = HEADER.size
+    digest = payload[offset : offset + DIGEST_SIZE]
+    offset += DIGEST_SIZE
     end = offset + name_len + format_len + data_len
     if len(payload) != end:
         raise ImagePayloadError("image frame length mismatch")
@@ -52,4 +63,7 @@ def decode(payload: bytes) -> dict:
     offset += format_len
     if not FORMAT_RE.match(format_hint) or format_hint not in ALLOWED:
         raise ImagePayloadError("unsupported image format")
-    return {"name": name, "format": format_hint, "data": payload[offset:]}
+    data = payload[offset:]
+    if hashlib.sha1(data).digest() != digest:
+        raise ImagePayloadError("image digest does not match its data")
+    return {"name": name, "format": format_hint, "sha1": digest.hex(), "data": data}

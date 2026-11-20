@@ -71,15 +71,16 @@ surface that cross-process re-parenting causes on some GPUs).
 * **Immediate remote application**: received transforms and vertex deltas are
   applied exactly at network rate (up to 60 Hz on LAN). There is no display
   interpolation, so the remote view never lags behind the authoritative state.
-* **Basic material sync**: Principled BSDF base colour, metallic, roughness and
-  emission, plus the viewport colour, for every object's material slots.
-  Imported objects carry their slot colours on creation. Full node graphs and
-  textures are not replicated yet.
-* **Modifier stack sync**: common modifiers (Subdivision, Mirror, Array, Solidify,
-  Bevel, Decimate, Triangulate, Smooth, Weld, Screw) and geometry-nodes group
-  references, with visibility flags, for the active object.
-* **Image sharing**: send the images used by the active object materials as packed
-  PNG/JPEG/EXR/etc. assets; receivers get a packed image datablock.
+* **Material graph sync**: a whitelisted shader graph (Principled BSDF, Material
+  Output, Image Texture, UV Map, Mapping, Normal Map, Bump, Mix, ColorRamp,
+  Emission, procedural textures, colour/vector maths) is replicated for every
+  object's material slots, with node values, links and viewport colour.
+* **Texture transfer**: images referenced by material nodes are sent with a
+  SHA-1 digest and packed on the receiver; duplicates are skipped, colours and
+  alpha modes are preserved, and a late image binds into its pending node.
+* **Object details**: parenting with `matrix_parent_inverse`, modifier stacks,
+  collection membership and collection visibility, object colour, and
+  viewport/render visibility, for every object rather than the active one.
 * **Edit leases with request/grant**: request edit on the active object, the owner
   gets a notification and can grant it from the panel or with `/grant <user>`.
 * **Presence, chat and 3D pings** between the addon UI and the desktop app, with
@@ -280,14 +281,17 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   `blender --command extension install-file`.
 * The app launches Blender, docks its window, and reports the live server
   status, fingerprint and verification code.
-* Two real Blender 5.3 instances: the host's scene, material, modifier,
-  collection, camera, world and render settings bootstrap arrives on the client;
-  object moves and live Edit Mode vertex drags propagate **both ways** without
-  snapping back; the host's selection locks the object for the client until the
-  host releases it.
+* Two real Blender 5.3 instances: the host's scene, material graph, packed
+  texture, modifier stack, parenting, collection, camera, world and render
+  settings bootstrap arrives on the client; object moves and live Edit Mode
+  vertex drags propagate **both ways** without snapping back; the host's
+  selection locks the object for the client until the host releases it.
+* Checked-in two-Blender harnesses cover textured material graphs
+  (`tests/e2e/run_material.ps1`), object details (`run_details.ps1`) and live
+  topology snapshots (`run_topology.ps1`).
 * The production Worker relay was exercised with the host key: no token and a
   wrong token are rejected, a valid host tunnel and client join succeed.
-* `pytest`: 106 passed.
+* `pytest`: 122 passed.
 
 ## Limitations
 
@@ -304,17 +308,19 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   synced back to other clients. Camera poses update at up to 30 Hz and are
   applied immediately; their zoom scale is stripped so orthographic views cannot stretch
   them into stray lines. Selection outlines skip oversized/corrupt edges and
-  fall back to a bounding box above 2,500 edges.
+  fall back to a bounding box above 120 edges.
 * Edit Mode streams vertex positions live. Structural changes (extrude,
-  subdivide, delete) sync when the editor leaves Edit Mode, not during the drag.
-* Worlds are limited to background colour/strength. Full shader node graphs,
-  textures, armatures/animation, compositor nodes, simulations and linked
-  libraries are not replicated yet.
+  subdivide, bevel, delete) send a debounced full topology snapshot while the
+  editor is still in Edit Mode; the receiver rebuilds the mesh in Object Mode.
+* Worlds are limited to background colour/strength. Node groups, scripts and
+  other unsafe shader nodes are skipped rather than approximated; the rest of a
+  material graph still applies. Armatures/pose/actions, shape keys,
+  compositor nodes, simulations and linked libraries are not replicated yet.
 * Modifier sync covers the common parameter set; unsupported modifier types only
   replicate type/name/visibility.
-* New objects are replicated for meshes, empties, cameras and lights; curves,
-  font objects and modifiers are not, and collections/parenting are only
-  partially covered.
+* New objects are replicated for meshes, empties, cameras and lights; curve and
+  font data is carried for objects created elsewhere but curve/font creation is
+  not detected locally.
 * Windows-only window docking; other platforms run Blender in its own window.
 * Multires is not supported.
 * Alpha software: back up work before a session.

@@ -754,7 +754,7 @@ class SessionService:
             return
 
         if frame.type == MessageType.MATERIAL_UPDATE:
-            body = self._json(frame, 16384)
+            body = self._json(frame, 64 * 1024)
             try:
                 uid = str(uuidlib.UUID(str(body.get("uuid"))))
             except ValueError as exc:
@@ -1025,6 +1025,61 @@ class SessionService:
         except ValueError as exc:
             raise Violation(str(exc)) from exc
 
+    def _sanitize_object_details(self, value) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            return None
+        details: dict[str, Any] = {}
+        for key in ("hide_viewport", "hide_render", "show_in_front"):
+            details[key] = bool(value.get(key, False))
+        color = value.get("color")
+        if color is not None:
+            if not isinstance(color, list) or len(color) != 4:
+                return None
+            try:
+                details["color"] = [max(0.0, min(1.0, float(component))) for component in color]
+            except (TypeError, ValueError):
+                return None
+        parent = value.get("parent")
+        if parent is not None:
+            try:
+                details["parent"] = str(uuidlib.UUID(str(parent)))
+            except ValueError:
+                return None
+        inverse = value.get("matrix_parent_inverse")
+        if inverse is not None:
+            if not isinstance(inverse, list) or len(inverse) != 16:
+                return None
+            try:
+                values = [float(component) for component in inverse]
+            except (TypeError, ValueError):
+                return None
+            if not all(math.isfinite(component) and abs(component) <= 1e12 for component in values):
+                return None
+            details["matrix_parent_inverse"] = values
+        collections = value.get("collections")
+        if collections is not None:
+            if not isinstance(collections, list) or len(collections) > 16:
+                return None
+            items = []
+            for item in collections:
+                if not isinstance(item, dict):
+                    return None
+                name = clean_text(item.get("name"), 64)
+                if not name:
+                    return None
+                items.append(
+                    {
+                        "name": name,
+                        "hide_viewport": bool(item.get("hide_viewport", False)),
+                        "hide_render": bool(item.get("hide_render", False)),
+                        "hide_select": bool(item.get("hide_select", False)),
+                    }
+                )
+            details["collections"] = items
+        return details
+
     def _sanitize_modifiers(self, body: dict) -> dict[str, Any] | None:
         try:
             uid = str(uuidlib.UUID(str(body.get("uuid"))))
@@ -1079,7 +1134,14 @@ class SessionService:
                     "props": props,
                 }
             )
-        return {"uuid": uid, "modifiers": result}
+        message = {"uuid": uid, "modifiers": result}
+        raw_details = body.get("details")
+        details = self._sanitize_object_details(raw_details)
+        if raw_details is not None and details is None:
+            return None
+        if details is not None:
+            message["details"] = details
+        return message
 
     def _json(self, frame: Frame, limit: int = MAX_CONTROL) -> dict[str, Any]:
         if len(frame.payload) > limit:
@@ -1530,7 +1592,7 @@ class SessionService:
             return
 
         if frame.type == MessageType.MATERIAL_UPDATE:
-            body = self._json(frame, 16384)
+            body = self._json(frame, 64 * 1024)
             payload = material_payload.sanitize(body.get("material"))
             slot = body.get("slot")
             if payload is not None and isinstance(slot, int) and 0 <= slot <= 255:
@@ -1781,20 +1843,24 @@ class SessionService:
             protocol.json_frame(MessageType.MATERIAL_UPDATE, {"uuid": uid, "slot": int(slot), "material": payload})
         )
 
-    def send_modifier_stack(self, uid: str, modifiers: list) -> None:
-        message = self._sanitize_modifiers({"uuid": uid, "modifiers": modifiers})
+    def send_modifier_stack(self, uid: str, modifiers: list, details: dict | None = None) -> None:
+        body = {"uuid": uid, "modifiers": modifiers}
+        if details is not None:
+            body["details"] = details
+        message = self._sanitize_modifiers(body)
         if message is None:
             return
         self._enqueue(protocol.json_frame(MessageType.MODIFIER_STACK, message))
 
-    def send_image(self, name: str, format_hint: str, data: bytes) -> None:
+    def send_image(self, name: str, format_hint: str, data: bytes) -> bool:
         try:
             payload = image_payload.encode(name, format_hint, data)
         except image_payload.ImagePayloadError:
-            return
+            return False
         if len(payload) > MAX_MESH:
-            return
+            return False
         self._enqueue(Frame(type=MessageType.IMAGE_ASSET, channel=Channel.BULK, payload=payload))
+        return True
 
     def request_lease(self, key: str, action: str = "acquire") -> None:
         self._enqueue(protocol.json_frame(MessageType.LEASE, {"key": key, "action": action}))

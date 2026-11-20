@@ -48,7 +48,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 1, 14),
+    "version": (0, 1, 15),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -166,10 +166,17 @@ runtime: dict = {
     "material_shadow": {},
     "modifier_shadow": {},
     "last_modifier": 0.0,
+    "modifier_cursor": 0,
     "lease_request": None,
     "lease_requests": {},
     "last_material": 0.0,
     "material_cursor": 0,
+    "image_queue": [],
+    "image_queued": set(),
+    "image_hash_cache": {},
+    "shared_images": set(),
+    "received_images": {},
+    "last_image": 0.0,
     "last_presence": 0.0,
     "control_checked": 0.0,
     "started": 0.0,
@@ -579,6 +586,10 @@ def _handle_event(context, kind: str, body: dict) -> None:
         _upsert_user(context, name, body.get("color", (1, 1, 1, 1)))
         _push_message(context, "system", f"{name} joined")
         if settings.is_host:
+            # A late joiner missed any image assets sent before it arrived.
+            # Re-queue them with the scene bootstrap.
+            runtime["shared_images"].clear()
+            runtime["material_shadow"].clear()
             _queue_scene_bootstrap(context, name)
     elif kind == "scene_reset":
         target = body.get("target")
@@ -1000,6 +1011,186 @@ def _expire_pings(context) -> None:
 
 
 # --------------------------------------------------------------------------- materials
+GRAPH_PROPS = (
+    "interpolation",
+    "extension",
+    "projection",
+    "uv_map",
+    "vector_type",
+    "attribute_name",
+    "attribute_type",
+    "noise_dimensions",
+    "feature",
+    "distance",
+    "voronoi_dimensions",
+    "wave_type",
+    "bands_direction",
+    "wave_profile",
+    "data_type",
+    "blend_type",
+    "clamp_factor",
+    "clamp",
+    "space",
+    "sky_type",
+    "altitude",
+    "air_density",
+    "dust_density",
+    "ozone_density",
+    "operation",
+    "use_clamp",
+)
+
+
+def _socket_default(value):
+    """Convert a Blender socket default into a sanitizable JSON value."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if math.isfinite(number) and abs(number) <= 1.0e6 else None
+    if isinstance(value, str):
+        return value[:32]
+    try:
+        values = list(value)
+    except TypeError:
+        return None
+    if not 1 <= len(values) <= 4:
+        return None
+    result = []
+    for component in values:
+        if isinstance(component, bool):
+            result.append(float(component))
+            continue
+        try:
+            number = float(component)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(number) or abs(number) > 1.0e6:
+            return None
+        result.append(number)
+    return result
+
+
+def _node_input_id(socket) -> str:
+    return (getattr(socket, "identifier", None) or getattr(socket, "name", ""))[:64]
+
+
+def _socket_by_id(sockets, key):
+    for socket in sockets:
+        if _node_input_id(socket) == key:
+            return socket
+    return None
+
+
+def _node_props(node) -> dict:
+    props = {}
+    for name in GRAPH_PROPS:
+        try:
+            value = getattr(node, name)
+        except (AttributeError, RuntimeError):
+            continue
+        encoded = _socket_default(value)
+        if encoded is not None:
+            props[name] = encoded
+    if node.bl_idname == "ShaderNodeValToRGB":
+        try:
+            ramp = node.color_ramp
+            elements = [[float(item.position), *(float(c) for c in item.color)] for item in ramp.elements]
+            if 2 <= len(elements) <= 32:
+                props["elements"] = elements
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+    return props
+
+
+def material_graph(material) -> tuple[list, list]:
+    """Serialize the active surface output's upstream node graph.
+
+    Only allow-listed nodes are traversed. Unsupported branches (node groups,
+    scripts, OSL) are omitted instead of being approximated.
+    """
+    tree = getattr(material, "node_tree", None)
+    if not material.use_nodes or tree is None:
+        return [], []
+    nodes = list(tree.nodes)
+    output = None
+    for node in nodes:
+        if node.bl_idname != "ShaderNodeOutputMaterial":
+            continue
+        if output is None or getattr(node, "is_active_output", False):
+            output = node
+    if output is None:
+        return [], []
+    order = []
+    index = {}
+    stack = [output]
+    while stack and len(order) < material_payload.MAX_NODES:
+        node = stack.pop()
+        name = node.name
+        if name in index:
+            continue
+        if node.bl_idname not in material_payload.ALLOWED_NODES:
+            continue
+        index[name] = len(order)
+        order.append(node)
+        for socket in node.inputs:
+            try:
+                links = socket.links
+            except (AttributeError, RuntimeError):
+                continue
+            for link in links:
+                source = link.from_node
+                if source.name not in index and source.bl_idname in material_payload.ALLOWED_NODES:
+                    stack.append(source)
+    if output.name not in index:
+        return [], []
+    specs = []
+    for node in order:
+        spec = {
+            "bl_idname": node.bl_idname,
+            "name": node.name[:64],
+            "location": [float(node.location[0]), float(node.location[1])],
+        }
+        inputs = {}
+        for socket in node.inputs:
+            if getattr(socket, "is_linked", False):
+                continue
+            value = _socket_default(getattr(socket, "default_value", None))
+            if value is not None:
+                inputs[_node_input_id(socket)] = value
+        if inputs:
+            spec["inputs"] = inputs
+        props = _node_props(node)
+        if props:
+            spec["props"] = props
+        image = getattr(node, "image", None)
+        if image is not None:
+            spec["image"] = image.name[:64]
+            cached = runtime["image_hash_cache"].get(image.name)
+            if cached:
+                spec["image_hash"] = cached[1]
+            try:
+                spec["image_colorspace"] = image.colorspace_settings.name[:32]
+                spec["image_alpha_mode"] = image.alpha_mode[:16]
+            except (AttributeError, RuntimeError, TypeError):
+                pass
+        specs.append(spec)
+    links = []
+    for link in tree.links:
+        source = index.get(link.from_node.name)
+        target = index.get(link.to_node.name)
+        if source is None or target is None or source == target:
+            continue
+        source_socket = _node_input_id(link.from_socket)
+        target_socket = _node_input_id(link.to_socket)
+        if not source_socket or not target_socket:
+            continue
+        links.append([source, source_socket, target, target_socket])
+        if len(links) >= material_payload.MAX_LINKS:
+            break
+    return specs, links
+
+
 def material_values(material) -> dict:
     base = list(getattr(material, "diffuse_color", (0.8, 0.8, 0.8, 1.0)))[:4]
     data = {
@@ -1029,18 +1220,138 @@ def material_values(material) -> dict:
         except (KeyError, TypeError, ValueError):
             pass
         break
+    nodes, links = material_graph(material)
+    if nodes:
+        data["nodes"] = nodes
+        data["links"] = links
     return data
 
 
-def _material_signature(data: dict) -> tuple:
-    return (
-        data.get("name"),
-        tuple(data.get("base_color", ())),
-        data.get("metallic"),
-        data.get("roughness"),
-        tuple(data.get("emission_color", ())),
-        data.get("emission_strength"),
-    )
+def _material_signature(data: dict) -> str:
+    try:
+        return json.dumps(data, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return repr(data)
+
+
+def _reset_basic_nodes(material) -> None:
+    tree = material.node_tree
+    if tree is None:
+        return
+    try:
+        tree.nodes.clear()
+        output = tree.nodes.new("ShaderNodeOutputMaterial")
+        bsdf = tree.nodes.new("ShaderNodeBsdfPrincipled")
+        socket = bsdf.outputs.get("BSDF")
+        surface = output.inputs.get("Surface")
+        if socket is not None and surface is not None:
+            tree.links.new(socket, surface)
+        output.location = (300.0, 0.0)
+        bsdf.location = (0.0, 0.0)
+        tree.nodes.active = output
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+
+
+def _apply_material_graph(material, data: dict) -> bool:
+    """Rebuild a whitelisted node graph. Returns False on any failure."""
+    tree = getattr(material, "node_tree", None)
+    specs = data.get("nodes") or []
+    if tree is None or not specs:
+        return False
+    if not any(spec.get("bl_idname") == "ShaderNodeOutputMaterial" for spec in specs):
+        return False
+    created = []
+    try:
+        tree.nodes.clear()
+        for spec in specs:
+            node = tree.nodes.new(spec["bl_idname"])
+            name = spec.get("name")
+            if name:
+                node.name = name[:64]
+            location = spec.get("location")
+            if isinstance(location, list) and len(location) == 2:
+                node.location = (float(location[0]), float(location[1]))
+            for key, value in (spec.get("inputs") or {}).items():
+                socket = _socket_by_id(node.inputs, key)
+                if socket is None:
+                    continue
+                try:
+                    socket.default_value = tuple(value) if isinstance(value, list) else value
+                except (TypeError, ValueError):
+                    pass
+            props = spec.get("props") or {}
+            for key, value in props.items():
+                if key == "elements":
+                    continue
+                try:
+                    setattr(node, key, tuple(value) if isinstance(value, list) else value)
+                except (AttributeError, TypeError, ValueError, RuntimeError):
+                    pass
+            if node.bl_idname == "ShaderNodeValToRGB" and isinstance(props.get("elements"), list):
+                try:
+                    ramp = node.color_ramp
+                    elements = props["elements"]
+                    while len(ramp.elements) > len(elements) and len(ramp.elements) > 2:
+                        ramp.elements.remove(ramp.elements[-1])
+                    while len(ramp.elements) < len(elements):
+                        ramp.elements.new(0.5)
+                    for target, item in zip(ramp.elements, elements):
+                        if len(item) != 5:
+                            continue
+                        target.position = float(item[0])
+                        target.color = tuple(float(component) for component in item[1:5])
+                except (AttributeError, TypeError, ValueError, RuntimeError):
+                    pass
+            if node.bl_idname in {"ShaderNodeTexImage", "ShaderNodeTexEnvironment"}:
+                image_name = spec.get("image")
+                if image_name:
+                    image = bpy.data.images.get(image_name)
+                    if image is None:
+                        digest = spec.get("image_hash")
+                        if digest:
+                            existing = runtime["received_images"].get(digest)
+                            if existing:
+                                image = bpy.data.images.get(existing)
+                    if image is not None:
+                        node.image = image
+                        _apply_image_settings(
+                            image,
+                            spec.get("image_colorspace"),
+                            spec.get("image_alpha_mode"),
+                        )
+                    else:
+                        node["bmp_image"] = image_name[:64]
+                        if spec.get("image_hash"):
+                            node["bmp_image_hash"] = spec["image_hash"]
+                        if spec.get("image_colorspace"):
+                            node["bmp_image_colorspace"] = spec["image_colorspace"][:32]
+                        if spec.get("image_alpha_mode"):
+                            node["bmp_image_alpha_mode"] = spec["image_alpha_mode"][:16]
+            created.append(node)
+        for link in data.get("links") or []:
+            if not isinstance(link, list) or len(link) != 4:
+                continue
+            source, source_key, target, target_key = link
+            if not 0 <= int(source) < len(created) or not 0 <= int(target) < len(created):
+                continue
+            from_socket = _socket_by_id(created[int(source)].outputs, source_key)
+            to_socket = _socket_by_id(created[int(target)].inputs, target_key)
+            if from_socket is None or to_socket is None:
+                continue
+            tree.links.new(from_socket, to_socket)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return False
+    for node in created:
+        if node.bl_idname == "ShaderNodeOutputMaterial":
+            try:
+                node.is_active_output = True
+                tree.nodes.active = node
+            except (AttributeError, RuntimeError):
+                pass
+            break
+    return True
 
 
 def _sync_materials(context) -> None:
@@ -1066,6 +1377,12 @@ def _sync_materials(context) -> None:
         owner = runtime["lease_owners"].get(uid)
         if owner is not None and owner != settings.name:
             continue
+        if not settings.is_host and uid not in runtime["owned_leases"]:
+            for index, slot in enumerate(obj.material_slots[:16]):
+                if slot.material is not None:
+                    data = material_values(slot.material)
+                    runtime["material_shadow"][(uid, index)] = _material_signature(data)
+            continue
         for index, slot in enumerate(obj.material_slots[:16]):
             material = slot.material
             if material is None:
@@ -1077,6 +1394,7 @@ def _sync_materials(context) -> None:
                 continue
             runtime["material_shadow"][key] = signature
             session.send_material(uid, index, data)
+            _queue_material_images(material)
 
 
 def _apply_material(context, body: dict) -> None:
@@ -1098,7 +1416,12 @@ def _apply_material(context, body: dict) -> None:
         slot.material = material
     material.use_nodes = True
     material.diffuse_color = tuple(data["base_color"])
-    if material.node_tree is not None:
+    applied = False
+    if data.get("nodes"):
+        applied = _apply_material_graph(material, data)
+        if not applied:
+            _reset_basic_nodes(material)
+    if not applied and material.node_tree is not None:
         for node in material.node_tree.nodes:
             if node.type != "BSDF_PRINCIPLED":
                 continue
@@ -1116,7 +1439,10 @@ def _apply_material(context, body: dict) -> None:
             except (KeyError, TypeError, ValueError):
                 pass
             break
-    runtime["material_shadow"][(body.get("uuid"), slot_index)] = _material_signature(data)
+    try:
+        runtime["material_shadow"][(body.get("uuid"), slot_index)] = _material_signature(material_values(material))
+    except Exception:  # noqa: BLE001
+        runtime["material_shadow"][(body.get("uuid"), slot_index)] = _material_signature(data)
 
 
 # --------------------------------------------------------------------------- modifiers
@@ -1164,8 +1490,43 @@ def modifier_snapshot(obj) -> list:
     return snapshot
 
 
-def _modifier_signature(snapshot: list) -> str:
-    return json.dumps(snapshot, sort_keys=True, default=str)
+def object_details(obj) -> dict:
+    """Small object-level properties that are not transforms or mesh data."""
+    details = {
+        "hide_viewport": bool(getattr(obj, "hide_viewport", False)),
+        "hide_render": bool(getattr(obj, "hide_render", False)),
+        "show_in_front": bool(getattr(obj, "show_in_front", False)),
+        "color": [float(value) for value in getattr(obj, "color", (1.0, 1.0, 1.0, 1.0))][:4],
+    }
+    parent = getattr(obj, "parent", None)
+    details["parent"] = parent.get("bmp_uuid") if parent is not None else None
+    if parent is not None:
+        try:
+            details["matrix_parent_inverse"] = [
+                float(value) for row in obj.matrix_parent_inverse for value in row
+            ]
+        except (AttributeError, TypeError, ValueError):
+            pass
+    collections = []
+    scene_collection = getattr(bpy.context.scene, "collection", None)
+    for collection in list(getattr(obj, "users_collection", []))[:16]:
+        if collection == scene_collection:
+            continue
+        collections.append(
+            {
+                "name": collection.name[:64],
+                "hide_viewport": bool(collection.hide_viewport),
+                "hide_render": bool(collection.hide_render),
+                "hide_select": bool(collection.hide_select),
+            }
+        )
+    if collections:
+        details["collections"] = collections
+    return details
+
+
+def _modifier_signature(snapshot: list, details=None) -> str:
+    return json.dumps({"modifiers": snapshot, "details": details or {}}, sort_keys=True, default=str)
 
 
 def _sync_modifiers(context) -> None:
@@ -1177,21 +1538,139 @@ def _sync_modifiers(context) -> None:
     if now - runtime["last_modifier"] < 0.5:
         return
     runtime["last_modifier"] = now
-    obj = context.active_object
-    if obj is None or not hasattr(obj, "modifiers"):
+    candidates = [
+        item
+        for item in context.scene.objects
+        if item.get("bmp_uuid") and not item.get("bmp_ping")
+    ]
+    if not candidates:
         return
-    uid = obj.get("bmp_uuid")
-    if not uid:
+    cursor = runtime.get("modifier_cursor", 0) % len(candidates)
+    runtime["modifier_cursor"] = cursor + 4
+    for obj in candidates[cursor : cursor + 4]:
+        uid = obj.get("bmp_uuid")
+        owner = runtime["lease_owners"].get(uid)
+        if owner is not None and owner != settings.name:
+            continue
+        snapshot = modifier_snapshot(obj)
+        details = object_details(obj)
+        signature = _modifier_signature(snapshot, details)
+        if not settings.is_host and uid not in runtime["owned_leases"]:
+            runtime["modifier_shadow"][uid] = signature
+            continue
+        if runtime["modifier_shadow"].get(uid) == signature:
+            continue
+        runtime["modifier_shadow"][uid] = signature
+        session.send_modifier_stack(uid, snapshot, details)
+
+
+def _modifier_signature(snapshot: list, details=None) -> str:
+    return json.dumps({"modifiers": snapshot, "details": details or {}}, sort_keys=True, default=str)
+
+
+def _apply_object_details(obj, details) -> None:
+    if not isinstance(details, dict):
         return
-    owner = runtime["lease_owners"].get(uid)
-    if owner is not None and owner != settings.name:
-        return
-    snapshot = modifier_snapshot(obj)
-    signature = _modifier_signature(snapshot)
-    if runtime["modifier_shadow"].get(uid) == signature:
-        return
-    runtime["modifier_shadow"][uid] = signature
-    session.send_modifier_stack(uid, snapshot)
+    for key in ("hide_viewport", "hide_render", "show_in_front"):
+        if key in details:
+            try:
+                setattr(obj, key, bool(details[key]))
+            except (AttributeError, TypeError, RuntimeError):
+                pass
+    color = details.get("color")
+    if isinstance(color, list) and len(color) == 4:
+        try:
+            obj.color = tuple(max(0.0, min(1.0, float(value))) for value in color)
+        except (TypeError, ValueError):
+            pass
+    parent_uid = details.get("parent")
+    try:
+        world = obj.matrix_world.copy()
+    except (AttributeError, RuntimeError):
+        world = None
+    current_parent = obj.parent.get("bmp_uuid") if obj.parent is not None else None
+    desired_inverse = details.get("matrix_parent_inverse")
+    inverse_matches = True
+    if isinstance(desired_inverse, list) and len(desired_inverse) == 16 and obj.parent is not None:
+        try:
+            current_inverse = [float(value) for row in obj.matrix_parent_inverse for value in row]
+            inverse_matches = all(
+                abs(current_inverse[index] - float(value)) <= 1e-6
+                for index, value in enumerate(desired_inverse)
+            )
+        except (TypeError, ValueError, AttributeError):
+            inverse_matches = False
+    if not (parent_uid == current_parent and inverse_matches):
+        if parent_uid is None:
+            if obj.parent is not None:
+                try:
+                    obj.parent = None
+                    if world is not None:
+                        obj.matrix_world = world
+                except (TypeError, RuntimeError):
+                    pass
+        else:
+            parent = obj_sync.find(parent_uid)
+            if parent is not None and parent is not obj:
+                ancestor = parent
+                cycle = False
+                while ancestor is not None:
+                    if ancestor is obj:
+                        cycle = True
+                        break
+                    ancestor = ancestor.parent
+                if not cycle:
+                    try:
+                        obj.parent = parent
+                        inverse = details.get("matrix_parent_inverse")
+                        if isinstance(inverse, list) and len(inverse) == 16:
+                            from mathutils import Matrix
+
+                            obj.matrix_parent_inverse = Matrix(
+                                (inverse[0:4], inverse[4:8], inverse[8:12], inverse[12:16])
+                            )
+                        # Reparenting must not move the object: transforms are
+                        # authoritative over a separate channel.
+                        if world is not None:
+                            obj.matrix_world = world
+                    except (TypeError, ValueError, RuntimeError):
+                        pass
+    collections = details.get("collections")
+    if isinstance(collections, list):
+        scene_collection = bpy.context.scene.collection
+        keep = set()
+        for item in collections[:16]:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", ""))[:64]
+            if not name:
+                continue
+            collection = bpy.data.collections.get(name)
+            if collection is None:
+                try:
+                    collection = bpy.data.collections.new(name)
+                    scene_collection.children.link(collection)
+                except (TypeError, RuntimeError):
+                    continue
+            try:
+                if obj.name not in collection.objects:
+                    collection.objects.link(obj)
+            except (TypeError, RuntimeError):
+                pass
+            keep.add(collection)
+            for flag in ("hide_viewport", "hide_render", "hide_select"):
+                if flag in item:
+                    try:
+                        setattr(collection, flag, bool(item[flag]))
+                    except (AttributeError, TypeError, RuntimeError):
+                        pass
+        if keep:
+            for collection in list(obj.users_collection):
+                if collection != scene_collection and collection not in keep:
+                    try:
+                        collection.objects.unlink(obj)
+                    except (TypeError, RuntimeError):
+                        pass
 
 
 def _apply_modifier_stack(context, body: dict) -> None:
@@ -1199,6 +1678,7 @@ def _apply_modifier_stack(context, body: dict) -> None:
     snapshot = body.get("modifiers")
     if obj is None or not hasattr(obj, "modifiers") or not isinstance(snapshot, list):
         return
+    _apply_object_details(obj, body.get("details"))
     desired = {(str(item.get("name")), str(item.get("type"))) for item in snapshot if isinstance(item, dict)}
     for mod in list(obj.modifiers):
         if (mod.name, mod.type) not in desired:
@@ -1241,7 +1721,12 @@ def _apply_modifier_stack(context, body: dict) -> None:
                 setattr(mod, key, value)
             except Exception:  # noqa: BLE001
                 pass
-    runtime["modifier_shadow"][body.get("uuid")] = _modifier_signature(snapshot)
+    try:
+        runtime["modifier_shadow"][body.get("uuid")] = _modifier_signature(
+            modifier_snapshot(obj), object_details(obj)
+        )
+    except Exception:  # noqa: BLE001
+        runtime["modifier_shadow"][body.get("uuid")] = _modifier_signature(snapshot, body.get("details"))
 
 
 # --------------------------------------------------------------------------- images
@@ -1289,6 +1774,101 @@ def _image_bytes(context, image):
     return b"", "png"
 
 
+def _material_images(material):
+    tree = getattr(material, "node_tree", None)
+    if not material.use_nodes or tree is None:
+        return []
+    images = []
+    for node in tree.nodes:
+        if node.bl_idname not in {"ShaderNodeTexImage", "ShaderNodeTexEnvironment"}:
+            continue
+        image = getattr(node, "image", None)
+        if image is not None and image.name not in {item.name for item in images}:
+            images.append(image)
+    return images
+
+
+def _queue_material_images(material) -> None:
+    for image in _material_images(material):
+        _queue_image(image)
+
+
+def _queue_image(image) -> None:
+    if image is None or image.name in runtime["image_queued"]:
+        return
+    runtime["image_queued"].add(image.name)
+    runtime["image_queue"].append(image.name)
+
+
+def _process_image_queue(context) -> None:
+    session: SessionService | None = runtime.get("session")
+    if session is None or not runtime["image_queue"]:
+        return
+    now = time.monotonic()
+    if now - runtime["last_image"] < 0.2:
+        return
+    runtime["last_image"] = now
+    name = runtime["image_queue"].pop(0)
+    runtime["image_queued"].discard(name)
+    image = bpy.data.images.get(name)
+    if image is None:
+        return
+    data, format_hint = _image_bytes(context, image)
+    if not data or len(data) > image_payload.MAX_IMAGE:
+        return
+    digest = hashlib.sha1(data).hexdigest()
+    runtime["image_hash_cache"][image.name] = (
+        (getattr(image, "filepath", ""), len(data), tuple(getattr(image, "size", (0, 0)))),
+        digest,
+    )
+    if digest in runtime["shared_images"]:
+        return
+    if session.send_image(image.name, format_hint, data):
+        runtime["shared_images"].add(digest)
+
+
+def _apply_image_settings(image, colorspace, alpha_mode) -> None:
+    if image is None:
+        return
+    if colorspace:
+        try:
+            if image.colorspace_settings.name != colorspace:
+                image.colorspace_settings.name = colorspace
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            pass
+    if alpha_mode:
+        try:
+            if image.alpha_mode != alpha_mode:
+                image.alpha_mode = alpha_mode
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            pass
+
+
+def _bind_material_images(name: str, image, digest: str | None) -> None:
+    for material in bpy.data.materials:
+        tree = getattr(material, "node_tree", None)
+        if tree is None:
+            continue
+        for node in tree.nodes:
+            if node.bl_idname not in {"ShaderNodeTexImage", "ShaderNodeTexEnvironment"}:
+                continue
+            try:
+                marker = node.get("bmp_image")
+                marker_hash = node.get("bmp_image_hash")
+            except (AttributeError, TypeError):
+                continue
+            if marker == name or (digest and marker_hash == digest):
+                try:
+                    node.image = image
+                except (TypeError, RuntimeError):
+                    continue
+                _apply_image_settings(
+                    image,
+                    node.get("bmp_image_colorspace"),
+                    node.get("bmp_image_alpha_mode"),
+                )
+
+
 def _apply_image(context, body: dict) -> None:
     data = body.get("data")
     if not isinstance(data, (bytes, bytearray)) or not data or len(data) > image_payload.MAX_IMAGE:
@@ -1297,6 +1877,13 @@ def _apply_image(context, body: dict) -> None:
     if format_hint not in image_payload.ALLOWED:
         format_hint = "png"
     name = str(body.get("name", "Image"))[:64] or "Image"
+    digest = str(body.get("sha1", "")) or hashlib.sha1(bytes(data)).hexdigest()
+    existing_name = runtime["received_images"].get(digest)
+    if existing_name:
+        existing = bpy.data.images.get(existing_name)
+        if existing is not None:
+            _bind_material_images(name, existing, digest)
+            return
     handle, path = tempfile.mkstemp(suffix="." + format_hint)
     try:
         with os.fdopen(handle, "wb") as writer:
@@ -1309,6 +1896,12 @@ def _apply_image(context, body: dict) -> None:
             name = f"{name}.{index:03d}"
         image.name = name
         image.pack()
+        try:
+            image.filepath_raw = ""
+        except (AttributeError, RuntimeError):
+            pass
+        runtime["received_images"][digest] = name
+        _bind_material_images(name, image, digest)
     except Exception:  # noqa: BLE001
         traceback.print_exc()
     finally:
@@ -1327,19 +1920,13 @@ def share_active_images(context) -> int:
     if obj is not None:
         for slot in getattr(obj, "material_slots", []) or []:
             material = slot.material
-            if material is None or not material.use_nodes or material.node_tree is None:
+            if material is None:
                 continue
-            for node in material.node_tree.nodes:
-                if node.type == "TEX_IMAGE" and node.image is not None:
-                    images[node.image.name] = node.image
-    count = 0
+            for image in _material_images(material):
+                images[image.name] = image
     for image in images.values():
-        data, format_hint = _image_bytes(context, image)
-        if not data or len(data) > image_payload.MAX_IMAGE:
-            continue
-        session.send_image(image.name, format_hint, data)
-        count += 1
-    return count
+        _queue_image(image)
+    return len(images)
 
 
 # --------------------------------------------------------------------------- bpy timer
@@ -1476,11 +2063,13 @@ def _send_object_details(session: SessionService, obj) -> None:
             continue
         data = material_values(material)
         session.send_material(uid, index, data)
+        _queue_material_images(material)
         runtime["material_shadow"][(uid, index)] = _material_signature(data)
     if hasattr(obj, "modifiers"):
         snapshot = modifier_snapshot(obj)
-        session.send_modifier_stack(uid, snapshot)
-        runtime["modifier_shadow"][uid] = _modifier_signature(snapshot)
+        details = object_details(obj)
+        session.send_modifier_stack(uid, snapshot, details)
+        runtime["modifier_shadow"][uid] = _modifier_signature(snapshot, details)
 
 
 def _world_values(world):
@@ -1684,7 +2273,7 @@ def _finish_scene_bootstrap(context, body: dict | None = None) -> None:
                 runtime["material_shadow"][(uid, index)] = _material_signature(data)
         if hasattr(obj, "modifiers"):
             snapshot = modifier_snapshot(obj)
-            runtime["modifier_shadow"][uid] = _modifier_signature(snapshot)
+            runtime["modifier_shadow"][uid] = _modifier_signature(snapshot, object_details(obj))
     if isinstance(body, dict):
         camera = body.get("camera")
         if isinstance(camera, str):
@@ -1773,6 +2362,25 @@ def _send_object_create(session: SessionService, obj) -> None:
             materials.append(data)
     if materials:
         meta["materials"] = materials
+        try:
+            encoded = json.dumps(meta, separators=(",", ":")).encode("utf-8")
+        except (TypeError, ValueError):
+            encoded = b""
+        if len(encoded) > 48 * 1024:
+            # The per-object JSON budget is tight for many textured slots.
+            # Ship the basic values now and let the material poller send the
+            # full graphs as separate updates.
+            for item in materials:
+                item.pop("nodes", None)
+                item.pop("links", None)
+        for slot in getattr(obj, "material_slots", [])[:16]:
+            if slot.material is not None:
+                _queue_material_images(slot.material)
+    try:
+        meta["modifiers"] = modifier_snapshot(obj)
+        meta["details"] = object_details(obj)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
     geometry = b""
     if kind == object_payload.KIND_MESH:
         mirror = runtime["mirrors"].get(uid)
@@ -1879,6 +2487,17 @@ def _apply_object_create(context, body: dict) -> None:
     runtime["known_objects"].add(uid)
     if obj.type == "MESH":
         runtime["tracked"].add(obj.name)
+    modifiers = meta.get("modifiers")
+    details = meta.get("details")
+    if isinstance(modifiers, list) or isinstance(details, dict):
+        _apply_modifier_stack(
+            context,
+            {
+                "uuid": uid,
+                "modifiers": modifiers if isinstance(modifiers, list) else [],
+                "details": details,
+            },
+        )
     obj_sync.apply(uid, meta.get("matrix", []))
     parent_uid = meta.get("parent")
     if parent_uid:
@@ -2051,6 +2670,13 @@ def _sync_transforms(context) -> None:
         seen.add(uid)
         owner = runtime["lease_owners"].get(uid)
         if owner is not None and owner != settings.name:
+            continue
+        if not settings.is_host and uid not in runtime["owned_leases"]:
+            # Only the host broadcasts unleased objects. A client that does
+            # not hold the lease must not send idle/echo transforms, or it
+            # silently takes ownership and fights the host.
+            matrix = obj.matrix_world
+            shadow[uid] = tuple(round(v, 6) for row in matrix for v in row)
             continue
         if uid in runtime["transform_smoothers"]:
             continue
@@ -3069,6 +3695,7 @@ def bmp_tick():
             _sync_edit_selection(context)
             _sync_materials(context)
             _sync_modifiers(context)
+            _process_image_queue(context)
             _send_presence(context)
         _pump_scene_bootstrap(context)
         _sync_remote_visuals(context)
