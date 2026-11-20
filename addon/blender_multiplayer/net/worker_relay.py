@@ -20,7 +20,7 @@ MAX_FRAME = 8 * 1024 * 1024
 
 
 class WorkerBridge:
-    def __init__(self, role: str, base_url: str, room: str):
+    def __init__(self, role: str, base_url: str, room: str, token: str | None = None):
         if role not in {"host", "join"}:
             raise ValueError("role must be host or join")
         if not base_url.startswith(("ws://", "wss://")):
@@ -28,6 +28,7 @@ class WorkerBridge:
         self.role = role
         self.base_url = base_url.rstrip("/")
         self.room = room
+        self.token = (token or "").strip()
         self.loop: asyncio.AbstractEventLoop | None = None
         self.thread: threading.Thread | None = None
         self.server: asyncio.AbstractServer | None = None
@@ -120,7 +121,8 @@ class WorkerBridge:
             if not line.startswith(b"BMPRELAY 1 "):
                 return
             try:
-                websocket = await connect(self._url())
+                headers = {"X-BMP-Host-Token": self.token} if self.role == "host" and self.token else None
+                websocket = await connect(self._url(), headers=headers)
             except WebSocketError:
                 writer.write(b"ERR no-host\n")
                 await writer.drain()

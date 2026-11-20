@@ -65,6 +65,7 @@ struct SessionRequest {
     target: Option<String>,
     relay: Option<String>,
     relay_url: Option<String>,
+    relay_token: Option<String>,
     use_relay: Option<bool>,
 }
 
@@ -591,6 +592,15 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
             return Err("invalid relay URL".into());
         }
     }
+    if let Some(token) = &request.relay_token {
+        if !(32..=128).contains(&token.len())
+            || !token
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        {
+            return Err("invalid relay token".into());
+        }
+    }
     if let Some(relay) = &request.relay {
         let (host, port) = relay
             .rsplit_once(':')
@@ -648,6 +658,7 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
         "target": target,
         "relay": request.relay,
         "relay_url": request.relay_url,
+        "relay_token": request.relay_token,
         "use_relay": request.use_relay,
         "nonce": format!("{:x}-{:x}", std::process::id(), stamp),
     });

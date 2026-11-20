@@ -195,6 +195,16 @@ def read_session() -> dict[str, Any] | None:
             return None
         result["relay_url"] = relay_url
 
+    relay_token = body.get("relay_token")
+    if relay_token is not None:
+        if (
+            not isinstance(relay_token, str)
+            or not 32 <= len(relay_token) <= 128
+            or re.fullmatch(r"[A-Za-z0-9_-]+", relay_token) is None
+        ):
+            return None
+        result["relay_token"] = relay_token
+
     if action == "chat":
         text = body.get("text")
         if not isinstance(text, str) or not text.strip() or len(text) > 2000:

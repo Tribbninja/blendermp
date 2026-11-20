@@ -62,6 +62,33 @@ function cleanInt(value, fallback, low, high) {
   return value;
 }
 
+function cleanToken(value) {
+  if (typeof value !== "string") return "";
+  const token = value.trim();
+  if (token.length < 32 || token.length > 128 || !/^[A-Za-z0-9_-]+$/.test(token)) return "";
+  return token;
+}
+
+async function hashToken(token) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function roomIdFromCode(code) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(code));
+  const hex = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  return hex.slice(0, 16);
+}
+
+function timingSafeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let index = 0; index < a.length; index += 1) {
+    diff |= a.charCodeAt(index) ^ b.charCodeAt(index);
+  }
+  return diff === 0;
+}
+
 async function binaryData(data) {
   if (data instanceof ArrayBuffer) return data;
   if (ArrayBuffer.isView(data)) {
@@ -98,6 +125,7 @@ export class Hub {
   constructor(state) {
     this.state = state;
     this.rooms = new Map();
+    this.tokens = new Map();
   }
 
   async fetch(request) {
@@ -138,9 +166,22 @@ export class Hub {
           seen: now(),
         };
         if (entry.players > entry.max) return json({ error: "player count is above the maximum" }, 400);
+        const hostToken = cleanToken(body.host_token);
+        if (entry.relay && !hostToken) {
+          return json({ error: "relay hosts must announce a host token" }, 400);
+        }
         const servers = await this.loadServers();
         if (!servers[entry.id] && Object.keys(servers).length >= MAX_SERVERS) {
           return json({ error: "directory is full" }, 400);
+        }
+        if (entry.relay) {
+          const room = await roomIdFromCode(entry.code);
+          const hash = await hashToken(hostToken);
+          const existing = this.tokens.get(room);
+          if (existing && !timingSafeEqual(existing.hash, hash)) {
+            return json({ error: "this room is already owned by another host" }, 409);
+          }
+          this.tokens.set(room, { hash, id: entry.id, seen: now() });
         }
         servers[entry.id] = entry;
         await this.state.storage.put("servers", servers);
@@ -151,6 +192,14 @@ export class Hub {
         if (!validId(body && body.id)) return json({ error: "invalid server id" }, 400);
         const servers = await this.loadServers();
         const removed = Boolean(servers[body.id]);
+        const entry = servers[body.id];
+        if (entry && entry.code) {
+          try {
+            this.tokens.delete(await roomIdFromCode(entry.code));
+          } catch {
+            /* ignore a malformed stored entry */
+          }
+        }
         delete servers[body.id];
         await this.state.storage.put("servers", servers);
         return json({ ok: removed });
@@ -167,6 +216,13 @@ export class Hub {
     let changed = false;
     for (const [id, entry] of Object.entries(stored)) {
       if (!entry || entry.seen < cutoff) {
+        if (entry && entry.code) {
+          try {
+            this.tokens.delete(await roomIdFromCode(entry.code));
+          } catch {
+            /* ignore a malformed stored entry */
+          }
+        }
         delete stored[id];
         changed = true;
       }
@@ -183,6 +239,14 @@ export class Hub {
     if (role !== "host" && role !== "join") return new Response("bad role", { status: 400, headers: CORS });
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("websocket required", { status: 426, headers: CORS });
+    }
+    if (role === "host") {
+      const record = this.tokens.get(roomId);
+      if (!record) return new Response("host token required", { status: 403, headers: CORS });
+      const supplied = request.headers.get("x-bmp-host-token") || "";
+      if (!timingSafeEqual(await hashToken(supplied), record.hash)) {
+        return new Response("invalid host token", { status: 403, headers: CORS });
+      }
     }
 
     let room = this.rooms.get(roomId);

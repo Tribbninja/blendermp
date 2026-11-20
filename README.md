@@ -26,11 +26,18 @@ surface that cross-process re-parenting causes on some GPUs).
   end-to-end; the Worker only forwards ciphertext. A self-hosted Python
   relay/directory (`docs/RELAY.md`) is the fallback.
 * **Scene bootstrap on join**: the host streams its existing objects, meshes,
-  materials and modifiers; the joining Blender replaces its local scene with
-  that snapshot before live sync starts, so both start identical.
+  materials, modifiers, collections, active camera, world background and render
+  settings; the joining Blender replaces its local scene with that snapshot
+  before live sync starts, so both start identical.
 * **Live Edit Mode vertex sync**: vertex moves stream as compact deltas at up to
   30 Hz in both directions, without leaving Edit Mode. Structural edits apply
   when the editor leaves Edit Mode.
+* **One editor per object**: selecting an object claims an edit lease. Other
+  players see it locked (unselectable) and cannot edit it until the owner
+  deselects or leaves. The active object name is shown for each player.
+* **Authenticated relay hosting**: each installation has a random host key; the
+  Worker stores only its hash and requires it for the host WebSocket. A public
+  room cannot be taken over by another host, and the key is never listed.
 * **TLS 1.3 everywhere**, self-signed host certificate, SHA-256 fingerprint
   pinning and a short verification code (no custom crypto).
 * **Host-authoritative protocol**: validated message types, size/rate limits,
@@ -251,9 +258,13 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   `blender --command extension install-file`.
 * The app launches Blender, docks its window, and reports the live server
   status, fingerprint and verification code.
-* Two real Blender 5.3 instances: the host's scene, material and modifier
-  bootstrap arrive on the client; object moves and live Edit Mode vertex drags
-  propagate **both ways** without snapping back.
+* Two real Blender 5.3 instances: the host's scene, material, modifier,
+  collection, camera, world and render settings bootstrap arrives on the client;
+  object moves and live Edit Mode vertex drags propagate **both ways** without
+  snapping back; the host's selection locks the object for the client until the
+  host releases it.
+* The production Worker relay was exercised with the host key: no token and a
+  wrong token are rejected, a valid host tunnel and client join succeed.
 * `pytest`: 106 passed.
 
 ## Limitations
@@ -263,9 +274,12 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
 * Multiple tracked meshes share the object-mode polling budget (20 Hz), so many
   large meshes update more slowly. The actively edited mesh has its own 30 Hz
   fast path.
+* Two people cannot select/edit the same object at once: the first selector
+  holds the lease. Deselecting or disconnecting releases it.
 * Edit Mode streams vertex positions live. Structural changes (extrude,
   subdivide, delete) sync when the editor leaves Edit Mode, not during the drag.
-* Worlds, compositor node trees, animation/armatures, simulations and linked
+* Worlds are limited to background colour/strength. Full shader node graphs,
+  textures, armatures/animation, compositor nodes, simulations and linked
   libraries are not replicated yet.
 * Modifier sync covers the common parameter set; unsupported modifier types only
   replicate type/name/visibility.

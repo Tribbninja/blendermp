@@ -1,4 +1,4 @@
-﻿/* Blendermp desktop shell.
+/* Blendermp desktop shell.
  *
  * No framework and no bundler: the webview loads this file directly, which keeps
  * the attack surface small (strict CSP, no inline script) and the install tiny.
@@ -60,7 +60,7 @@ const store = {
 };
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.1.2";
+const APP_VERSION = "0.1.3";
 const storedDirectory = store.get("directory", DEFAULT_HUB);
 // Drop the localhost values used while developing the Worker hub; a deployment
 // URL (or a deliberately configured hub) is kept.
@@ -81,6 +81,23 @@ const settings = {
   useRelay: store.get("useRelay", "0") === "1",
   blender: store.get("blender", ""),
 };
+
+function randomHex(bytes) {
+  const data = new Uint8Array(bytes);
+  if (window.crypto?.getRandomValues) {
+    window.crypto.getRandomValues(data);
+  } else {
+    for (let index = 0; index < data.length; index += 1) {
+      data[index] = Math.floor(Math.random() * 256);
+    }
+  }
+  return Array.from(data, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+if (!settings.hostKey) {
+  settings.hostKey = randomHex(32);
+  store.set("hostKey", settings.hostKey);
+}
 
 const state = {
   status: null,
@@ -205,13 +222,7 @@ function hubRelayUrl() {
 }
 
 function makeServerId() {
-  const bytes = new Uint8Array(16);
-  if (window.crypto?.getRandomValues) {
-    window.crypto.getRandomValues(bytes);
-  } else {
-    for (let i = 0; i < bytes.length; i += 1) bytes[i] = Math.floor(Math.random() * 256);
-  }
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return randomHex(16);
 }
 
 function serverDisplayName() {
@@ -424,6 +435,13 @@ function renderMembers(status) {
     who.className = "who";
     who.textContent = user.name || "user";
     item.append(who);
+
+    if (user.active) {
+      const editing = document.createElement("span");
+      editing.className = "ms";
+      editing.textContent = `editing ${String(user.active).slice(0, 28)}`;
+      item.append(editing);
+    }
 
     if (user.host) {
       const badge = document.createElement("span");
@@ -716,6 +734,7 @@ async function hostRoom() {
       pin: settings.pin || null,
       relay: workerRelay ? null : settings.useRelay ? settings.relay : null,
       relay_url: workerRelay || null,
+      relay_token: workerRelay ? settings.hostKey : null,
       use_relay: Boolean(workerRelay) || settings.useRelay,
     });
     state.serverId = makeServerId();
@@ -968,6 +987,7 @@ function announceServer() {
     password: Boolean(settings.pin),
     relay: Boolean(status.relay),
     relay_url: hubRelayUrl(),
+    host_token: hubRelayUrl() ? settings.hostKey : "",
     version: APP_VERSION,
   };
   Promise.allSettled(

@@ -62,7 +62,7 @@ The desktop app drives the addon through two JSON files in
 `%LOCALAPPDATA%\Blendermp`. That is a local trust boundary, so:
 
 * `session.json` is size-limited and schema-validated, with a strict action
-  allowlist (`host`, `join`, `leave`, `chat`) and a nonce;
+  allowlist (`host`, `join`, `leave`, `chat`, `kick`) and a nonce;
 * only a valid 15-character room code is accepted;
 * no file paths, script fragments or arbitrary arguments are accepted;
 * status writes are atomic and bounded;
@@ -105,9 +105,12 @@ channel will be arranged.
 The public directory stores a server's display name, host name, room endpoint,
 player count, password flag and version for at most 60 seconds after the last
 announcement. It never receives the server password, scene data, chat or
-certificates. Announcements are unauthenticated by design, so a directory
-operator can list or remove entries; clients still pin the host certificate and
-the host still validates every connection. Kicks are enforced by the host.
+certificates. A listing is announced/removed with a 128-bit server id that is
+not returned by the directory, and a relay host must also present a per-install
+host key (stored server-side only as a SHA-256 hash). This prevents a client who
+sees the public room code from replacing the host or taking over the relay
+tunnel. Clients still pin the host certificate and the host still validates
+every connection. Kicks are enforced by the host.
 
 ## Cloudflare Worker hub
 
@@ -116,3 +119,9 @@ relays WebSocket messages between the host and clients. Cloudflare sees IP
 addresses, room ids, timing and byte counts, but not TLS plaintext, passwords,
 scene data or host private keys. The host certificate is still pinned and the
 password is still verified by the host.
+
+The relay's `host` WebSocket requires the installation host key in an
+`X-BMP-Host-Token` header. The Worker hashes it and compares it in constant time
+to the hash registered by the host's announcement; no token and a wrong token
+are rejected with 403. The key is never included in `/servers` responses and is
+not the room code. A client joining the room does not need it.

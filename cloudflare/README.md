@@ -41,3 +41,14 @@ password flag, relay flag and version for 60 seconds after the last announce.
 It never receives the server password or scene data. The relay forwards binary
 WebSocket messages between the host tunnel and clients; TLS remains end-to-end
 between Blender instances.
+
+## Host authentication
+
+A relay host must register a per-install host key with `/announce` and send the
+same key in the `X-BMP-Host-Token` header when it opens the
+`/relay/<room>?role=host` WebSocket. The Worker stores only a SHA-256 hash, never
+returns it from `/servers`, and compares it in constant time. A connection with
+no key or the wrong key is rejected with 403, so a client who can see the public
+room code cannot replace the host or kick everyone. Joining clients do not need
+the key; the host's TLS certificate pinning and optional password still
+authenticate them.

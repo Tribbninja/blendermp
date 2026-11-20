@@ -127,7 +127,7 @@ class WebSocket:
             pass
 
 
-async def connect(url: str, timeout: float = 10.0) -> WebSocket:
+async def connect(url: str, timeout: float = 10.0, headers: dict[str, str] | None = None) -> WebSocket:
     parts = urlsplit(url)
     if parts.scheme not in {"ws", "wss"}:
         raise WebSocketError("relay URL must start with ws:// or wss://")
@@ -149,6 +149,12 @@ async def connect(url: str, timeout: float = 10.0) -> WebSocket:
     if parts.query:
         path += "?" + parts.query
     host_header = host if port in (80, 443) else f"{host}:{port}"
+    extra = ""
+    if headers:
+        for name, value in headers.items():
+            if not name or any(ch in f"{name}{value}" for ch in "\r\n"):
+                continue
+            extra += f"{name}: {value}\r\n"
     request = (
         f"GET {path} HTTP/1.1\r\n"
         f"Host: {host_header}\r\n"
@@ -157,6 +163,7 @@ async def connect(url: str, timeout: float = 10.0) -> WebSocket:
         f"Sec-WebSocket-Key: {key}\r\n"
         "Sec-WebSocket-Version: 13\r\n"
         f"Origin: {'https' if context else 'http'}://{host_header}\r\n"
+        f"{extra}"
         "\r\n"
     )
     writer.write(request.encode("ascii"))

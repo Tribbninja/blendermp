@@ -6,7 +6,7 @@
     dist/blender_multiplayer-<version>.zip    installable Blender extension
     dist/blendermp-windows-x64-<version>.zip  app + addon + docs
 #>
-param([string]$Version = "0.1.2")
+param([string]$Version = "0.1.3")
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot

@@ -1,4 +1,4 @@
-﻿"""Blendermp - collaborative Blender sessions.
+"""Blendermp - collaborative Blender sessions.
 
 The addon talks to the desktop app through two small JSON files in the user's
 local data folder. That keeps the integration dependency-free and lets the app
@@ -45,19 +45,21 @@ from .sync.mesh import EditMirror, MeshMirror
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 1, 2),
+    "version": (0, 1, 3),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
     "category": "Network",
 }
 
-ADDON_VERSION = "0.1.2"
+ADDON_VERSION = "0.1.3"
 TICK = 1.0 / 30.0
 CONTROL_POLL = 0.5
 STATUS_WRITE = 0.5
 MESH_POLL = 1.0 / 20.0
 EDIT_POLL = 1.0 / 30.0
+SELECTION_POLL = 0.2
+LEASE_RENEW = 30.0
 
 runtime: dict = {
     "session": None,
@@ -68,6 +70,11 @@ runtime: dict = {
     "lease_owners": {},
     "local_transform": {},
     "edit_lease_uid": None,
+    "selection": set(),
+    "hidden_objects": set(),
+    "deselected": {},
+    "last_selection": 0.0,
+    "lease_renew": 0.0,
     "bootstrapping": False,
     "bootstrap_deadline": 0.0,
     "bootstraps": {},
@@ -100,6 +107,7 @@ class BMPUser(PropertyGroup):
     scene: StringProperty()
     frame: IntProperty()
     mode: StringProperty()
+    active: StringProperty()
     host: BoolProperty()
 
 
@@ -193,6 +201,7 @@ def start_host(
     code: str | None = None,
     port: int | None = None,
     relay_url: str | None = None,
+    relay_token: str | None = None,
 ) -> None:
     settings = context.window_manager.bmp
     existing = runtime.get("session")
@@ -225,7 +234,7 @@ def start_host(
             settings.is_host = True
             settings.state = "hosting"
             settings.last_error = ""
-            bridge = WorkerBridge("host", relay_url, room_id(code))
+            bridge = WorkerBridge("host", relay_url, room_id(code), relay_token)
             relay = ("127.0.0.1", bridge.start())
             port = 0
         else:
@@ -275,6 +284,8 @@ def start_host(
     runtime["mirrors"].clear()
     runtime["object_shadow"].clear()
     _prime_objects(context)
+    runtime["last_selection"] = 0.0
+    _sync_selection(context)
     _upsert_user(context, name, tuple(settings.color), host=True)
     _push_message(context, "system", f"Hosting room {code}")
     _ensure_timer()
@@ -360,6 +371,11 @@ def stop_session(context, publish: bool = True) -> None:
     runtime["object_shadow"].clear()
     runtime["lease_owners"].clear()
     runtime["local_transform"].clear()
+    runtime["selection"].clear()
+    runtime["hidden_objects"].clear()
+    runtime["deselected"].clear()
+    runtime["last_selection"] = 0.0
+    runtime["lease_renew"] = 0.0
     runtime["bootstraps"].clear()
     runtime["bootstrapping"] = False
     runtime["bootstrap_deadline"] = 0.0
@@ -413,12 +429,20 @@ def _handle_event(context, kind: str, body: dict) -> None:
             settings.name = body["you"]
         runtime["bootstrapping"] = True
         runtime["bootstrap_deadline"] = time.monotonic() + 20.0
+        leases = body.get("leases")
+        if isinstance(leases, dict):
+            runtime["lease_owners"] = {
+                key: info["owner"]
+                for key, info in leases.items()
+                if isinstance(key, str) and isinstance(info, dict) and isinstance(info.get("owner"), str)
+            }
         _push_message(context, "system", "Connected - loading host scene")
         _upsert_user(context, body.get("name", "host"), body.get("color", (1, 1, 1, 1)), host=True)
         for peer in body.get("peers", []):
             _upsert_user(context, peer.get("name", "?"), peer.get("color", (1, 1, 1, 1)))
         # The host now streams its scene; the client does not upload its own.
     elif kind == "relay":
+        settings.last_error = ""
         _push_message(context, "system", body.get("message", "Relay connected"))
     elif kind == "relay_error":
         settings.last_error = str(body.get("message", "relay error"))[:180]
@@ -432,7 +456,7 @@ def _handle_event(context, kind: str, body: dict) -> None:
         target = body.get("target")
         if target and target != settings.name:
             return
-        _clear_scene(context)
+        _clear_scene(context, body)
         runtime["bootstrapping"] = True
         runtime["bootstrap_deadline"] = time.monotonic() + 30.0
         _push_message(context, "system", "Replacing local scene with the host's")
@@ -454,6 +478,7 @@ def _handle_event(context, kind: str, body: dict) -> None:
                 user.scene = body.get("scene", "")
                 user.frame = int(body.get("frame", 0))
                 user.mode = body.get("mode", "")
+                user.active = str(body.get("active", ""))[:64]
                 if body.get("name") == settings.name:
                     user.ping_ms = settings.rtt_ms
         if (
@@ -477,9 +502,9 @@ def _handle_event(context, kind: str, body: dict) -> None:
             }
         key = body.get("key")
         owner = body.get("owner")
-        if isinstance(key, str) and isinstance(owner, str):
-            runtime["lease_owners"][key] = owner
         action = body.get("action")
+        if action != "release" and isinstance(key, str) and isinstance(owner, str):
+            runtime["lease_owners"][key] = owner
         if action in {"denied", "held"}:
             _push_message(context, "system", f"Locked by {body.get('owner', 'someone')}")
         elif action == "requested":
@@ -754,6 +779,9 @@ def _sync_materials(context) -> None:
     uid = obj.get("bmp_uuid")
     if not uid:
         return
+    owner = runtime["lease_owners"].get(uid)
+    if owner is not None and owner != settings.name:
+        return
     for index, slot in enumerate(obj.material_slots):
         material = slot.material
         if material is None:
@@ -870,6 +898,9 @@ def _sync_modifiers(context) -> None:
         return
     uid = obj.get("bmp_uuid")
     if not uid:
+        return
+    owner = runtime["lease_owners"].get(uid)
+    if owner is not None and owner != settings.name:
         return
     snapshot = modifier_snapshot(obj)
     signature = _modifier_signature(snapshot)
@@ -1069,6 +1100,7 @@ def _poll_control(context) -> None:
                 request.get("code") or None,
                 request.get("port"),
                 request.get("relay_url"),
+                request.get("relay_token"),
             )
         elif action == "join":
             code = request.get("code", "")
@@ -1174,6 +1206,36 @@ def _world_values(world):
     return None
 
 
+def _collection_snapshot(context) -> list:
+    master = context.scene.collection.name
+    result = []
+    for collection in bpy.data.collections:
+        if collection.name == master:
+            continue
+        parent = ""
+        for other in bpy.data.collections:
+            if other == collection:
+                continue
+            if other.children.get(collection.name) is not None:
+                parent = other.name
+                break
+        result.append({"name": collection.name[:64], "parent": parent[:64]})
+        if len(result) >= 256:
+            break
+    return result
+
+
+def _render_snapshot(context) -> dict:
+    render = context.scene.render
+    return {
+        "engine": str(render.engine)[:32],
+        "resolution_x": int(render.resolution_x),
+        "resolution_y": int(render.resolution_y),
+        "resolution_percentage": int(render.resolution_percentage),
+        "fps": int(render.fps),
+    }
+
+
 def _queue_scene_bootstrap(context, target: str) -> None:
     session: SessionService | None = runtime.get("session")
     if session is None or not session.is_host:
@@ -1181,12 +1243,15 @@ def _queue_scene_bootstrap(context, target: str) -> None:
     objects = [obj for obj in context.scene.objects if not obj.get("bmp_ping")]
     objects.sort(key=_parent_depth)
     camera = context.scene.camera
+    collections = _collection_snapshot(context)
     runtime["bootstraps"][target] = {
         "objects": [obj.name for obj in objects],
         "camera": camera.get("bmp_uuid") if camera is not None else None,
         "world": _world_values(context.scene.world),
+        "collections": collections,
+        "render": _render_snapshot(context),
     }
-    session.send_scene_reset(target)
+    session.send_scene_reset(target, {"collections": collections})
     _push_message(context, "system", f"Sending scene to {target}")
 
 
@@ -1214,12 +1279,16 @@ def _pump_scene_bootstrap(context) -> None:
         if not queue:
             session.send_scene_ready(
                 target,
-                {"camera": entry.get("camera"), "world": entry.get("world")},
+                {
+                    "camera": entry.get("camera"),
+                    "world": entry.get("world"),
+                    "render": entry.get("render"),
+                },
             )
             del bootstraps[target]
 
 
-def _clear_scene(context) -> None:
+def _clear_scene(context, body: dict | None = None) -> None:
     try:
         if context.mode != "OBJECT" and context.active_object is not None:
             bpy.ops.object.mode_set(mode="OBJECT")
@@ -1228,6 +1297,14 @@ def _clear_scene(context) -> None:
     for obj in list(bpy.data.objects):
         try:
             bpy.data.objects.remove(obj, do_unlink=True)
+        except Exception:  # noqa: BLE001
+            pass
+    master = context.scene.collection
+    for collection in list(bpy.data.collections):
+        if collection == master:
+            continue
+        try:
+            bpy.data.collections.remove(collection)
         except Exception:  # noqa: BLE001
             pass
     try:
@@ -1239,6 +1316,31 @@ def _clear_scene(context) -> None:
             pass
     except Exception:  # noqa: BLE001
         pass
+    entries = (body or {}).get("collections")
+    if isinstance(entries, list):
+        for item in entries[:256]:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if isinstance(name, str) and name and name not in bpy.data.collections:
+                try:
+                    bpy.data.collections.new(name[:64])
+                except Exception:  # noqa: BLE001
+                    pass
+        for item in entries[:256]:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if not isinstance(name, str) or name not in bpy.data.collections:
+                continue
+            parent = item.get("parent")
+            target = bpy.data.collections.get(parent) if isinstance(parent, str) and parent else master
+            collection = bpy.data.collections.get(name)
+            if collection is not None and target is not None and target.children.get(collection.name) is None:
+                try:
+                    target.children.link(collection)
+                except Exception:  # noqa: BLE001
+                    pass
     runtime["mirrors"].clear()
     runtime["edit_mirrors"].clear()
     runtime["object_shadow"].clear()
@@ -1246,8 +1348,12 @@ def _clear_scene(context) -> None:
     runtime["modifier_shadow"].clear()
     runtime["tracked"].clear()
     runtime["known_objects"].clear()
-    runtime["lease_owners"].clear()
     runtime["edit_lease_uid"] = None
+    runtime["selection"].clear()
+    runtime["hidden_objects"].clear()
+    runtime["deselected"].clear()
+    runtime["last_selection"] = 0.0
+    runtime["lease_renew"] = 0.0
 
 
 def _finish_scene_bootstrap(context, body: dict | None = None) -> None:
@@ -1300,6 +1406,43 @@ def _finish_scene_bootstrap(context, body: dict | None = None) -> None:
                     if isinstance(strength, (int, float)):
                         node.inputs["Strength"].default_value = float(strength)
                     break
+        render = body.get("render")
+        if isinstance(render, dict):
+            scene = context.scene
+            engine = render.get("engine")
+            if engine in {"BLENDER_EEVEE_NEXT", "BLENDER_EEVEE", "CYCLES", "BLENDER_WORKBENCH"}:
+                try:
+                    scene.render.engine = engine
+                except Exception:  # noqa: BLE001
+                    pass
+            limits = {
+                "resolution_x": (1, 16384),
+                "resolution_y": (1, 16384),
+                "resolution_percentage": (1, 1000),
+                "fps": (1, 240),
+            }
+            for key, (low, high) in limits.items():
+                value = render.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    try:
+                        setattr(scene.render, key, max(low, min(high, int(value))))
+                    except Exception:  # noqa: BLE001
+                        pass
+    settings = context.window_manager.bmp
+    blocked = {
+        uid
+        for uid, owner in runtime["lease_owners"].items()
+        if owner and owner != settings.name
+    }
+    hidden = runtime["hidden_objects"]
+    for uid in blocked:
+        obj = obj_sync.find(uid)
+        if obj is not None:
+            try:
+                obj.hide_select = True
+                hidden.add(uid)
+            except Exception:  # noqa: BLE001
+                pass
     _push_message(context, "system", "Host scene loaded")
 
 
@@ -1313,6 +1456,9 @@ def _send_object_create(session: SessionService, obj) -> None:
         "matrix": matrix,
         "parent": obj.parent.get("bmp_uuid") if obj.parent else None,
     }
+    collections = [collection for collection in getattr(obj, "users_collection", []) if collection != bpy.context.scene.collection]
+    if collections:
+        meta["collection"] = collections[0].name[:64]
     geometry = b""
     if kind == object_payload.KIND_MESH:
         mirror = runtime["mirrors"].get(uid)
@@ -1442,6 +1588,88 @@ def _apply_object_delete(context, body: dict) -> None:
         traceback.print_exc()
 
 
+def _lease_request(session: SessionService, uid: str, action: str) -> bool:
+    if session.is_host:
+        return session.local_lease(uid, action)
+    session.send_lease(uid, action)
+    return True
+
+
+def _sync_selection(context) -> None:
+    """Claim selected objects so only one person can select/edit them."""
+    session: SessionService | None = runtime.get("session")
+    settings = context.window_manager.bmp
+    if session is None or runtime.get("bootstrapping"):
+        return
+    now = time.monotonic()
+    if now - runtime["last_selection"] < SELECTION_POLL:
+        return
+    runtime["last_selection"] = now
+    owners = runtime["lease_owners"]
+    selected = {
+        uid
+        for obj in context.selected_objects
+        if (uid := obj.get("bmp_uuid"))
+    }
+    previous = runtime["selection"]
+
+    for uid in previous - selected:
+        if owners.get(uid) == settings.name:
+            runtime["deselected"].setdefault(uid, now)
+    for uid in selected:
+        runtime["deselected"].pop(uid, None)
+    for uid, stamp in list(runtime["deselected"].items()):
+        if now - stamp < 0.35:
+            continue
+        if owners.get(uid) == settings.name:
+            _lease_request(session, uid, "release")
+            owners.pop(uid, None)
+        runtime["deselected"].pop(uid, None)
+
+    for uid in selected - previous:
+        owner = owners.get(uid)
+        if owner is None or owner == settings.name:
+            granted = _lease_request(session, uid, "acquire")
+            if granted and session.is_host:
+                owners[uid] = settings.name
+            owner = owners.get(uid)
+        if owner not in (None, settings.name):
+            obj = obj_sync.find(uid)
+            if obj is not None:
+                try:
+                    obj.select_set(False)
+                except Exception:  # noqa: BLE001
+                    pass
+                _push_message(context, "system", f"{obj.name} is being edited by {owner}")
+
+    if now - runtime["lease_renew"] > LEASE_RENEW:
+        runtime["lease_renew"] = now
+        for uid in selected:
+            if owners.get(uid) == settings.name:
+                _lease_request(session, uid, "acquire")
+
+    blocked = {uid for uid, owner in owners.items() if owner and owner != settings.name}
+    hidden = runtime["hidden_objects"]
+    for uid in list(hidden - blocked):
+        obj = obj_sync.find(uid)
+        if obj is not None:
+            try:
+                obj.hide_select = False
+            except Exception:  # noqa: BLE001
+                pass
+        hidden.discard(uid)
+    for uid in blocked:
+        obj = obj_sync.find(uid)
+        if obj is not None and not obj.hide_select:
+            try:
+                obj.hide_select = True
+                hidden.add(uid)
+            except Exception:  # noqa: BLE001
+                pass
+
+    runtime["selection"] = selected
+
+
 def _sync_transforms(context) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
@@ -1472,6 +1700,9 @@ def _sync_transforms(context) -> None:
             uid = str(uuid.uuid4())
             obj["bmp_uuid"] = uid
         seen.add(uid)
+        owner = runtime["lease_owners"].get(uid)
+        if owner is not None and owner != settings.name:
+            continue
         matrix = obj.matrix_world
         current = tuple(round(v, 6) for row in matrix for v in row)
         previous = shadow.get(uid)
@@ -1514,7 +1745,9 @@ def _sync_edit_mesh(context, session: SessionService, obj) -> None:
         return
     if runtime.get("edit_lease_uid") != uid:
         runtime["edit_lease_uid"] = uid
-        session.send_lease(uid, "acquire")
+        _lease_request(session, uid, "acquire")
+        if session.is_host:
+            runtime["lease_owners"][uid] = settings.name
     try:
         import bmesh
         bm = bmesh.from_edit_mesh(obj.data)
@@ -1577,6 +1810,9 @@ def _sync_mesh(context) -> None:
     if obj is None or obj.type != "MESH":
         runtime["tracked"].discard(names[cursor])
         return
+    owner = runtime["lease_owners"].get(obj.get("bmp_uuid"))
+    if owner is not None and owner != settings.name:
+        return
 
     uid = obj.get("bmp_uuid") or str(uuid.uuid4())
     obj["bmp_uuid"] = uid
@@ -1628,6 +1864,7 @@ def _send_presence(context) -> None:
             "scene": context.scene.name,
             "frame": context.scene.frame_current,
             "mode": context.mode,
+            "active": context.active_object.name if context.active_object is not None else "",
         }
     )
 
@@ -1654,12 +1891,18 @@ def _write_status(context, force: bool = False) -> None:
         code = getattr(session, "code", None) or code
         is_host = bool(getattr(session, "is_host", is_host))
         name = getattr(session, "name", None) or name
+    local_active = context.active_object.name if context.active_object is not None else ""
+    for user in settings.users:
+        if user.name == settings.name:
+            user.active = local_active
+            break
     users = [
         {
             "name": user.name,
             "color": list(user.color),
             "ping_ms": user.ping_ms,
             "host": user.host,
+            "active": user.active,
         }
         for user in settings.users
     ]
@@ -1706,6 +1949,7 @@ def bmp_tick():
                 break
             _handle_event(context, kind, body)
         if session is not None:
+            _sync_selection(context)
             _sync_transforms(context)
             _sync_mesh(context)
             _sync_materials(context)

@@ -489,6 +489,7 @@ class SessionService:
                 "scene": clean_text(body.get("scene"), 64),
                 "frame": int(body.get("frame", 0)) if isinstance(body.get("frame"), (int, float)) else 0,
                 "mode": clean_text(body.get("mode"), 32),
+                "active": clean_text(body.get("active"), 64),
             }
             self._broadcast(protocol.json_frame(MessageType.PRESENCE, presence), exclude=peer.peer_id)
             self._emit("presence", presence)
@@ -654,6 +655,7 @@ class SessionService:
             "peers": peers,
             "fingerprint": self.fingerprint,
             "code": self.code,
+            "leases": self._leases.snapshot(time.monotonic()),
         }
         peer.enqueue(protocol.encode(protocol.json_frame(MessageType.WELCOME, welcome)), critical=True)
         self._broadcast(
@@ -724,14 +726,24 @@ class SessionService:
         else:
             raise Violation("unknown lease action")
         snapshot = self._leases.snapshot(now)
-        self._broadcast(protocol.json_frame(MessageType.LEASE, {"key": key, "owner": peer.name, "action": action, "leases": snapshot}))
+        body = {"key": key, "action": action, "leases": snapshot}
+        if action != "release":
+            body["owner"] = peer.name
+        self._broadcast(protocol.json_frame(MessageType.LEASE, body))
 
     def _may_edit(self, peer: Peer, key: str, now: float) -> bool:
         owner = self._leases.owner_of(key, now)
         if owner is None:
             self._leases.acquire(key, peer.name, now)
+            self._broadcast(
+                protocol.json_frame(
+                    MessageType.LEASE,
+                    {"key": key, "owner": peer.name, "action": "acquire", "leases": self._leases.snapshot(now)},
+                )
+            )
             return True
         if owner == peer.name:
+            self._leases.renew(key, peer.name, now)
             return True
         peer.strikes += 1
         if peer.strikes >= DISCONNECT_STRIKES:
@@ -867,6 +879,18 @@ class SessionService:
             peer.writer_task.cancel()
         self._peers.pop(peer.peer_id, None)
         if was_authenticated:
+            now = time.monotonic()
+            released = False
+            for key in self._leases.held_by(peer.name, now):
+                if self._leases.release(key, peer.name):
+                    released = True
+            if released:
+                self._broadcast(
+                    protocol.json_frame(
+                        MessageType.LEASE,
+                        {"action": "release", "leases": self._leases.snapshot(now)},
+                    )
+                )
             self._emit("peer_leave", {"name": peer.name})
             self._broadcast(protocol.json_frame(MessageType.BYE, {"name": peer.name}))
         try:
@@ -1141,8 +1165,11 @@ class SessionService:
                 self._leases.sweep(now)
 
     # ------------------------------------------------------------------ public API
-    def send_scene_reset(self, target: str) -> None:
-        self._enqueue(protocol.json_frame(MessageType.SCENE_RESET, {"target": target}))
+    def send_scene_reset(self, target: str, extra: dict | None = None) -> None:
+        body = {"target": target}
+        if isinstance(extra, dict):
+            body.update(extra)
+        self._enqueue(protocol.json_frame(MessageType.SCENE_RESET, body))
 
     def send_scene_ready(self, target: str, extra: dict | None = None) -> None:
         body = {"target": target}
@@ -1244,6 +1271,34 @@ class SessionService:
         if requester:
             body["requester"] = requester
         self._enqueue(protocol.json_frame(MessageType.LEASE, body))
+
+    def local_lease(self, key: str, action: str) -> bool:
+        """Acquire/release a lease from the host's own Blender."""
+        if not self.is_host:
+            self.send_lease(key, action)
+            return True
+        now = time.monotonic()
+        if action == "acquire":
+            if not self._leases.acquire(key, self.name, now):
+                owner = self._leases.owner_of(key, now)
+                self._emit("lease", {"key": key, "owner": owner, "action": "held"})
+                return False
+        elif action == "release":
+            self._leases.release(key, self.name)
+        elif action == "force":
+            self._leases.force(key, self.name, now)
+        else:
+            return False
+        body = {
+            "key": key,
+            "action": action,
+            "leases": self._leases.snapshot(now),
+        }
+        if action != "release":
+            body["owner"] = self.name
+        self._broadcast(protocol.json_frame(MessageType.LEASE, body))
+        self._emit("lease", body)
+        return True
 
     def stats(self) -> dict[str, Any]:
         peers = []
