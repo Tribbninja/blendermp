@@ -20,6 +20,7 @@ if _VENDOR.is_dir() and str(_VENDOR) not in sys.path:
 
 import hashlib
 import json
+import math
 import queue
 import socket
 import tempfile
@@ -53,7 +54,7 @@ bl_info = {
     "category": "Network",
 }
 
-ADDON_VERSION = "0.1.5"
+ADDON_VERSION = "0.1.6"
 TICK = 1.0 / 30.0
 CONTROL_POLL = 0.5
 STATUS_WRITE = 0.5
@@ -61,10 +62,11 @@ MESH_POLL = 1.0 / 20.0
 EDIT_POLL = 1.0 / 30.0
 SELECTION_POLL = 0.2
 LEASE_RENEW = 30.0
-PRESENCE_POLL = 0.2
-REMOTE_POLL = 0.2
+PRESENCE_POLL = 1.0 / 20.0
+REMOTE_POLL = 1.0 / 30.0
 TRANSFORM_SMOOTH = 0.035
 MESH_SMOOTH = 0.045
+VIEW_SMOOTH = 0.075
 DEFAULT_COLOR = (0.35, 0.8, 0.95, 1.0)
 USER_PALETTE = (
     (0.35, 0.8, 0.95, 1.0),
@@ -108,6 +110,8 @@ runtime: dict = {
     "remote_labels": [],
     "remote_shader": None,
     "last_remote": 0.0,
+    "view_smoothers": {},
+    "remote_debug": {},
     "draw_lines": None,
     "draw_labels": None,
     "transform_smoothers": {},
@@ -150,6 +154,7 @@ class BMPUser(PropertyGroup):
     has_view: BoolProperty()
     view_aspect: FloatProperty(default=1.6)
     view_persp: StringProperty()
+    view_distance: FloatProperty(default=7.0)
     selected: StringProperty()
     host: BoolProperty()
 
@@ -220,6 +225,7 @@ def _upsert_user(context, name: str, color, host: bool = False) -> None:
 
 
 def _remove_user(context, name: str) -> None:
+    runtime["view_smoothers"].pop(name, None)
     users = context.window_manager.bmp.users
     for index, user in enumerate(users):
         if user.name == name:
@@ -417,6 +423,8 @@ def stop_session(context, publish: bool = True) -> None:
     runtime["local_transform"].clear()
     runtime["transform_smoothers"].clear()
     runtime["mesh_smoothers"].clear()
+    runtime["view_smoothers"].clear()
+    runtime["remote_debug"] = {}
     runtime["selection"].clear()
     runtime["hidden_objects"].clear()
     runtime["deselected"].clear()
@@ -542,6 +550,9 @@ def _handle_event(context, kind: str, body: dict) -> None:
                 if isinstance(aspect, (int, float)) and not isinstance(aspect, bool):
                     user.view_aspect = max(0.1, min(10.0, float(aspect)))
                 user.view_persp = str(body.get("persp", ""))[:16]
+                distance = body.get("dist")
+                if isinstance(distance, (int, float)) and not isinstance(distance, bool):
+                    user.view_distance = max(0.05, min(100000.0, float(distance)))
                 user.selected = str(body.get("selected", ""))[:512]
                 if body.get("name") == settings.name:
                     user.ping_ms = settings.rtt_ms
@@ -1469,6 +1480,7 @@ def _clear_scene(context, body: dict | None = None) -> None:
     runtime["owned_leases"].clear()
     runtime["transform_smoothers"].clear()
     runtime["mesh_smoothers"].clear()
+    runtime["view_smoothers"].clear()
     runtime["last_selection"] = 0.0
     runtime["lease_renew"] = 0.0
 
@@ -1986,7 +1998,28 @@ def on_frame_change(scene) -> None:
     )
 
 
+def _rigid_view(matrix):
+    """Split a view matrix into position + rotation, dropping viewport zoom.
+
+    ``RegionView3D.view_matrix.inverted()`` carries the orthographic zoom (and
+    possibly a camera object's scale) in its basis. Drawing that directly made
+    remote frustums gigantic when the other user was in an orthographic view,
+    which looked like a stray axis line across the scene.
+    """
+    try:
+        location, rotation, _scale = matrix.decompose()
+    except Exception:  # noqa: BLE001
+        return None
+    numbers = [location[0], location[1], location[2], rotation.w, rotation.x, rotation.y, rotation.z]
+    if not all(math.isfinite(float(value)) and abs(float(value)) < 1e9 for value in numbers):
+        return None
+    rotation.normalize()
+    return location.copy(), rotation.copy()
+
+
 def _viewport_view(context):
+    from mathutils import Matrix
+
     screen = getattr(context, "screen", None)
     if screen is None:
         return None
@@ -1997,67 +2030,123 @@ def _viewport_view(context):
     if region_3d is None:
         return None
     try:
-        matrix = region_3d.view_matrix.inverted()
+        rigid = _rigid_view(region_3d.view_matrix.inverted())
     except Exception:  # noqa: BLE001
         return None
+    if rigid is None:
+        return None
+    location, rotation = rigid
+    matrix = Matrix.Translation(location) @ rotation.to_matrix().to_4x4()
+    try:
+        distance = float(region_3d.view_distance)
+    except Exception:  # noqa: BLE001
+        distance = 7.0
+    if not math.isfinite(distance) or distance <= 0.0:
+        distance = 7.0
     return {
         "matrix": [float(value) for row in matrix for value in row],
         "aspect": float(area.width) / max(1.0, float(area.height)),
         "persp": str(region_3d.view_perspective)[:16],
+        "distance": max(0.05, min(100000.0, distance)),
     }
 
 
 def _selected_uids(context) -> list:
-    return [
-        uid
-        for obj in context.selected_objects
-        if (uid := obj.get("bmp_uuid")) and not obj.get("bmp_remote")
-    ][:10]
+    objects = list(context.selected_objects)
+    active = context.active_object
+    if active is not None and active not in objects:
+        objects.append(active)
+    for obj in getattr(context, "objects_in_mode", []):
+        if obj not in objects:
+            objects.append(obj)
+    uids = []
+    seen = set()
+    for obj in objects:
+        uid = obj.get("bmp_uuid")
+        if not uid or uid in seen:
+            continue
+        seen.add(uid)
+        uids.append(uid)
+    return uids[:10]
 
 
-def _camera_segments(matrix, aspect: float) -> list:
+def _camera_segments(matrix, aspect: float, distance: float = 7.0) -> list:
+    """A camera-shaped wire pyramid that shows both position and gaze.
+
+    The widget is sized from the remote orbit distance so it stays readable at
+    any zoom level, and the centre ray makes the look direction obvious.
+    """
     from mathutils import Vector
 
-    distance = 0.7
-    height = 0.22
+    try:
+        orbit = float(distance)
+    except (TypeError, ValueError):
+        orbit = 7.0
+    if not math.isfinite(orbit) or orbit <= 0.0:
+        orbit = 7.0
+    size = max(0.35, min(8.0, orbit * 0.16))
+    forward = size
+    height = size * 0.34
     width = height * max(0.6, min(2.6, float(aspect or 1.6)))
-    local = [
-        Vector((0.0, 0.0, 0.0)),
-        Vector((-width, -height, -distance)),
-        Vector((width, -height, -distance)),
-        Vector((width, height, -distance)),
-        Vector((-width, height, -distance)),
+    apex = matrix @ Vector((0.0, 0.0, 0.0))
+    corners = [
+        matrix @ Vector((-width, -height, -forward)),
+        matrix @ Vector((width, -height, -forward)),
+        matrix @ Vector((width, height, -forward)),
+        matrix @ Vector((-width, height, -forward)),
     ]
-    world = [matrix @ point for point in local]
-    return [
-        (world[0], world[1]),
-        (world[0], world[2]),
-        (world[0], world[3]),
-        (world[0], world[4]),
-        (world[1], world[2]),
-        (world[2], world[3]),
-        (world[3], world[4]),
-        (world[4], world[1]),
+    tip = matrix @ Vector((0.0, 0.0, -forward))
+    arrow = [
+        matrix @ Vector((-width * 0.45, 0.0, -forward + size * 0.28)),
+        matrix @ Vector((width * 0.45, 0.0, -forward + size * 0.28)),
     ]
+    segments = [(apex, corner) for corner in corners]
+    segments.extend(
+        (corners[index], corners[(index + 1) % 4]) for index in range(4)
+    )
+    segments.append((apex, tip))
+    segments.append((tip, arrow[0]))
+    segments.append((tip, arrow[1]))
+    return segments
 
 
-def _object_segments(obj) -> list:
+def _object_segments(obj, max_edges: int = 2500) -> list:
     from mathutils import Vector
 
     matrix = obj.matrix_world
-    if obj.type == "MESH" and len(obj.data.edges) <= 8000:
-        vertices = obj.data.vertices
-        segments = []
-        for edge in obj.data.edges:
-            first, second = edge.vertices
-            segments.append((matrix @ vertices[first].co, matrix @ vertices[second].co))
-        return segments
+    corners = [matrix @ Vector(corner) for corner in obj.bound_box]
+    max_length = 1.0
+    if corners:
+        spans = [
+            max(point[index] for point in corners) - min(point[index] for point in corners)
+            for index in range(3)
+        ]
+        max_length = max(1.0, max(spans) * 2.0)
+    if obj.type == "MESH":
+        mesh = obj.data
+        count = len(mesh.vertices)
+        if count and len(mesh.edges) <= max_edges:
+            segments = []
+            for edge in mesh.edges:
+                first, second = edge.vertices
+                if first >= count or second >= count:
+                    continue
+                start = matrix @ mesh.vertices[first].co
+                end = matrix @ mesh.vertices[second].co
+                if not all(math.isfinite(float(value)) for value in (*start, *end)):
+                    continue
+                # Ignore corrupt/oversized geometry rather than drawing a line
+                # across the whole viewport.
+                if (end - start).length > max_length:
+                    continue
+                segments.append((start, end))
+            if segments:
+                return segments
     pairs = (
         (0, 1), (1, 2), (2, 3), (3, 0),
         (4, 5), (5, 6), (6, 7), (7, 4),
         (0, 4), (1, 5), (2, 6), (3, 7),
     )
-    corners = [matrix @ Vector(corner) for corner in obj.bound_box]
     return [(corners[first], corners[second]) for first, second in pairs]
 
 
@@ -2102,6 +2191,50 @@ def _build_remote_batches(lines: list) -> list:
     return batches
 
 
+def _smooth_view(name: str, values, now: float):
+    """Interpolate a remote camera between 20 Hz presence updates."""
+    from mathutils import Matrix
+
+    try:
+        matrix = Matrix((values[0:4], values[4:8], values[8:12], values[12:16]))
+    except Exception:  # noqa: BLE001
+        return None
+    rigid = _rigid_view(matrix)
+    if rigid is None:
+        return None
+    location, rotation = rigid
+    key = tuple(round(float(value), 4) for value in (*location, *rotation))
+    states = runtime["view_smoothers"]
+    state = states.get(name)
+    if state is None:
+        state = {
+            "location": location.copy(),
+            "rotation": rotation.copy(),
+            "start_location": location.copy(),
+            "start_rotation": rotation.copy(),
+            "target_location": location.copy(),
+            "target_rotation": rotation.copy(),
+            "started": now,
+            "key": key,
+        }
+        states[name] = state
+    elif key != state["key"]:
+        state["start_location"] = state["location"].copy()
+        state["start_rotation"] = state["rotation"].copy()
+        state["target_location"] = location
+        state["target_rotation"] = rotation
+        state["started"] = now
+        state["key"] = key
+    duration = max(0.001, VIEW_SMOOTH)
+    t = min(1.0, max(0.0, (now - state["started"]) / duration))
+    state["location"] = state["start_location"].lerp(state["target_location"], t)
+    target_rotation = state["target_rotation"].copy()
+    if state["start_rotation"].dot(target_rotation) < 0.0:
+        target_rotation.negate()
+    state["rotation"] = state["start_rotation"].slerp(target_rotation, t)
+    return Matrix.Translation(state["location"]) @ state["rotation"].to_matrix().to_4x4()
+
+
 def _sync_remote_visuals(context) -> None:
     session: SessionService | None = runtime.get("session")
     now = time.monotonic()
@@ -2111,29 +2244,34 @@ def _sync_remote_visuals(context) -> None:
     if session is None:
         runtime["remote_batches"] = []
         runtime["remote_labels"] = []
+        runtime["view_smoothers"].clear()
+        runtime["remote_debug"] = {}
         return
     settings = context.window_manager.bmp
-    from mathutils import Matrix, Vector
+    from mathutils import Vector
 
     lines = []
     labels = []
     total = 0
+    max_segment = 0.0
+    seen_users = set()
     for user in settings.users:
         if user.name == settings.name:
             continue
+        seen_users.add(user.name)
         color = effective_color(user.name, user.color)
         if user.has_view:
-            try:
-                values = list(user.view)
-                matrix = Matrix((values[0:4], values[4:8], values[8:12], values[12:16]))
-            except Exception:  # noqa: BLE001
-                matrix = None
+            matrix = _smooth_view(user.name, list(user.view), now)
             if matrix is not None:
-                segments = _camera_segments(matrix, user.view_aspect)
+                segments = _camera_segments(matrix, user.view_aspect, user.view_distance)
                 lines.append((color, segments))
                 total += len(segments)
+                for first, second in segments:
+                    max_segment = max(max_segment, float((second - first).length))
                 origin = matrix.translation
-                labels.append((origin + Vector((0.0, 0.0, 0.25)), user.name, color))
+                labels.append(
+                    (origin + Vector((0.0, 0.0, max(0.4, user.view_distance * 0.05))), user.name, color)
+                )
         uids = [uid for uid in str(user.selected or "").split(",") if uid]
         for uid in uids[:6]:
             obj = obj_sync.find(uid)
@@ -2145,12 +2283,23 @@ def _sync_remote_visuals(context) -> None:
             lines.append((color, segments))
             labels.append((_object_label(obj), user.name, color))
             total += len(segments)
+            for first, second in segments:
+                max_segment = max(max_segment, float((second - first).length))
             if total > 30000:
                 break
         if total > 30000:
             break
+    for name in list(runtime["view_smoothers"]):
+        if name not in seen_users:
+            runtime["view_smoothers"].pop(name, None)
     runtime["remote_labels"] = labels[:24]
     runtime["remote_batches"] = _build_remote_batches(lines)
+    runtime["remote_debug"] = {
+        "max_segment": round(max_segment, 3),
+        "segments": total,
+        "labels": len(labels),
+        "users": sorted(seen_users),
+    }
 
 
 def _draw_remote_lines() -> None:
@@ -2196,25 +2345,47 @@ def _draw_remote_labels() -> None:
     width = float(region.width)
     height = float(region.height)
     matrix = region_data.perspective_matrix
-    font = 0
     try:
-        blf.size(font, 13)
+        preferences = context.preferences.system
+        scale = max(1.0, float(getattr(preferences, "ui_scale", 1.0) or 1.0))
+        dpi = max(72.0, float(getattr(preferences, "dpi", 72.0) or 72.0))
     except Exception:  # noqa: BLE001
-        pass
+        scale = 1.0
+        dpi = 72.0
+    font = 0
+    pad = max(1.0, round(scale))
+    lift = round(10.0 * scale)
+    try:
+        # Render at the UI DPI so HiDPI displays get crisp text instead of a
+        # blurry, doubled-looking shadow.
+        blf.size(font, 12.0, dpi * scale)
+    except Exception:  # noqa: BLE001
+        try:
+            blf.size(font, int(12 * scale))
+        except Exception:  # noqa: BLE001
+            pass
+    outline = (
+        (-pad, 0.0), (pad, 0.0), (0.0, -pad), (0.0, pad),
+        (-pad, -pad), (pad, -pad), (-pad, pad), (pad, pad),
+    )
     for position, name, color in labels:
         clip = matrix @ Vector((position[0], position[1], position[2], 1.0))
         if clip.w <= 0.0001:
             continue
         x = (clip.x / clip.w * 0.5 + 0.5) * width
-        y = (clip.y / clip.w * 0.5 + 0.5) * height
-        if x < -120 or y < -120 or x > width + 120 or y > height + 120:
+        y = (clip.y / clip.w * 0.5 + 0.5) * height + lift
+        if x < -160 or y < -160 or x > width + 160 or y > height + 160:
             continue
         try:
-            blf.color(font, 0.0, 0.0, 0.0, 0.8)
-            blf.position(font, x + 1.0, y - 1.0, 0.0)
-            blf.draw(font, name)
-            blf.color(font, color[0], color[1], color[2], 1.0)
-            blf.position(font, x, y, 0.0)
+            text_width, _text_height = blf.dimensions(font, name)
+            left = round(x - text_width * 0.5)
+            base = round(y)
+            blf.color(font, 0.015, 0.015, 0.02, 0.95)
+            for dx, dy in outline:
+                blf.position(font, left + dx, base + dy, 0.0)
+                blf.draw(font, name)
+            blf.color(font, float(color[0]), float(color[1]), float(color[2]), 1.0)
+            blf.position(font, left, base, 0.0)
             blf.draw(font, name)
         except Exception:  # noqa: BLE001
             pass
@@ -2269,6 +2440,7 @@ def _send_presence(context) -> None:
         body["view"] = view["matrix"]
         body["aspect"] = view["aspect"]
         body["persp"] = view["persp"]
+        body["dist"] = view["distance"]
     session.send_presence(body)
 
 

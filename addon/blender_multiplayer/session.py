@@ -506,6 +506,9 @@ class SessionService:
             persp = clean_text(body.get("persp"), 16)
             if persp:
                 presence["persp"] = persp
+            distance = body.get("dist")
+            if isinstance(distance, (int, float)) and not isinstance(distance, bool):
+                presence["dist"] = max(0.01, min(100000.0, float(distance)))
             self._broadcast(protocol.json_frame(MessageType.PRESENCE, presence), exclude=peer.peer_id)
             self._emit("presence", presence)
             return
@@ -1061,6 +1064,9 @@ class SessionService:
             persp = clean_text(body.get("persp"), 16)
             if persp:
                 presence["persp"] = persp
+            distance = body.get("dist")
+            if isinstance(distance, (int, float)) and not isinstance(distance, bool):
+                presence["dist"] = max(0.01, min(100000.0, float(distance)))
             self._emit("presence", presence)
             return
 
@@ -1228,6 +1234,9 @@ class SessionService:
         persp = clean_text(body.get("persp"), 16)
         if persp:
             payload["persp"] = persp
+        distance = body.get("dist")
+        if isinstance(distance, (int, float)) and not isinstance(distance, bool):
+            payload["dist"] = max(0.01, min(100000.0, float(distance)))
         if self.is_host:
             payload.update({"name": self.name, "color": list(self.color)})
         self._enqueue(protocol.json_frame(MessageType.PRESENCE, payload))

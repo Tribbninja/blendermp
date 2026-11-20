@@ -36,9 +36,12 @@ surface that cross-process re-parenting causes on some GPUs).
   players see it locked (unselectable) and cannot edit it until the owner
   deselects or leaves. The active object name is shown for each player.
 * **Remote presence in the viewport**: each player's viewport camera is drawn as
-  a colored frustum with their name above it, and their selected objects are
-  wireframed in their color with a name tag. Each user gets a stable color
-  derived from their name if they have not chosen one.
+  a colored view pyramid with a look-direction ray and their name above it, and
+  their selected objects are wireframed in their color with a name tag. Camera
+  poses stream at 20 Hz, interpolate at 30 Hz, and are normalized so
+  orthographic zoom cannot distort the widget. Name tags use a DPI-scaled
+  outlined font so they stay crisp. Each user gets a stable color derived from
+  their name if they have not chosen one.
 * **Authenticated relay hosting**: each installation has a random host key; the
   Worker stores only its hash and requires it for the host WebSocket. A public
   room cannot be taken over by another host, and the key is never listed.
@@ -285,10 +288,12 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
 * Two people cannot select/edit the same object at once: the first selector
   holds the lease. Deselecting or disconnecting releases it, including a short
   debounce so mode switches do not release accidentally.
-* Remote camera frustums and selection wireframes are viewport overlays in the
+* Remote camera widgets and selection wireframes are viewport overlays in the
   local Blender; they are not scene objects, are not rendered, and are not
-  synced back to other clients. They approximate the remote viewport and update
-  at 5 Hz.
+  synced back to other clients. Camera poses update at 20 Hz, are smoothed at
+  30 Hz, and their zoom scale is stripped so orthographic views cannot stretch
+  them into stray lines. Selection outlines skip oversized/corrupt edges and
+  fall back to a bounding box above 2,500 edges.
 * Edit Mode streams vertex positions live. Structural changes (extrude,
   subdivide, delete) sync when the editor leaves Edit Mode, not during the drag.
 * Worlds are limited to background colour/strength. Full shader node graphs,
