@@ -122,9 +122,12 @@ class WorkerBridge:
                 return
             try:
                 headers = {"X-BMP-Host-Token": self.token} if self.role == "host" and self.token else None
+                if self.role == "host":
+                    print(f"BMP relay host connecting room={self.room}", flush=True)
                 websocket = await connect(self._url(), headers=headers)
-            except WebSocketError:
-                writer.write(b"ERR no-host\n")
+            except WebSocketError as exc:
+                print(f"BMP relay {self.role} failed: {exc}", flush=True)
+                writer.write(f"ERR {str(exc)[:150]}\n".encode("utf-8", "replace"))
                 await writer.drain()
                 return
             writer.write(b"OK\n")

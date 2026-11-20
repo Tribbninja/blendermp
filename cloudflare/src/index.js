@@ -141,7 +141,13 @@ export class Hub {
         const servers = await this.loadServers();
         const query = (url.searchParams.get("q") || "").trim().toLowerCase();
         const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit")) || 100));
-        const list = Object.values(servers)
+        const unique = new Map();
+        for (const entry of Object.values(servers)) {
+          if (!entry || !entry.code) continue;
+          const existing = unique.get(entry.code);
+          if (!existing || entry.seen > existing.seen) unique.set(entry.code, entry);
+        }
+        const list = [...unique.values()]
           .filter((entry) => !query || entry.name.toLowerCase().includes(query) || entry.host.toLowerCase().includes(query))
           .sort((a, b) => b.players - a.players || a.name.localeCompare(b.name))
           .slice(0, limit)

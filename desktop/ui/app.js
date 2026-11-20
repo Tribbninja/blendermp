@@ -80,6 +80,7 @@ const settings = {
   relay: store.get("relay", ""),
   useRelay: store.get("useRelay", "0") === "1",
   blender: store.get("blender", ""),
+  hostKey: store.get("hostKey", ""),
 };
 
 function randomHex(bytes) {
