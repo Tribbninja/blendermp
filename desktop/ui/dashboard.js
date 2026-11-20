@@ -51,6 +51,10 @@
           <div class="section-head"><span>Sync queue</span><span>per peer</span></div>
           <ul class="dash-list" id="dashSync"><li class="empty">No peer telemetry yet.</li></ul>
         </section>
+        <section class="dash-card">
+          <div class="section-head"><span>Session tools</span><span id="dashRecording">idle</span></div>
+          <ul class="dash-list" id="dashTools"><li class="empty">Start the live view or bridge in Blender.</li></ul>
+        </section>
         <section class="dash-card dash-history">
           <div class="section-head"><span>Recent chat</span><span id="dashHistoryCount">0</span></div>
           <div class="messages" id="dashMessages"><div class="message empty">No messages yet.</div></div>
@@ -300,6 +304,54 @@
     }
   }
 
+  function renderTools(status) {
+    const list = $("dashTools");
+    list.replaceChildren();
+    $("dashRecording").textContent = status.recording ? "recording" : "idle";
+    const rows = [];
+    if (status.broadcast_url) {
+      const link = document.createElement("a");
+      link.href = status.broadcast_url;
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      link.textContent = "Open live view";
+      rows.push(link);
+    }
+    if (status.bridge_url) {
+      const text = document.createElement("span");
+      text.textContent = `Bridge: ${status.bridge_url} (${Number(status.bridge_clients) || 0} client(s))`;
+      rows.push(text);
+    }
+    if (status.recording) {
+      const text = document.createElement("span");
+      text.textContent = `Recording: ${status.recording}`;
+      rows.push(text);
+    }
+    const budgets = status.perf && status.perf.budgets;
+    if (budgets && typeof budgets === "object") {
+      const parts = Object.entries(budgets)
+        .slice(0, 6)
+        .map(([name, item]) => `${name} ${Number(item.p95_ms || 0).toFixed(1)} ms`);
+      if (parts.length) {
+        const text = document.createElement("span");
+        text.textContent = `p95: ${parts.join(" · ")}`;
+        rows.push(text);
+      }
+    }
+    if (!rows.length) {
+      const empty = document.createElement("li");
+      empty.className = "empty";
+      empty.textContent = "Start the live view or bridge in Blender.";
+      list.append(empty);
+      return;
+    }
+    for (const row of rows) {
+      const item = document.createElement("li");
+      item.append(row);
+      list.append(item);
+    }
+  }
+
   function renderMessages(status) {
     const list = $("dashMessages");
     list.replaceChildren();
@@ -343,6 +395,7 @@
     renderPeople(current);
     renderLeases(current);
     renderSync(current);
+    renderTools(current);
     renderMessages(current);
 
     const messages = Array.isArray(current.messages) ? current.messages : [];

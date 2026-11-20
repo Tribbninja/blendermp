@@ -68,26 +68,89 @@ class BMP_PT_main(bpy.types.Panel):
         ai_box.prop(settings, "ai_enabled")
         if settings.ai_enabled:
             ai_box.prop(settings, "ai_url")
-            ai_box.prop(settings, "ai_model")
+            row = ai_box.row(align=True)
+            row.prop(settings, "ai_model", text="")
+            row.operator("bmp.ai_test", text="Test", icon="PLUGIN")
             row = ai_box.row(align=True)
             row.prop(settings, "ai_prompt", text="")
             row.operator("bmp.ai_ask", text="", icon="PLAY")
             if settings.ai_status == "thinking":
                 ai_box.label(text="Thinking...", icon="SORTTIME")
+            elif settings.ai_reply:
+                ai_box.label(text=settings.ai_reply[:160], icon="INFO")
             if settings.ai_pending_count:
-                for line in settings.ai_pending_text.splitlines():
+                ai_box.label(
+                    text=f"{settings.ai_pending_count} proposed edit(s)",
+                    icon="CHECKMARK",
+                )
+                for line in settings.ai_pending_text.splitlines()[:8]:
                     ai_box.label(text=line[:100])
-                ai_box.operator("bmp.ai_apply_all", text="Apply all", icon="CHECKMARK")
-                ai_box.operator("bmp.ai_clear", text="Clear", icon="X")
+                row = ai_box.row(align=True)
+                row.operator("bmp.ai_apply_all", text="Apply all", icon="CHECKMARK")
+                row.operator("bmp.ai_clear", text="Clear", icon="X")
             if settings.last_error_code == "AI_ERROR" and settings.last_error:
                 ai_box.label(text=settings.last_error[:120], icon="ERROR")
 
         recording_box = layout.box()
-        recording_box.label(text="Recording", icon="RECORD")
+        recording_box.label(text="Recording & Replay", icon="RECORD")
         row = recording_box.row(align=True)
-        row.operator("bmp.record_start", text="Start", icon="PLAY")
-        row.operator("bmp.record_stop", text="Stop", icon="PAUSE")
-        row.operator("bmp.replay", text="Replay", icon="PREVIEW_RANGE")
+        if settings.recording_active:
+            row.operator("bmp.record_stop", text="Stop recording", icon="PAUSE")
+        else:
+            row.operator("bmp.record_start", text="Record", icon="PLAY")
+        row.operator("bmp.replay", text="Replay latest", icon="PREVIEW_RANGE")
+        row.operator("bmp.replay_stop", text="", icon="CANCEL")
+        recording_box.prop(settings, "replay_speed")
+        if settings.recording_info:
+            recording_box.label(text=settings.recording_info[:80], icon="FILE_TEXT")
+
+        broadcast_box = layout.box()
+        broadcast_box.label(text="Live Broadcast", icon="WORLD")
+        row = broadcast_box.row(align=True)
+        if settings.broadcast_active:
+            row.operator("bmp.broadcast_stop", text="Stop", icon="PAUSE")
+            row.operator("bmp.broadcast_open", text="Open", icon="URL")
+        else:
+            row.operator("bmp.broadcast_start", text="Start live view", icon="PLAY")
+        broadcast_box.prop(settings, "broadcast_port")
+        if settings.broadcast_url:
+            broadcast_box.label(text=settings.broadcast_url[:120], icon="LINKED")
+
+        bridge_box = layout.box()
+        bridge_box.label(text="Cross-engine Bridge", icon="ARROW_LEFTRIGHT")
+        row = bridge_box.row(align=True)
+        row.prop(settings, "bridge_engine", text="")
+        if settings.bridge_active:
+            row.operator("bmp.bridge_stop", text="Stop", icon="PAUSE")
+        else:
+            row.operator("bmp.bridge_start", text="Start", icon="PLAY")
+        bridge_box.prop(settings, "bridge_port")
+        bridge_box.prop(settings, "bridge_meshes")
+        if settings.bridge_active:
+            bridge_box.label(
+                text=f"{settings.bridge_url}  ({settings.bridge_clients} client(s))",
+                icon="LINKED",
+            )
+            bridge_box.label(text="Receivers in integrations/", icon="INFO")
+
+        try:
+            from . import runtime as _runtime
+
+            budgets = _runtime["perf"].snapshot().get("budgets", {})
+        except Exception:  # noqa: BLE001
+            budgets = {}
+        if budgets:
+            perf_box = layout.box()
+            perf_box.label(text="Performance (p95)", icon="TIME")
+            for key, label in (
+                ("tick", "Tick"),
+                ("apply", "Apply"),
+                ("topology_read", "Topology"),
+                ("bridge_pump", "Bridge"),
+            ):
+                item = budgets.get(key)
+                if item:
+                    perf_box.label(text=f"{label}: {item.get('p95_ms', 0.0):.1f} ms")
 
         if settings.last_error:
             error = layout.box()

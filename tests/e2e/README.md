@@ -14,6 +14,7 @@ result and exits non-zero on mismatch.
 | `run_undo.ps1` | scoped undo of a local transform, verified on both sides |
 | `run_animation.ps1` | armature bones, vertex weights, armature modifier, shape keys, action curves and live pose |
 | `run_sculpt.ps1` | Sculpt Mode vertex deltas streamed to the client |
+| `run_foundation.ps1` | AI tool handlers, mesh export, bridge, broadcast and recording tap (headless) |
 
 Requirements:
 

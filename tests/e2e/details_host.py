@@ -55,6 +55,12 @@ subsurf.render_levels = 2
 bevel = child.modifiers.new("Edge Bevel", "BEVEL")
 bevel.width = 0.1
 bevel.segments = 2
+bpy.ops.mesh.primitive_cube_add(location=(4.0, 0.0, 0.0))
+cutter = context.active_object
+cutter.name = "Cutter"
+boolean = child.modifiers.new("Cutter Boolean", "BOOLEAN")
+boolean.operation = "DIFFERENCE"
+boolean.object = cutter
 constraint = child.constraints.new("COPY_ROTATION")
 constraint.name = "Follow Root"
 constraint.target = root
@@ -88,6 +94,7 @@ def summary():
     if obj is None:
         return None
     modifiers = {mod.type: mod.name for mod in obj.modifiers}
+    boolean = next((mod for mod in obj.modifiers if mod.type == "BOOLEAN"), None)
     root = bpy.data.objects.get("RigRoot")
     return {
         "root_location": [round(float(v), 3) for v in root.location] if root else None,
@@ -96,6 +103,14 @@ def summary():
         "local": [round(float(value), 3) for value in obj.matrix_basis.translation],
         "parent_inverse": [round(float(value), 3) for value in obj.matrix_parent_inverse.translation],
         "modifiers": sorted(modifiers),
+        "boolean": (
+            {
+                "operation": boolean.operation,
+                "object": boolean.object.name if boolean.object is not None else None,
+            }
+            if boolean is not None
+            else None
+        ),
         "constraints": sorted(item.name for item in child.constraints),
         "subsurf_levels": int(subsurf.levels),
         "color": [round(float(value), 3) for value in obj.color],

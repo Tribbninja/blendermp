@@ -121,6 +121,7 @@ class MessageType(IntEnum):
     CLIENT_STATS = 37
     VIEW_BOOKMARK = 42
     ASSET_BUNDLE = 43
+    OBJECT_RENAME = 46
     CHUNK = 45
 
 

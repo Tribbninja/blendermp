@@ -44,6 +44,7 @@ def summary():
     if obj is None:
         return None
     subsurf = next((mod for mod in obj.modifiers if mod.type == "SUBSURF"), None)
+    boolean = next((mod for mod in obj.modifiers if mod.type == "BOOLEAN"), None)
     collection = bpy.data.collections.get("Props")
     root = bpy.data.objects.get("RigRoot")
     return {
@@ -54,6 +55,14 @@ def summary():
         "local": [round(float(value), 3) for value in obj.matrix_basis.translation],
         "parent_inverse": [round(float(value), 3) for value in obj.matrix_parent_inverse.translation],
         "modifiers": sorted(mod.type for mod in obj.modifiers),
+        "boolean": (
+            {
+                "operation": boolean.operation,
+                "object": boolean.object.name if boolean.object is not None else None,
+            }
+            if boolean is not None
+            else None
+        ),
         "constraints": sorted(item.name for item in obj.constraints),
         "modifier_names": sorted(mod.name for mod in obj.modifiers),
         "subsurf_levels": int(subsurf.levels) if subsurf is not None else None,

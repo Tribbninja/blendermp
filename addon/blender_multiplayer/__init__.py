@@ -40,7 +40,7 @@ from pathlib import Path
 
 import bpy
 from bpy.app.handlers import persistent
-from bpy.props import BoolProperty, CollectionProperty, FloatProperty, FloatVectorProperty, IntProperty, StringProperty
+from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, FloatVectorProperty, IntProperty, StringProperty
 from bpy.types import Operator, Panel, PropertyGroup
 from bpy_extras.io_utils import ExportHelper
 
@@ -51,6 +51,7 @@ from .core import ai
 from .core import compression
 from .core import asset_bundle
 from .core import bookmarks
+from .core import broadcast
 from .core import checkpoints
 from .core import cross_engine
 from .core import eventlog
@@ -70,7 +71,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 8, 13),
+    "version": (0, 9, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -159,6 +160,16 @@ runtime: dict = {
     "lasers": {},
     "laser_active": False,
     "recording": None,
+    "broadcast": None,
+    "bridge": None,
+    "bridge_exporter": None,
+    "bridge_shadow": {},
+    "bridge_last": 0.0,
+    "bridge_materials_at": 0.0,
+    "replaying": False,
+    "replay_cancel": None,
+    "perf": perf.PerfRegistry(),
+    "last_tick": 0.0,
     "ai_session": None,
     "ai_queue": queue.Queue(),
     "ai_pending_edits": [],
@@ -333,6 +344,28 @@ class BMPState(PropertyGroup):
     ai_prompt: StringProperty(name="Ask the copilot", default="")
     ai_status: StringProperty(name="AI status", default="idle")
     ai_pending_text: StringProperty(name="AI pending edits", default="")
+    ai_pending_count: IntProperty(name="AI pending count", default=0, min=0)
+    ai_reply: StringProperty(name="AI reply", default="")
+    recording_active: BoolProperty(name="Recording", default=False)
+    recording_info: StringProperty(name="Recording info", default="")
+    replay_speed: FloatProperty(name="Replay speed", default=1.0, min=0.1, max=10.0)
+    broadcast_active: BoolProperty(name="Live broadcast", default=False)
+    broadcast_port: IntProperty(name="Broadcast port", default=7102, min=1024, max=65535)
+    broadcast_url: StringProperty(name="Broadcast URL", default="")
+    bridge_active: BoolProperty(name="Cross-engine bridge", default=False)
+    bridge_engine: EnumProperty(
+        name="Engine",
+        items=[
+            ("unity", "Unity", "Unity receiver"),
+            ("unreal", "Unreal", "Unreal receiver"),
+            ("godot", "Godot", "Godot receiver"),
+        ],
+        default="unity",
+    )
+    bridge_port: IntProperty(name="Bridge port", default=7103, min=1024, max=65535)
+    bridge_meshes: BoolProperty(name="Send meshes", default=True)
+    bridge_url: StringProperty(name="Bridge URL", default="")
+    bridge_clients: IntProperty(name="Bridge clients", default=0, min=0)
     host_name: StringProperty()
     sync_transforms: BoolProperty(name="Sync object transforms", default=True)
     users: CollectionProperty(type=BMPUser)
@@ -374,6 +407,37 @@ def _push_message(context, author: str, text: str) -> None:
     item.stamp = time.strftime("%H:%M")
     while len(messages) > 200:
         messages.remove(0)
+    _broadcast_event(
+        "chat" if author != "system" else "system",
+        {"name": author, "text": text},
+    )
+
+
+def _broadcast_event(kind: str, body) -> None:
+    """Publish one event to the live browser view, if it is running."""
+    server = runtime.get("broadcast")
+    if server is None:
+        return
+    if kind == "transform":
+        now = time.monotonic()
+        if now - runtime.get("last_broadcast_transform", 0.0) < 0.1:
+            return
+        runtime["last_broadcast_transform"] = now
+    try:
+        server.publish(kind, body)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _record_local(kind: str, body) -> None:
+    """Tap a locally sent session event into the recorder and live view."""
+    recorder = runtime.get("recording")
+    if recorder is not None and not runtime.get("replaying"):
+        try:
+            recorder.record(kind, body)
+        except Exception:  # noqa: BLE001
+            pass
+    _broadcast_event(kind, body)
 
 
 def _upsert_user(context, name: str, color, host: bool = False, role: str | None = None) -> None:
@@ -526,6 +590,7 @@ def start_host(
         raise
     runtime["relay_bridge"] = bridge
     runtime["session"] = session
+    session.event_sink = _record_local
     runtime["mirrors"].clear()
     runtime["object_shadow"].clear()
     _prime_objects(context)
@@ -619,6 +684,7 @@ def start_join(
         raise
     runtime["relay_bridge"] = bridge
     runtime["session"] = session
+    session.event_sink = _record_local
     runtime["mirrors"].clear()
     runtime["object_shadow"].clear()
     _prime_objects(context)
@@ -703,6 +769,16 @@ def stop_session(context, publish: bool = True) -> None:
     runtime["last_edit"] = 0.0
     settings.rtt_ms = 0
     settings.users.clear()
+    try:
+        recorder = runtime.get("recording")
+        if recorder is not None:
+            recorder.stop()
+            runtime["recording"] = None
+            settings.recording_active = False
+        _stop_broadcast(settings)
+        _stop_bridge(settings)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
     if runtime["inbox"] is not None:
         while not runtime["inbox"].empty():
             try:
@@ -1085,6 +1161,8 @@ def _handle_event(context, kind: str, body: dict) -> None:
         _apply_object_create(context, body)
     elif kind == "object_delete":
         _apply_object_delete(context, body)
+    elif kind == "object_rename":
+        _apply_object_rename(context, body)
     elif kind == "ping_mark":
         body_pos = body.get("pos") or []
         name = body.get("name", "?")
@@ -1735,7 +1813,7 @@ def _action_snapshot(obj) -> dict | None:
 def _sync_pose(context) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
-    if session is None or settings.paused or runtime.get("bootstrapping"):
+    if session is None or settings.paused or runtime.get("bootstrapping") or runtime.get("replaying"):
         return
     if not settings.is_host and session.state != "connected":
         return
@@ -1813,7 +1891,7 @@ def _apply_pose(context, body: dict) -> None:
 def _sync_shape_keys(context) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
-    if session is None or settings.paused or runtime.get("bootstrapping"):
+    if session is None or settings.paused or runtime.get("bootstrapping") or runtime.get("replaying"):
         return
     if not settings.is_host and session.state != "connected":
         return
@@ -1861,7 +1939,7 @@ def _apply_shape_keys(context, body: dict) -> None:
 def _sync_actions(context) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
-    if session is None or settings.paused or runtime.get("bootstrapping"):
+    if session is None or settings.paused or runtime.get("bootstrapping") or runtime.get("replaying"):
         return
     if not settings.is_host and session.state != "connected":
         return
@@ -2085,7 +2163,7 @@ def _apply_nla(obj, snapshot) -> None:
 def _sync_materials(context) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
-    if session is None or settings.paused or not settings.sync_materials or runtime.get("bootstrapping"):
+    if session is None or settings.paused or not settings.sync_materials or runtime.get("bootstrapping") or runtime.get("replaying"):
         return
     now = time.monotonic()
     if now - runtime["last_material"] < 0.25:
@@ -2181,6 +2259,7 @@ MODIFIER_PROPS = {
     "ARRAY": ("count", "use_relative_offset", "relative_offset_displace", "use_constant_offset", "constant_offset_displace"),
     "SOLIDIFY": ("thickness", "offset", "use_even_offset"),
     "BEVEL": ("width", "segments", "limit_method", "angle_limit"),
+    "BOOLEAN": ("operation", "solver", "use_self", "use_hole_tolerant"),
     "DECIMATE": ("ratio", "decimate_type"),
     "TRIANGULATE": ("quad_method", "ngon_method", "min_vertices"),
     "SMOOTH": ("factor", "iterations"),
@@ -2207,7 +2286,7 @@ def modifier_snapshot(obj) -> list:
                 props["node_group"] = mod.node_group.name if mod.node_group else ""
             except AttributeError:
                 props["node_group"] = ""
-        if mod.type in {"ARMATURE", "LATTICE", "CURVE", "HOOK", "SURFACE_DEFORM", "MESH_DEFORM"}:
+        if mod.type in {"ARMATURE", "LATTICE", "CURVE", "HOOK", "SURFACE_DEFORM", "MESH_DEFORM", "BOOLEAN"}:
             target = getattr(mod, "object", None)
             if target is not None and target.get("bmp_uuid"):
                 props["object_uid"] = target.get("bmp_uuid")
@@ -2282,7 +2361,7 @@ def _modifier_signature(snapshot: list, details=None) -> str:
 def _sync_modifiers(context) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
-    if session is None or settings.paused or not settings.sync_modifiers or runtime.get("bootstrapping"):
+    if session is None or settings.paused or not settings.sync_modifiers or runtime.get("bootstrapping") or runtime.get("replaying"):
         return
     now = time.monotonic()
     if now - runtime["last_modifier"] < 0.5:
@@ -2919,7 +2998,7 @@ def _start_journal(context) -> None:
 
 
 def _journal_capture(context) -> None:
-    if not runtime.get("journal_active"):
+    if not runtime.get("journal_active") or runtime.get("replaying"):
         return
     session: SessionService | None = runtime.get("session")
     if session is not None and session.state in {"connected"}:
@@ -4185,6 +4264,7 @@ def _apply_object_create(context, body: dict) -> None:
     target.objects.link(obj)
     obj["bmp_uuid"] = uid
     runtime["known_objects"].add(uid)
+    runtime.setdefault("name_shadow", {})[uid] = obj.name
     if obj.type == "MESH":
         runtime["tracked"].add(obj.name)
         _apply_mesh_rig(obj, meta)
@@ -4261,6 +4341,7 @@ def _apply_object_delete(context, body: dict) -> None:
     runtime["lease_owners"].pop(uid, None)
     runtime["transform_smoothers"].pop(uid, None)
     runtime["mesh_smoothers"].pop(uid, None)
+    runtime.setdefault("name_shadow", {}).pop(uid, None)
     if obj is not None:
         runtime["tracked"].discard(obj.name)
     if obj is None:
@@ -4274,6 +4355,21 @@ def _apply_object_delete(context, body: dict) -> None:
             bpy.data.meshes.remove(mesh)
     except Exception:  # noqa: BLE001
         traceback.print_exc()
+
+
+def _apply_object_rename(context, body: dict) -> None:
+    uid = body.get("uuid")
+    name = body.get("name")
+    if not isinstance(uid, str) or not isinstance(name, str) or not name.strip():
+        return
+    obj = obj_sync.find(uid)
+    if obj is None:
+        return
+    try:
+        obj.name = name.strip()[:48]
+    except Exception:  # noqa: BLE001
+        return
+    runtime.setdefault("name_shadow", {})[uid] = obj.name
 
 
 def _lease_request(session: SessionService, uid: str, action: str) -> bool:
@@ -4294,12 +4390,15 @@ def _drain_ai_queue(context) -> None:
         if session is None:
             continue
         settings.ai_status = session.status
+        settings.ai_reply = session.reply
         if session.status == "done":
             runtime["ai_pending_edits"] = list(session.pending)
             settings.ai_pending_count = len(session.pending)
-            settings.ai_pending_text = "\\n".join(edit.summary for edit in session.pending)
+            settings.ai_pending_text = "\n".join(edit.summary for edit in session.pending)
             if session.pending:
                 _push_message(context, "system", f"AI proposed {len(session.pending)} edit(s). Confirm to apply.")
+            elif session.reply:
+                _push_message(context, "system", f"AI: {session.reply[:160]}")
         elif session.status == "error":
             settings.last_error = session.error
             settings.last_error_code = "AI_ERROR"
@@ -4309,7 +4408,7 @@ def _sync_selection(context) -> None:
     """Claim selected objects so only one person can select/edit them."""
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
-    if session is None or runtime.get("bootstrapping"):
+    if session is None or runtime.get("bootstrapping") or runtime.get("replaying"):
         return
     now = time.monotonic()
     if now - runtime["last_selection"] < SELECTION_POLL:
@@ -4393,7 +4492,7 @@ def _sync_selection(context) -> None:
 def _sync_transforms(context) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
-    if session is None or not settings.sync_transforms or settings.paused or runtime.get("bootstrapping"):
+    if session is None or not settings.sync_transforms or settings.paused or runtime.get("bootstrapping") or runtime.get("replaying"):
         return
     if not settings.is_host and session.state != "connected":
         return
@@ -4416,6 +4515,12 @@ def _sync_transforms(context) -> None:
             obj["bmp_uuid"] = uid
         if uid not in known:
             _send_object_create(session, obj)
+        names = runtime.setdefault("name_shadow", {})
+        previous_name = names.get(uid)
+        if previous_name is not None and previous_name != obj.name:
+            _note_rev(uid)
+            session.send_object_rename(uid, obj.name)
+        names[uid] = obj.name
         assigned.add(uid)
         current.add(uid)
     for uid in list(known - current):
@@ -4464,12 +4569,6 @@ def _sync_transforms(context) -> None:
             runtime["undo"].push(uid, "transform", previous, current)
             _note_rev(uid)
             session.send_transform(uid, current)
-            recorder = runtime.get("recording")
-            if recorder is not None:
-                try:
-                    recorder.record("transform", {"uuid": uid, "matrix": list(current)})
-                except Exception:  # noqa: BLE001
-                    pass
     for stale in list(shadow.keys() - seen):
         del shadow[stale]
 
@@ -4491,110 +4590,238 @@ def _ai_callback(result: dict) -> None:
     runtime["ai_queue"].put(result)
 
 
+def _ai_scene_context(context) -> str:
+    """Build a compact scene summary for the copilot prompt."""
+    try:
+        import bpy
+
+        scene = context.scene
+        objects = [obj for obj in scene.objects if not obj.get("bmp_ping")]
+        selected = [obj.name for obj in context.selected_objects][:12]
+        active = context.active_object.name if context.active_object is not None else ""
+        lines = [
+            f"Scene: {scene.name}",
+            f"Frame: {scene.frame_current} ({scene.frame_start}-{scene.frame_end})",
+            f"Objects: {len(objects)}",
+            f"Active: {active or 'none'}",
+            f"Selected: {', '.join(selected) if selected else 'none'}",
+        ]
+        for obj in objects[:40]:
+            location = ", ".join(f"{float(value):.2f}" for value in obj.location)
+            flags = []
+            if obj.select_get():
+                flags.append("selected")
+            if obj.hide_viewport:
+                flags.append("hidden")
+            suffix = f" [{', '.join(flags)}]" if flags else ""
+            lines.append(f"- {obj.name} ({obj.type}) at ({location}){suffix}")
+        if len(objects) > 40:
+            lines.append(f"- ... {len(objects) - 40} more")
+        materials = [material.name for material in bpy.data.materials][:30]
+        if materials:
+            lines.append("Materials: " + ", ".join(materials))
+        return "\n".join(lines)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _ai_handlers() -> dict:
     import bpy
     from math import radians
 
     from . import obj_sync
 
+    def _obj(args):
+        name = str(args.get("name", args.get("object", ""))).strip()
+        return bpy.data.objects.get(name) if name else None
+
+    def _uid(obj):
+        uid = obj.get("bmp_uuid")
+        if not uid:
+            uid = str(uuid.uuid4())
+            obj["bmp_uuid"] = uid
+            runtime["tracked"].add(obj.name)
+        return uid
+
+    def _send_transform(obj):
+        uid = _uid(obj)
+        _note_rev(uid)
+        runtime["object_shadow"].pop(uid, None)
+        sess = runtime.get("session")
+        if sess is not None:
+            matrix = tuple(round(float(value), 6) for row in obj.matrix_world for value in row)
+            sess.send_transform(uid, matrix)
+
+    def _invalidate_material(obj):
+        uid = obj.get("bmp_uuid")
+        if not uid:
+            return
+        for index in range(len(getattr(obj, "material_slots", []))):
+            runtime["material_shadow"].pop((uid, index), None)
+
+    def _invalidate_modifier(obj):
+        uid = obj.get("bmp_uuid")
+        if uid:
+            runtime["modifier_shadow"].pop(uid, None)
+
+    def _color(value):
+        if not (isinstance(value, (list, tuple)) and len(value) in (3, 4)):
+            return None
+        try:
+            values = [max(0.0, min(1.0, float(item))) for item in value]
+        except (TypeError, ValueError):
+            return None
+        if len(values) == 3:
+            values.append(1.0)
+        return values
+
+    def _principled(material):
+        if material is None or not material.use_nodes or material.node_tree is None:
+            return None
+        for node in material.node_tree.nodes:
+            if node.type == "BSDF_PRINCIPLED":
+                return node
+        return None
+
+    # ---------------------------------------------------------------- read
     def get_scene_info(args, ctx):
-        objs = []
+        objects = []
         for obj in bpy.context.scene.objects:
-            objs.append(
-                {"name": obj.name, "type": obj.type, "location": [round(float(v), 3) for v in obj.location]}
+            if obj.get("bmp_ping"):
+                continue
+            objects.append(
+                {
+                    "name": obj.name,
+                    "uid": obj.get("bmp_uuid", ""),
+                    "type": obj.type,
+                    "location": [round(float(value), 3) for value in obj.location],
+                    "selected": bool(obj.select_get()),
+                    "hidden": bool(obj.hide_viewport),
+                }
             )
-        return {"count": len(objs), "objects": objs[:80]}
+        return {"count": len(objects), "objects": objects[:120]}
 
     def get_selected_objects(args, ctx):
         return {
             "objects": [
-                {"name": o.name, "type": o.type, "location": [round(float(v), 3) for v in o.location]}
-                for o in bpy.context.selected_objects
+                {
+                    "name": obj.name,
+                    "type": obj.type,
+                    "location": [round(float(value), 3) for value in obj.location],
+                }
+                for obj in bpy.context.selected_objects
             ]
         }
 
     def get_object_info(args, ctx):
-        obj = bpy.data.objects.get(str(args.get("name", "")))
+        obj = _obj(args)
         if obj is None:
             return {"error": "object not found"}
         return {
             "name": obj.name,
+            "uid": obj.get("bmp_uuid", ""),
             "type": obj.type,
-            "location": [round(float(v), 3) for v in obj.location],
-            "rotation": [round(float(v), 3) for v in obj.rotation_euler],
-            "scale": [round(float(v), 3) for v in obj.scale],
-            "dimensions": [round(float(v), 3) for v in obj.dimensions],
+            "location": [round(float(value), 3) for value in obj.location],
+            "rotation": [round(float(value), 3) for value in obj.rotation_euler],
+            "scale": [round(float(value), 3) for value in obj.scale],
+            "dimensions": [round(float(value), 3) for value in obj.dimensions],
+            "materials": [
+                slot.material.name
+                for slot in getattr(obj, "material_slots", [])
+                if slot.material is not None
+            ],
+            "modifiers": [modifier.type for modifier in obj.modifiers],
         }
 
     def get_materials(args, ctx):
-        return {"materials": [m.name for m in bpy.data.materials][:80]}
+        users: dict[str, list[str]] = {}
+        for obj in bpy.context.scene.objects:
+            for slot in getattr(obj, "material_slots", []):
+                if slot.material is not None:
+                    users.setdefault(slot.material.name, []).append(obj.name)
+        return {
+            "materials": [
+                {"name": material.name, "users": users.get(material.name, [])[:8]}
+                for material in bpy.data.materials
+            ][:120]
+        }
 
+    def get_object_modifiers(args, ctx):
+        obj = _obj(args)
+        if obj is None:
+            return {"error": "object not found"}
+        return {
+            "name": obj.name,
+            "modifiers": [
+                {
+                    "name": modifier.name,
+                    "type": modifier.type,
+                    "show_viewport": bool(modifier.show_viewport),
+                }
+                for modifier in obj.modifiers
+            ],
+        }
+
+    # ---------------------------------------------------------- transforms
     def move_object(args, ctx):
-        obj = bpy.data.objects.get(str(args.get("name", "")))
+        obj = _obj(args)
         if obj is None:
             return {"error": "object not found"}
         loc = args.get("location")
         if not (isinstance(loc, (list, tuple)) and len(loc) == 3):
             return {"error": "location must be [x, y, z]"}
         try:
-            obj.location = tuple(float(v) for v in loc)
+            obj.location = tuple(float(value) for value in loc)
         except (TypeError, ValueError):
             return {"error": "invalid location"}
-        sess = runtime.get("session")
-        if sess is not None:
-            uid = obj.get("bmp_uuid")
-            if uid:
-                _note_rev(uid)
-                sess.send_transform(uid, tuple(round(float(v), 6) for row in obj.matrix_world for v in row))
-        return {"ok": True, "name": obj.name, "location": [round(float(v), 3) for v in obj.location]}
+        _send_transform(obj)
+        return {
+            "ok": True,
+            "name": obj.name,
+            "location": [round(float(value), 3) for value in obj.location],
+        }
 
     def rotate_object(args, ctx):
-        obj = bpy.data.objects.get(str(args.get("name", "")))
+        obj = _obj(args)
         if obj is None:
             return {"error": "object not found"}
         rot = args.get("rotation")
         if not (isinstance(rot, (list, tuple)) and len(rot) == 3):
             return {"error": "rotation must be [x, y, z] degrees"}
         try:
-            obj.rotation_euler = tuple(radians(float(v)) for v in rot)
+            obj.rotation_euler = tuple(radians(float(value)) for value in rot)
         except (TypeError, ValueError):
             return {"error": "invalid rotation"}
-        sess = runtime.get("session")
-        if sess is not None:
-            uid = obj.get("bmp_uuid")
-            if uid:
-                _note_rev(uid)
-                sess.send_transform(uid, tuple(round(float(v), 6) for row in obj.matrix_world for v in row))
-        return {"ok": True}
+        _send_transform(obj)
+        return {"ok": True, "name": obj.name}
 
     def scale_object(args, ctx):
-        obj = bpy.data.objects.get(str(args.get("name", "")))
+        obj = _obj(args)
         if obj is None:
             return {"error": "object not found"}
-        sc = args.get("scale")
-        if not (isinstance(sc, (list, tuple)) and len(sc) in (1, 3)):
+        scale = args.get("scale")
+        if not (isinstance(scale, (list, tuple)) and len(scale) in (1, 3)):
             return {"error": "scale must be a number or [x, y, z]"}
         try:
-            if len(sc) == 1:
-                value = float(sc[0])
+            if len(scale) == 1:
+                value = float(scale[0])
                 obj.scale = (value, value, value)
             else:
-                obj.scale = tuple(float(v) for v in sc)
+                obj.scale = tuple(float(value) for value in scale)
         except (TypeError, ValueError):
             return {"error": "invalid scale"}
-        sess = runtime.get("session")
-        if sess is not None:
-            uid = obj.get("bmp_uuid")
-            if uid:
-                _note_rev(uid)
-                sess.send_transform(uid, tuple(round(float(v), 6) for row in obj.matrix_world for v in row))
-        return {"ok": True}
+        _send_transform(obj)
+        return {"ok": True, "name": obj.name}
 
+    # ------------------------------------------------------------ lifecycle
     def create_primitive(args, ctx):
         ptype = str(args.get("type", "cube")).lower()
         name = str(args.get("name", "")).strip() or ptype
         loc = args.get("location", [0.0, 0.0, 0.0])
-        size = float(args.get("size", 1.0) or 1.0)
+        try:
+            size = float(args.get("size", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            size = 1.0
         if not (isinstance(loc, (list, tuple)) and len(loc) == 3):
             return {"error": "location must be [x, y, z]"}
         try:
@@ -4615,8 +4842,7 @@ def _ai_handlers() -> dict:
             if obj is None:
                 return {"error": "creation failed"}
             obj.name = name
-            uid = str(uuid.uuid4())
-            obj["bmp_uuid"] = uid
+            uid = _uid(obj)
             runtime["tracked"].add(obj.name)
             sess = runtime.get("session")
             if sess is not None:
@@ -4626,22 +4852,24 @@ def _ai_handlers() -> dict:
             return {"error": str(exc)[:200]}
 
     def delete_object(args, ctx):
-        obj = bpy.data.objects.get(str(args.get("name", "")))
+        obj = _obj(args)
         if obj is None:
             return {"error": "object not found"}
         uid = obj.get("bmp_uuid")
+        name = obj.name
         bpy.data.objects.remove(obj, do_unlink=True)
         if uid:
-            runtime["tracked"].discard(obj.name)
+            runtime["tracked"].discard(name)
             runtime["object_shadow"].pop(uid, None)
             runtime["mirrors"].pop(uid, None)
+            runtime["edit_mirrors"].pop(uid, None)
             sess = runtime.get("session")
             if sess is not None:
                 sess.send_object_delete(uid)
-        return {"ok": True}
+        return {"ok": True, "name": name}
 
     def duplicate_object(args, ctx):
-        obj = bpy.data.objects.get(str(args.get("name", "")))
+        obj = _obj(args)
         if obj is None:
             return {"error": "object not found"}
         new_name = str(args.get("new_name", "")).strip() or f"{obj.name} copy"
@@ -4650,48 +4878,274 @@ def _ai_handlers() -> dict:
             copy.data = obj.data.copy()
         bpy.context.scene.collection.objects.link(copy)
         copy.name = new_name
-        uid = str(uuid.uuid4())
-        copy["bmp_uuid"] = uid
+        uid = _uid(copy)
         runtime["tracked"].add(copy.name)
         sess = runtime.get("session")
         if sess is not None:
             _send_object_create(sess, copy)
         return {"ok": True, "name": copy.name, "uid": uid}
 
-    def set_material_color(args, ctx):
-        mat = bpy.data.materials.get(str(args.get("material", "")))
-        if mat is None:
-            return {"error": "material not found"}
-        color = args.get("color")
-        if not (isinstance(color, (list, tuple)) and len(color) in (3, 4)):
+    def rename_object(args, ctx):
+        obj = _obj(args)
+        if obj is None:
+            return {"error": "object not found"}
+        new_name = str(args.get("new_name", "")).strip()
+        if not new_name:
+            return {"error": "new_name is required"}
+        old_name = obj.name
+        try:
+            obj.name = new_name[:48]
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)[:200]}
+        runtime["tracked"].discard(old_name)
+        runtime["tracked"].add(obj.name)
+        uid = _uid(obj)
+        runtime.setdefault("name_shadow", {})[uid] = obj.name
+        sess = runtime.get("session")
+        if sess is not None:
+            sess.send_object_rename(uid, obj.name)
+        return {"ok": True, "name": obj.name}
+
+    def select_object(args, ctx):
+        obj = _obj(args)
+        if obj is None:
+            return {"error": "object not found"}
+        if not bool(args.get("add", False)):
+            for item in bpy.context.selected_objects:
+                item.select_set(False)
+        try:
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)[:200]}
+        return {"ok": True, "name": obj.name}
+
+    def frame_object(args, ctx):
+        obj = _obj(args)
+        if obj is None:
+            return {"error": "object not found"}
+        try:
+            for item in bpy.context.selected_objects:
+                item.select_set(False)
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.view3d.view_selected()
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not frame in this view: {exc}"[:200]}
+        return {"ok": True, "name": obj.name}
+
+    def set_object_visibility(args, ctx):
+        obj = _obj(args)
+        if obj is None:
+            return {"error": "object not found"}
+        visible = bool(args.get("visible", True))
+        render = args.get("render", visible)
+        try:
+            obj.hide_viewport = not visible
+            obj.hide_render = not bool(render)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)[:200]}
+        _invalidate_modifier(obj)
+        return {"ok": True, "name": obj.name, "visible": visible}
+
+    def set_object_color(args, ctx):
+        obj = _obj(args)
+        if obj is None:
+            return {"error": "object not found"}
+        color = _color(args.get("color"))
+        if color is None:
             return {"error": "color must be [r, g, b] or [r, g, b, a]"}
         try:
-            values = [max(0.0, min(1.0, float(v))) for v in color]
+            obj.color = tuple(color)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)[:200]}
+        _invalidate_modifier(obj)
+        return {"ok": True, "name": obj.name}
+
+    # ------------------------------------------------------------- materials
+    def create_material(args, ctx):
+        name = str(args.get("name", "")).strip()[:48] or "Material"
+        material = bpy.data.materials.get(name)
+        if material is None:
+            material = bpy.data.materials.new(name)
+        material.use_nodes = True
+        color = _color(args.get("color", [0.8, 0.8, 0.8]))
+        if color is not None:
+            material.diffuse_color = tuple(color)
+        bsdf = _principled(material)
+        if bsdf is not None:
+            if color is not None and "Base Color" in bsdf.inputs:
+                bsdf.inputs["Base Color"].default_value = tuple(color)
+            for key, field in (("metallic", "Metallic"), ("roughness", "Roughness")):
+                value = args.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    if field in bsdf.inputs:
+                        bsdf.inputs[field].default_value = max(0.0, min(1.0, float(value)))
+        return {"ok": True, "material": material.name}
+
+    def assign_material(args, ctx):
+        obj = _obj(args)
+        if obj is None:
+            return {"error": "object not found"}
+        material = bpy.data.materials.get(str(args.get("material", "")).strip())
+        if material is None:
+            return {"error": "material not found"}
+        if getattr(obj.data, "materials", None) is None:
+            return {"error": "object has no material slots"}
+        try:
+            slot_index = max(0, min(63, int(args.get("slot", 0))))
         except (TypeError, ValueError):
-            return {"error": "invalid color"}
-        if len(values) == 3:
-            values.append(1.0)
-        mat.diffuse_color = tuple(values)
-        bsdf = mat.node_tree.nodes.get("Principled BSDF") if mat.node_tree else None
+            slot_index = 0
+        while len(obj.material_slots) <= slot_index:
+            obj.data.materials.append(None)
+        obj.material_slots[slot_index].material = material
+        _invalidate_material(obj)
+        return {"ok": True, "object": obj.name, "material": material.name}
+
+    def set_material_color(args, ctx):
+        material = bpy.data.materials.get(str(args.get("material", "")).strip())
+        if material is None:
+            return {"error": "material not found"}
+        color = _color(args.get("color"))
+        if color is None:
+            return {"error": "color must be [r, g, b] or [r, g, b, a]"}
+        material.diffuse_color = tuple(color)
+        bsdf = _principled(material)
         if bsdf is not None and "Base Color" in bsdf.inputs:
-            bsdf.inputs["Base Color"].default_value = tuple(values)
-        return {"ok": True, "material": mat.name}
+            bsdf.inputs["Base Color"].default_value = tuple(color)
+        return {"ok": True, "material": material.name}
+
+    def set_material_property(args, ctx):
+        material = bpy.data.materials.get(str(args.get("material", "")).strip())
+        if material is None:
+            return {"error": "material not found"}
+        bsdf = _principled(material)
+        if bsdf is None:
+            return {"error": "material has no Principled BSDF"}
+        changed = []
+        for key, field in (("metallic", "Metallic"), ("roughness", "Roughness"), ("alpha", "Alpha")):
+            value = args.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if field in bsdf.inputs:
+                    bsdf.inputs[field].default_value = max(0.0, min(1.0, float(value)))
+                    changed.append(key)
+        if "alpha" in changed:
+            material.diffuse_color = tuple(list(material.diffuse_color[:3]) + [float(bsdf.inputs["Alpha"].default_value)])
+        if not changed:
+            return {"error": "pass metallic, roughness or alpha"}
+        return {"ok": True, "material": material.name, "changed": changed}
+
+    # ------------------------------------------------------------- modifiers
+    def add_modifier(args, ctx):
+        obj = _obj(args)
+        if obj is None:
+            return {"error": "object not found"}
+        modifier_type = str(args.get("modifier", "")).upper()
+        if modifier_type not in {"SUBSURF", "BEVEL", "SOLIDIFY", "MIRROR", "ARRAY"}:
+            return {"error": "unsupported modifier"}
+        try:
+            modifier = obj.modifiers.new(name=modifier_type.title(), type=modifier_type)
+            if modifier_type == "SUBSURF" and hasattr(modifier, "levels"):
+                modifier.levels = max(1, min(6, int(args.get("levels", 1) or 1)))
+            if modifier_type == "BEVEL" and hasattr(modifier, "width"):
+                modifier.width = max(0.0, min(10.0, float(args.get("width", 0.1) or 0.1)))
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)[:200]}
+        _invalidate_modifier(obj)
+        return {"ok": True, "name": obj.name, "modifier": modifier.type}
+
+    def apply_boolean(args, ctx):
+        obj = _obj(args)
+        if obj is None:
+            return {"error": "object not found"}
+        operand = bpy.data.objects.get(str(args.get("operand", "")).strip())
+        if operand is None:
+            return {"error": "operand not found"}
+        if operand is obj:
+            return {"error": "an object cannot boolean itself"}
+        _uid(obj)
+        _uid(operand)
+        operation = str(args.get("operation", "DIFFERENCE")).upper()
+        if operation not in {"DIFFERENCE", "UNION", "INTERSECT"}:
+            return {"error": "operation must be DIFFERENCE, UNION or INTERSECT"}
+        try:
+            modifier = None
+            for item in obj.modifiers:
+                if item.type == "BOOLEAN":
+                    modifier = item
+                    break
+            if modifier is None:
+                modifier = obj.modifiers.new(name="Boolean", type="BOOLEAN")
+            modifier.operation = operation
+            modifier.object = operand
+            applied = False
+            if bool(args.get("apply", False)):
+                for item in bpy.context.selected_objects:
+                    item.select_set(False)
+                obj.select_set(True)
+                bpy.context.view_layer.objects.active = obj
+                bpy.ops.object.modifier_apply(modifier=modifier.name)
+                applied = True
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)[:200]}
+        _invalidate_modifier(obj)
+        return {
+            "ok": True,
+            "name": obj.name,
+            "operand": operand.name,
+            "operation": operation,
+            "applied": applied,
+        }
+
+    # ----------------------------------------------------------------- scene
+    def set_scene_setting(args, ctx):
+        scene = bpy.context.scene
+        changed = []
+        for key in ("frame", "frame_start", "frame_end"):
+            value = args.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                target = "frame_current" if key == "frame" else key
+                try:
+                    setattr(scene, target, max(0, value))
+                    changed.append(key)
+                except (AttributeError, TypeError, ValueError):
+                    pass
+        engine = args.get("engine")
+        if isinstance(engine, str) and engine:
+            try:
+                scene.render.engine = engine
+                changed.append("engine")
+            except (TypeError, ValueError):
+                return {"error": f"unknown render engine {engine}"}
+        if not changed:
+            return {"error": "pass frame, frame_start, frame_end or engine"}
+        return {"ok": True, "changed": changed}
 
     return {
         "get_scene_info": get_scene_info,
         "get_selected_objects": get_selected_objects,
         "get_object_info": get_object_info,
         "get_materials": get_materials,
+        "get_object_modifiers": get_object_modifiers,
         "move_object": move_object,
         "rotate_object": rotate_object,
         "scale_object": scale_object,
         "create_primitive": create_primitive,
         "delete_object": delete_object,
         "duplicate_object": duplicate_object,
-        "rename_object": lambda args, ctx: {"error": "not implemented"},
+        "rename_object": rename_object,
+        "select_object": select_object,
+        "frame_object": frame_object,
+        "set_object_visibility": set_object_visibility,
+        "set_object_color": set_object_color,
+        "create_material": create_material,
+        "assign_material": assign_material,
         "set_material_color": set_material_color,
+        "set_material_property": set_material_property,
+        "add_modifier": add_modifier,
+        "apply_boolean": apply_boolean,
+        "set_scene_setting": set_scene_setting,
     }
-
 
 def _sync_edit_topology(context, session: SessionService, obj, bm) -> None:
     """Debounced full snapshots when Edit Mode topology changes."""
@@ -4717,7 +5171,8 @@ def _sync_edit_topology(context, session: SessionService, obj, bm) -> None:
         return
     runtime["topology_due"].pop(uid, None)
     try:
-        payload = snapshot_bmesh(bm)
+        with runtime["perf"].measure("topology_read"):
+            payload = snapshot_bmesh(bm)
     except Exception:  # noqa: BLE001
         traceback.print_exc()
         return
@@ -4841,7 +5296,7 @@ def _sync_sculpt_mesh(context, session: SessionService, obj) -> None:
 def _sync_mesh(context) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
-    if session is None or not settings.sync_mesh or settings.paused or runtime.get("bootstrapping"):
+    if session is None or not settings.sync_mesh or settings.paused or runtime.get("bootstrapping") or runtime.get("replaying"):
         return
     active = context.active_object
     editing = active is not None and active.type == "MESH" and context.mode == "EDIT_MESH"
@@ -6172,6 +6627,11 @@ def _write_status(context, force: bool = False) -> None:
             "messages": messages,
             "leases": leases,
             "sync": sync_queue,
+            "broadcast_url": settings.broadcast_url,
+            "bridge_url": settings.bridge_url,
+            "bridge_clients": settings.bridge_clients,
+            "recording": settings.recording_info if settings.recording_active else "",
+            "perf": runtime["perf"].snapshot(),
             "blender": bpy.app.version_string,
             "addon": ADDON_VERSION,
             "pid": os.getpid(),
@@ -6292,7 +6752,7 @@ def bmp_smooth_tick():
 def _sync_edit_selection(context) -> None:
     """Send the active Edit Mode vertex selection at up to ~8 Hz."""
     session: SessionService | None = runtime.get("session")
-    if session is None:
+    if session is None or runtime.get("replaying"):
         return
     now = time.monotonic()
     if now - runtime["last_edit_sel"] < 0.12:
@@ -6387,6 +6847,7 @@ def bmp_tick():
     if context is None or context.window_manager is None:
         return TICK
     try:
+        tick_started = time.perf_counter()
         _poll_control(context)
         _ensure_bookmarks(context)
         _heartbeat_tick(context)
@@ -6407,14 +6868,22 @@ def bmp_tick():
                 break
             started = time.monotonic()
             recorder = runtime.get("recording")
-            if recorder is not None:
+            if recorder is not None and not runtime.get("replaying"):
                 try:
                     recorder.record(kind, body)
                 except Exception:  # noqa: BLE001
                     pass
+            publisher = runtime.get("broadcast")
+            if publisher is not None:
+                try:
+                    publisher.publish(kind, body)
+                except Exception:  # noqa: BLE001
+                    pass
             _handle_event(context, kind, body)
             times = runtime.setdefault("apply_times", [])
-            times.append((time.monotonic() - started) * 1000.0)
+            elapsed = (time.monotonic() - started) * 1000.0
+            times.append(elapsed)
+            runtime["perf"].record("apply", elapsed)
             if len(times) > 240:
                 del times[: len(times) - 240]
         if session is not None:
@@ -6436,6 +6905,8 @@ def bmp_tick():
         _maybe_auto_checkpoint(context)
         _pump_scene_bootstrap(context)
         _sync_remote_visuals(context)
+        with runtime["perf"].measure("bridge_pump"):
+            _pump_bridge(context)
         _apply_follow(context)
         if (
             runtime.get("bootstrapping")
@@ -6448,6 +6919,9 @@ def bmp_tick():
             _prime_objects(context)
         # Keep writing while offline too, so the desktop app always sees the
         # current state and never stays stuck on "connected".
+        runtime["perf"].record(
+            "tick", (time.perf_counter() - tick_started) * 1000.0
+        )
         _write_status(context)
         if session is not None and not session.is_alive():
             settings = context.window_manager.bmp
@@ -6847,6 +7321,250 @@ class BMP_OT_trust_host(Operator):
         return {"FINISHED"}
 
 
+def _export_mesh_data(obj, max_vertices: int = 20000):
+    """Return local-space triangles for an object, or None if too large."""
+    if obj.type != "MESH":
+        return None
+    evaluated = None
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        evaluated = obj.evaluated_get(depsgraph)
+        mesh = evaluated.to_mesh()
+        try:
+            count = len(mesh.vertices)
+            if count == 0 or count > max_vertices:
+                return None
+            positions = np.empty(count * 3, dtype=np.float32)
+            mesh.vertices.foreach_get("co", positions)
+            mesh.calc_loop_triangles()
+            triangles = len(mesh.loop_triangles)
+            if triangles == 0:
+                return None
+            indices = np.empty(triangles * 3, dtype=np.uint32)
+            try:
+                mesh.loop_triangles.foreach_get("vertices", indices)
+            except (AttributeError, TypeError, RuntimeError):
+                values = []
+                for triangle in mesh.loop_triangles:
+                    values.extend(triangle.vertices)
+                indices = np.asarray(values, dtype=np.uint32)
+            normals = np.empty(count * 3, dtype=np.float32)
+            try:
+                mesh.vertex_normals.foreach_get("vector", normals)
+            except (AttributeError, TypeError, RuntimeError):
+                normals = np.zeros(count * 3, dtype=np.float32)
+            return {
+                "positions": [round(float(value), 5) for value in positions],
+                "normals": [round(float(value), 5) for value in normals],
+                "indices": [int(value) for value in indices],
+            }
+        finally:
+            evaluated.to_mesh_clear()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _exported_object(obj, include_mesh: bool = False):
+    uid = obj.get("bmp_uuid")
+    if not uid:
+        uid = str(uuid.uuid4())
+        obj["bmp_uuid"] = uid
+    dimensions = obj.dimensions
+    metadata = {
+        "type": obj.type,
+        "euler": [round(float(value), 6) for value in obj.rotation_euler],
+        "materials": [
+            slot.material.name
+            for slot in getattr(obj, "material_slots", [])
+            if slot.material is not None
+        ],
+        "parent": obj.parent.get("bmp_uuid") if obj.parent is not None else None,
+    }
+    return cross_engine.ExportedObject(
+        uid=uid,
+        name=obj.name,
+        kind=obj.type.lower(),
+        matrix=[float(value) for row in obj.matrix_world for value in row],
+        bounds=(
+            0.0,
+            0.0,
+            0.0,
+            float(dimensions.x),
+            float(dimensions.y),
+            float(dimensions.z),
+        ),
+        metadata=metadata,
+        visible=not bool(obj.hide_viewport),
+        mesh=_export_mesh_data(obj) if include_mesh else None,
+    )
+
+
+def _exported_materials():
+    result = []
+    for material in bpy.data.materials:
+        try:
+            data = material_values(material)
+        except Exception:  # noqa: BLE001
+            continue
+        base = data.get("base_color", (1.0, 1.0, 1.0, 1.0))
+        result.append(
+            cross_engine.ExportedMaterial(
+                name=material.name,
+                base_color=tuple(float(value) for value in list(base)[:4])
+                + (1.0,) * max(0, 4 - len(list(base)[:4])),
+                metallic=float(data.get("metallic", 0.0) or 0.0),
+                roughness=float(data.get("roughness", 0.5) or 0.5),
+            )
+        )
+    return result
+
+
+def _start_broadcast(settings):
+    server = runtime.get("broadcast")
+    if server is not None:
+        return server
+    for offset in range(0, 10):
+        candidate = broadcast.BroadcastServer(
+            port=settings.broadcast_port + offset,
+            title=f"Blendermp - {settings.name or settings.code or 'session'}",
+        )
+        try:
+            candidate.start()
+        except OSError:
+            candidate.stop()
+            continue
+        runtime["broadcast"] = candidate
+        settings.broadcast_active = True
+        settings.broadcast_port = candidate.port
+        settings.broadcast_url = candidate.url
+        return candidate
+    return None
+
+
+def _stop_broadcast(settings):
+    server = runtime.get("broadcast")
+    runtime["broadcast"] = None
+    settings.broadcast_active = False
+    settings.broadcast_url = ""
+    if server is not None:
+        server.stop()
+
+
+def _start_bridge(settings, context):
+    server = runtime.get("bridge")
+    if server is not None:
+        return server
+    registry = cross_engine.EngineRegistry.default()
+    exporter = registry.get(settings.bridge_engine) or registry.get("unity")
+    for offset in range(0, 10):
+        candidate = cross_engine.BridgeServer(
+            port=settings.bridge_port + offset, engine=exporter.name
+        )
+        try:
+            candidate.start()
+        except OSError:
+            candidate.stop()
+            continue
+        runtime["bridge"] = candidate
+        runtime["bridge_exporter"] = exporter
+        runtime["bridge_shadow"] = {}
+        runtime["bridge_last"] = 0.0
+        runtime["bridge_materials_at"] = 0.0
+        settings.bridge_active = True
+        settings.bridge_port = candidate.port
+        settings.bridge_url = candidate.url
+        objects = [
+            _exported_object(obj, include_mesh=settings.bridge_meshes)
+            for obj in context.scene.objects
+            if not obj.get("bmp_ping")
+        ]
+        candidate.publish_scene(exporter, objects, _exported_materials())
+        return candidate
+    return None
+
+
+def _stop_bridge(settings):
+    server = runtime.get("bridge")
+    runtime["bridge"] = None
+    runtime["bridge_exporter"] = None
+    runtime["bridge_shadow"] = {}
+    settings.bridge_active = False
+    settings.bridge_url = ""
+    settings.bridge_clients = 0
+    if server is not None:
+        server.stop()
+
+
+def _pump_bridge(context) -> None:
+    """Push changed objects to connected engines at 10 Hz."""
+    bridge = runtime.get("bridge")
+    exporter = runtime.get("bridge_exporter")
+    if bridge is None or exporter is None:
+        return
+    settings = context.window_manager.bmp
+    settings.bridge_clients = bridge.client_count
+    now = time.monotonic()
+    if now - runtime.get("bridge_last", 0.0) < 0.1:
+        return
+    runtime["bridge_last"] = now
+    shadow = runtime.get("bridge_shadow", {})
+    seen = set()
+    for obj in context.scene.objects:
+        if obj.get("bmp_ping"):
+            continue
+        uid = obj.get("bmp_uuid")
+        if not uid:
+            uid = str(uuid.uuid4())
+            obj["bmp_uuid"] = uid
+        seen.add(uid)
+        signature = (
+            tuple(round(float(value), 5) for row in obj.matrix_world for value in row),
+            bool(obj.hide_viewport),
+            tuple(
+                slot.material.name if slot.material is not None else ""
+                for slot in getattr(obj, "material_slots", [])
+            ),
+        )
+        if shadow.get(uid) == signature:
+            continue
+        is_new = uid not in shadow
+        shadow[uid] = signature
+        try:
+            bridge.publish_object(
+                exporter,
+                _exported_object(
+                    obj, include_mesh=is_new and settings.bridge_meshes
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    for uid in list(shadow):
+        if uid not in seen:
+            shadow.pop(uid, None)
+            try:
+                bridge.publish_remove(uid)
+            except Exception:  # noqa: BLE001
+                pass
+    if now - runtime.get("bridge_materials_at", 0.0) > 2.0:
+        runtime["bridge_materials_at"] = now
+        try:
+            bridge.publish_materials(exporter, _exported_materials())
+        except Exception:  # noqa: BLE001
+            pass
+    if settings.bridge_meshes and bridge.client_count:
+        if now - runtime.get("bridge_scene_at", 0.0) > 5.0:
+            runtime["bridge_scene_at"] = now
+            objects = [
+                _exported_object(obj, include_mesh=True)
+                for obj in context.scene.objects
+                if not obj.get("bmp_ping")
+            ]
+            try:
+                bridge.publish_scene(exporter, objects, _exported_materials())
+            except Exception:  # noqa: BLE001
+                pass
+
+
 class BMP_OT_ai_ask(Operator):
     bl_idname = "bmp.ai_ask"
     bl_label = "Ask"
@@ -6866,7 +7584,9 @@ class BMP_OT_ai_ask(Operator):
             client = ai_core.OllamaClient(settings.ai_url, settings.ai_model)
             runtime["ai_session"] = ai_core.AISession(client, tools)
         else:
-            runtime["ai_session"].client = ai_core.OllamaClient(settings.ai_url, settings.ai_model)
+            runtime["ai_session"].client = ai_core.OllamaClient(
+                settings.ai_url, settings.ai_model
+            )
         prompt = settings.ai_prompt.strip()
         if not prompt:
             self.report({"ERROR"}, "Type a prompt first")
@@ -6874,10 +7594,37 @@ class BMP_OT_ai_ask(Operator):
         settings.ai_status = "thinking"
         settings.ai_pending_text = ""
         settings.ai_pending_count = 0
+        settings.ai_reply = ""
+        settings.last_error = ""
         runtime["ai_pending_edits"] = []
-        runtime["ai_session"].ask(prompt, callback=_ai_callback)
+        runtime["ai_session"].ask(
+            prompt, callback=_ai_callback, scene_context=_ai_scene_context(context)
+        )
         self.report({"INFO"}, "Thinking...")
         return {"FINISHED"}
+
+
+class BMP_OT_ai_test(Operator):
+    bl_idname = "bmp.ai_test"
+    bl_label = "Test connection"
+    bl_description = "Check that Ollama is running and the model is installed"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        from .core import ai as ai_core
+
+        client = ai_core.OllamaClient(settings.ai_url, settings.ai_model)
+        ok, message = client.health()
+        if ok:
+            settings.ai_status = "ready"
+            self.report({"INFO"}, message)
+        else:
+            settings.ai_status = "error"
+            settings.last_error = message[:180]
+            settings.last_error_code = "AI_ERROR"
+            self.report({"ERROR"}, message)
+        return {"FINISHED"} if ok else {"CANCELLED"}
 
 
 class BMP_OT_ai_apply_all(Operator):
@@ -6892,12 +7639,25 @@ class BMP_OT_ai_apply_all(Operator):
         if session is None or not session.pending:
             self.report({"INFO"}, "No pending edits")
             return {"CANCELLED"}
+        results = list(session.pending)
         applied = session.apply_all(context)
-        settings.ai_pending_text = ""
-        settings.ai_pending_count = 0
-        runtime["ai_pending_edits"] = []
-        settings.ai_status = "idle"
-        self.report({"INFO"}, f"Applied {applied} edit(s)")
+        failed = [
+            edit
+            for edit in results
+            if edit.result
+            and (not edit.result.get("ok", True) or edit.result.get("error"))
+        ]
+        settings.ai_pending_text = "\n".join(
+            f"{edit.summary} -> {edit.result.get('error', 'failed') if edit.result else 'failed'}"
+            for edit in failed[:6]
+        )
+        settings.ai_pending_count = len(failed)
+        runtime["ai_pending_edits"] = failed
+        settings.ai_status = "idle" if not failed else "error"
+        if failed:
+            settings.last_error = f"{len(failed)} AI edit(s) failed"
+            settings.last_error_code = "AI_ERROR"
+        self.report({"INFO"}, f"Applied {applied} edit(s), {len(failed)} failed")
         return {"FINISHED"}
 
 
@@ -6915,6 +7675,7 @@ class BMP_OT_ai_clear(Operator):
         settings.ai_pending_text = ""
         settings.ai_pending_count = 0
         settings.ai_status = "idle"
+        settings.ai_reply = ""
         runtime["ai_pending_edits"] = []
         self.report({"INFO"}, "Cleared")
         return {"FINISHED"}
@@ -6927,13 +7688,21 @@ class BMP_OT_record_start(Operator):
     bl_options = {"REGISTER"}
 
     def execute(self, context):
-        recorder = recording.Recorder(str(control.data_dir() / "recordings" / f"session-{int(time.time())}.jsonl"))
+        settings = context.window_manager.bmp
+        if runtime.get("recording") is not None:
+            self.report({"INFO"}, "Already recording")
+            return {"CANCELLED"}
+        recorder = recording.Recorder(
+            str(control.data_dir() / "recordings" / f"session-{int(time.time())}.jsonl")
+        )
         try:
             recorder.start()
         except Exception as exc:  # noqa: BLE001
             self.report({"ERROR"}, f"Could not start recording: {exc}")
             return {"CANCELLED"}
         runtime["recording"] = recorder
+        settings.recording_active = True
+        settings.recording_info = recorder.path.name
         _push_message(context, "system", f"Recording to {recorder.path.name}")
         self.report({"INFO"}, f"Recording to {recorder.path.name}")
         return {"FINISHED"}
@@ -6946,6 +7715,7 @@ class BMP_OT_record_stop(Operator):
     bl_options = {"REGISTER"}
 
     def execute(self, context):
+        settings = context.window_manager.bmp
         recorder = runtime.get("recording")
         if recorder is None:
             self.report({"INFO"}, "No recording active")
@@ -6953,44 +7723,160 @@ class BMP_OT_record_stop(Operator):
         count = recorder.event_count
         recorder.stop()
         runtime["recording"] = None
+        settings.recording_active = False
+        settings.recording_info = f"{count} events"
         _push_message(context, "system", f"Recording stopped ({count} events)")
         self.report({"INFO"}, f"Recording stopped ({count} events)")
+        return {"FINISHED"}
+
+
+class BMP_OT_broadcast_start(Operator):
+    bl_idname = "bmp.broadcast_start"
+    bl_label = "Start broadcast"
+    bl_description = "Serve a live read-only view of this session in a browser"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        server = _start_broadcast(settings)
+        if server is None:
+            self.report({"ERROR"}, "Could not bind a broadcast port")
+            return {"CANCELLED"}
+        _push_message(context, "system", f"Live view: {settings.broadcast_url}")
+        self.report({"INFO"}, f"Live view: {settings.broadcast_url}")
+        return {"FINISHED"}
+
+
+class BMP_OT_broadcast_stop(Operator):
+    bl_idname = "bmp.broadcast_stop"
+    bl_label = "Stop broadcast"
+    bl_description = "Stop the live browser view"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        _stop_broadcast(settings)
+        _push_message(context, "system", "Live view stopped")
+        return {"FINISHED"}
+
+
+class BMP_OT_broadcast_open(Operator):
+    bl_idname = "bmp.broadcast_open"
+    bl_label = "Open live view"
+    bl_description = "Open the live session view in the default browser"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        if not settings.broadcast_url:
+            self.report({"ERROR"}, "Start the broadcast first")
+            return {"CANCELLED"}
+        try:
+            import webbrowser
+
+            webbrowser.open(settings.broadcast_url)
+        except Exception as exc:  # noqa: BLE001
+            self.report({"ERROR"}, f"Could not open a browser: {exc}")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class BMP_OT_bridge_start(Operator):
+    bl_idname = "bmp.bridge_start"
+    bl_label = "Start bridge"
+    bl_description = "Stream this scene to a Unity, Unreal or Godot receiver"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        server = _start_bridge(settings, context)
+        if server is None:
+            self.report({"ERROR"}, "Could not bind a bridge port")
+            return {"CANCELLED"}
+        _push_message(
+            context,
+            "system",
+            f"{settings.bridge_engine.title()} bridge: {settings.bridge_url}",
+        )
+        self.report({"INFO"}, f"Bridge: {settings.bridge_url}")
+        return {"FINISHED"}
+
+
+class BMP_OT_bridge_stop(Operator):
+    bl_idname = "bmp.bridge_stop"
+    bl_label = "Stop bridge"
+    bl_description = "Stop the cross-engine bridge"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        _stop_bridge(settings)
+        _push_message(context, "system", "Cross-engine bridge stopped")
         return {"FINISHED"}
 
 
 class BMP_OT_replay(Operator):
     bl_idname = "bmp.replay"
     bl_label = "Replay latest"
-    bl_description = "Replay the most recent recording into this session"
+    bl_description = "Replay the most recent recording into this scene"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
+        settings = context.window_manager.bmp
         if runtime.get("recording") is not None:
             self.report({"ERROR"}, "Stop the active recording first")
             return {"CANCELLED"}
+        if runtime.get("replaying"):
+            self.report({"ERROR"}, "A replay is already running")
+            return {"CANCELLED"}
         directory = control.data_dir() / "recordings"
-        files = sorted(directory.glob("*.jsonl"), key=lambda path: path.stat().st_mtime, reverse=True) if directory.exists() else []
-        if not files:
+        recordings = recording.list_recordings(directory, 1)
+        if not recordings:
             self.report({"ERROR"}, "No recording found")
             return {"CANCELLED"}
-        replay = recording.Replay(str(files[0]))
+        path = recordings[0].path
+        replay = recording.Replay(str(path))
+        runtime["replay_cancel"] = replay
+        runtime["replaying"] = True
 
         def sink(kind, body):
             runtime["inbox"].put((kind, body))
 
         def worker():
             try:
-                replay.play(sink, speed=1.0)
+                replay.play(sink, speed=max(0.1, float(settings.replay_speed)))
             except Exception:  # noqa: BLE001
                 pass
+            finally:
+                runtime["replaying"] = False
+                runtime["replay_cancel"] = None
 
         import threading
 
         threading.Thread(target=worker, name="bmp-replay", daemon=True).start()
-        _push_message(context, "system", f"Replaying {files[0].name}")
-        self.report({"INFO"}, f"Replaying {files[0].name}")
+        _push_message(
+            context,
+            "system",
+            f"Replaying {path.name} ({len(replay.events)} events)",
+        )
+        self.report({"INFO"}, f"Replaying {path.name}")
         return {"FINISHED"}
 
+
+class BMP_OT_replay_stop(Operator):
+    bl_idname = "bmp.replay_stop"
+    bl_label = "Stop replay"
+    bl_description = "Stop the active replay"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        replay = runtime.get("replay_cancel")
+        if replay is None:
+            self.report({"INFO"}, "No replay active")
+            return {"CANCELLED"}
+        replay.cancel()
+        self.report({"INFO"}, "Stopping replay")
+        return {"FINISHED"}
 
 class BMP_OT_ping(Operator):
     bl_idname = "bmp.ping"
@@ -7662,11 +8548,18 @@ classes = (
     BMP_OT_laser,
     BMP_OT_trust_host,
     BMP_OT_ai_ask,
+    BMP_OT_ai_test,
     BMP_OT_ai_apply_all,
     BMP_OT_ai_clear,
     BMP_OT_record_start,
     BMP_OT_record_stop,
     BMP_OT_replay,
+    BMP_OT_replay_stop,
+    BMP_OT_broadcast_start,
+    BMP_OT_broadcast_stop,
+    BMP_OT_broadcast_open,
+    BMP_OT_bridge_start,
+    BMP_OT_bridge_stop,
     BMP_OT_ping_mark,
     BMP_OT_follow_user,
     BMP_OT_share_images,
@@ -7754,6 +8647,12 @@ def unregister() -> None:
         runtime["session"] = None
     try:
         settings = bpy.context.window_manager.bmp
+        _stop_broadcast(settings)
+        _stop_bridge(settings)
+        recorder = runtime.get("recording")
+        if recorder is not None:
+            recorder.stop()
+            runtime["recording"] = None
         settings.state = "offline"
         settings.users.clear()
         runtime["last_status"] = 0.0

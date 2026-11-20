@@ -5,12 +5,12 @@ Blender and **docks the live window over the app viewport** (a native owned
 window, not video capture, so it keeps full GPU performance and avoids the black
 surface that cross-process re-parenting causes on some GPUs).
 
-> **Status: alpha vertical slice.** Hosting, the public server browser, TLS
-> pinning, presence, chat, object transforms, mesh streaming, live Edit Mode
-> vertex edits and window docking work.
-> Cross-network sessions use the self-hosted relay or the Cloudflare Worker hub.
-> Edit-mode topology (extrude/subdivide), full node graphs, animation and
-> simulations are not implemented yet.
+> **Status: 0.9.0 collaboration foundation.** Hosting, the public server
+> browser, TLS pinning, presence, chat, object transforms, mesh streaming, live
+> Edit Mode topology, animation, sculpt, materials/textures, asset bundles,
+> roles, checkpoints, an Ollama copilot, session recording/replay, a live
+> broadcast page and a cross-engine bridge all ship in this build.
+> Pre-1.0 builds require an exact version match on both PCs.
 
 ![Blendermp UI](docs/ui-preview.jpeg)
 
@@ -32,7 +32,22 @@ surface that cross-process re-parenting causes on some GPUs).
 * **Live Edit Mode topology**: vertex drags stream as deltas, and structural
   changes (extrude, subdivide, bevel, delete) send a debounced full topology
   snapshot after the operation settles. The receiver rebuilds the mesh while
-  remaining in Object Mode.
+  remaining in Object Mode. Large snapshots use a C-side read and a cheaper
+  compression pass.
+* **AI copilot (local Ollama)**: a chat panel proposes structured edits
+  (transforms, primitives, materials, modifiers, booleans, scene settings) with
+  a scene snapshot for context. Nothing is applied until you confirm; failed
+  edits stay in the list with their error.
+* **Recording, replay and live broadcast**: every local send and remote event is
+  tapped into a JSONL recording. Replay feeds the events back at their original
+  timing. A token-protected localhost page streams the same events to a browser
+  over Server-Sent Events for debugging or a live audience.
+* **Cross-engine bridge**: stream objects, transforms, materials and triangle
+  meshes to Unity, Unreal or Godot over newline-delimited JSON. Reference
+  receivers live in `integrations/`.
+* **Measured performance**: the addon publishes p50/p95/p99 budgets for tick,
+  apply, topology reads and the bridge in `status.json`; the topology snapshot
+  uses `BMesh.to_mesh` + `foreach_get` instead of per-element Python loops.
 * **One editor per object**: selecting an object claims an edit lease. Other
   players see it locked (unselectable) and cannot edit it until the owner
   deselects or leaves. The active object name is shown for each player.

@@ -67,6 +67,9 @@ if ($null -ne $initial) {
     Check ($initial.parent -eq 'RigRoot') "initial parent was '$($initial.parent)'"
     Check ([math]::Abs($initial.world[0] - 3.0) -le 0.01) "initial world x was $($initial.world[0])"
     Check ($initial.modifiers -contains 'SUBSURF' -and $initial.modifiers -contains 'BEVEL') "initial modifiers were $($initial.modifiers -join ',')"
+    Check ($initial.modifiers -contains 'BOOLEAN') "initial modifiers were $($initial.modifiers -join ',')"
+    Check ($initial.boolean.operation -eq 'DIFFERENCE') "initial boolean operation was $($initial.boolean.operation)"
+    Check ($initial.boolean.object -eq 'Cutter') "initial boolean operand was $($initial.boolean.object)"
     Check ($initial.subsurf_levels -eq 2) "initial subsurf levels were $($initial.subsurf_levels)"
     Check ([math]::Abs($initial.color[0] - 0.2) -le 0.01 -and [math]::Abs($initial.color[1] - 0.8) -le 0.01) "initial colour was $($initial.color -join ',')"
     Check ($initial.hide_render -eq $true) 'initial hide_render was not true'
@@ -84,6 +87,8 @@ if ($null -ne $settled) {
 if ($null -ne $hostResult -and $null -ne $settled) {
     Check ($hostResult.summary.subsurf_levels -eq $settled.subsurf_levels) 'host/client subsurf levels differ'
     Check (($hostResult.summary.collections -join ',') -eq ($settled.collections -join ',')) 'host/client collections differ'
+    Check ($hostResult.summary.boolean.operation -eq $settled.boolean.operation) 'host/client boolean operation differ'
+    Check ($hostResult.summary.boolean.object -eq $settled.boolean.object) 'host/client boolean operand differ'
 }
 
 Write-Host ("client: parent={0} world={1} modifiers={2} subsurf={3} color={4} hide_render={5} collections={6} coll_render={7} coll_view={8} reason={9}" -f $settled.parent, ($settled.world -join ','), ($settled.modifiers -join ','), $settled.subsurf_levels, ($settled.color -join ','), $settled.hide_render, ($settled.collections -join ','), $settled.collection_hide_render, $settled.collection_hide_viewport, $client.reason)

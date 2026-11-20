@@ -285,7 +285,7 @@ def _safe_int(value, low: int, high: int, default: int = 0) -> int:
 def write_status(data: dict[str, Any]) -> None:
     """Write a bounded, sanitised status document atomically."""
     safe: dict[str, Any] = {}
-    for key in ("state", "code", "name", "addon", "blender", "fingerprint", "verify_code", "last_error", "error_code", "role", "overlay_info", "direct_code", "identity_public", "identity_signature", "identity_descriptor"):
+    for key in ("state", "code", "name", "addon", "blender", "fingerprint", "verify_code", "last_error", "error_code", "role", "overlay_info", "direct_code", "identity_public", "identity_signature", "identity_descriptor", "broadcast_url", "bridge_url", "recording"):
         value = data.get(key)
         if isinstance(value, str):
             safe[key] = value[:512]
@@ -308,7 +308,7 @@ def write_status(data: dict[str, Any]) -> None:
     rtt = data.get("rtt_ms")
     if isinstance(rtt, (int, float)) and not isinstance(rtt, bool):
         safe["rtt_ms"] = round(max(0.0, min(5000.0, float(rtt))), 1)
-    for key in ("bytes_in", "bytes_out", "pid", "uptime", "total_bytes"):
+    for key in ("bytes_in", "bytes_out", "pid", "uptime", "total_bytes", "bridge_clients"):
         value = data.get(key)
         if isinstance(value, int) and not isinstance(value, bool):
             safe[key] = max(-1, min(value, 1 << 62))
@@ -364,6 +364,27 @@ def write_status(data: dict[str, Any]) -> None:
             for item in sync[:64]
             if isinstance(item, dict)
         ]
+
+    perf = data.get("perf")
+    if isinstance(perf, dict):
+        budgets = perf.get("budgets")
+        if isinstance(budgets, dict):
+            safe["perf"] = {
+                "violations": [
+                    str(name)[:48]
+                    for name in (perf.get("violations") or [])[:16]
+                    if isinstance(name, str)
+                ],
+                "budgets": {
+                    str(name)[:48]: {
+                        "max_ms": round(float(item.get("max_ms", 0.0) or 0.0), 3),
+                        "p95_ms": round(float(item.get("p95_ms", 0.0) or 0.0), 3),
+                        "ok": bool(item.get("ok", True)),
+                    }
+                    for name, item in list(budgets.items())[:16]
+                    if isinstance(item, dict)
+                },
+            }
 
     payload = json.dumps(safe, separators=(",", ":"))[:MAX_STATUS_BYTES]
     _atomic_write(status_path(), payload, ".status-")

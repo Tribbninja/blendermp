@@ -116,6 +116,14 @@ def test_status_is_bounded_and_atomic(appdir):
             "bytes_in": 10**30,
             "error_code": "PROTOCOL",
             "scene": {"objects": 12, "meshes": 8, "vertices": 5000, "materials": 4, "images": 2, "collections": 3},
+            "broadcast_url": "http://127.0.0.1:7102/?token=abc",
+            "bridge_url": "tcp://127.0.0.1:7103",
+            "bridge_clients": 2,
+            "recording": "session.jsonl",
+            "perf": {
+                "violations": ["tick"],
+                "budgets": {"tick": {"max_ms": 8.0, "p95_ms": 9.5, "ok": False}},
+            },
             "unknown": "ignored",
         }
     )
@@ -126,6 +134,11 @@ def test_status_is_bounded_and_atomic(appdir):
     assert body["bytes_in"] == (1 << 62)
     assert body["error_code"] == "PROTOCOL"
     assert body["scene"]["vertices"] == 5000
+    assert body["broadcast_url"].startswith("http://127.0.0.1:7102")
+    assert body["bridge_clients"] == 2
+    assert body["recording"] == "session.jsonl"
+    assert body["perf"]["budgets"]["tick"]["p95_ms"] == 9.5
+    assert body["perf"]["violations"] == ["tick"]
 
 
 def test_tls_certificate_and_pinning(appdir):

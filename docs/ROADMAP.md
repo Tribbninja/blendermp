@@ -7,6 +7,7 @@ streaming, edit leases, presence 2.0, exact remote application, durable settings
 strict version gate, lease request UX, server-enforced roles, optional LAN direct).
 
 Progress log:
+- [x] 2026-11-21: 0.9.0: finished the collaboration foundation: Ollama copilot with 23 tools, scene context and per-edit results; send-path recording + replay + token-protected SSE live broadcast; cross-engine bridge for Unity/Unreal/Godot with transforms, materials and triangle meshes; perf registry published in `status.json`; topology snapshot fast path (`BMesh.to_mesh` + `foreach_get`) and a cheaper compression level for large meshes; object rename sync.
 - [x] 2026-11-20: `version.json` + `scripts/check_version.py` + test; build fails on drift.
 - [x] 2026-11-20: durable `%LOCALAPPDATA%\Blendermp\settings.json`; host key, public toggle and layout survive reinstall; localStorage migrated once.
 - [x] 2026-11-20: CI skeleton for Python tests + version check + JS syntax.
@@ -799,6 +800,38 @@ join a session; security review with no high findings.
 
 Exit gate: all polish items have tests; accessibility checklist passes; 1.0
 release checklist complete.
+
+### 11.1 0.9.0 - Collaboration foundation (shipped)
+
+This release turns the Phase 6 scaffolds into working features:
+
+* **AI copilot** (`core/ai.py`, `__init__._ai_handlers`): Ollama `/api/chat`
+  with 23 tools, a plain-text scene snapshot in the prompt, JSON-string
+  argument tolerance, per-edit result reporting, and an explicit
+  propose/confirm/apply flow. Failed edits remain visible with their error.
+* **Recording and replay** (`core/recording.py`, `session.event_sink`): every
+  local send and every remote inbox event is recorded as JSONL. `Replay` feeds
+  events back with original timing and a cancel switch. Recordings list with
+  event counts and duration.
+* **Live broadcast** (`core/broadcast.py`): a token-protected localhost HTTP
+  server serves a self-contained page and an SSE stream. Chat, transforms,
+  objects, locks and errors are shown live. No external JS, no second window.
+* **Cross-engine bridge** (`core/cross_engine.py`, `integrations/`): TCP
+  newline-delimited JSON. Unity, Unreal and Godot receivers; full scene
+  snapshots with triangle meshes up to 20k vertices, per-object transform
+  deltas, materials every 2 seconds, remove messages and ping/pong.
+* **Performance** (`core/perf.py`, `sync/mesh.py`): p50/p95/p99 budgets in
+  `status.json`; `PerfRegistry` for tick/apply/topology/bridge. The topology
+  snapshot uses `BMesh.to_mesh` + `foreach_get` (about an order of magnitude
+  faster than the old Python loops on 100k vertices) with a portable fallback,
+  and large snapshots use zlib level 3 instead of 9.
+* **Fidelity**: object renames now sync (`OBJECT_RENAME`), manual renames
+  are detected by the transform poller, and Boolean modifiers sync their
+  operation and operand UID so live booleans match on both sides. The details
+  e2e suite asserts the Boolean target.
+* **Tests**: 204 unit tests and 12 two-Blender/headless e2e suites, including
+  `run_foundation.ps1` for AI tools, mesh export, bridge, broadcast and the
+  recording tap.
 
 ---
 

@@ -304,6 +304,7 @@ class SessionService:
     ):
         self.inbox = inbox
         self.is_host = host
+        self.event_sink = None
         self.code = code.strip().upper()
         self.name = clean_name(name)
         self.color = clean_color(color)
@@ -528,6 +529,15 @@ class SessionService:
         if loop and loop.is_running():
             self._outbox.put(frame)
             loop.call_soon_threadsafe(self._wake.set)
+
+    def _tap(self, kind: str, body: dict) -> None:
+        sink = self.event_sink
+        if sink is None:
+            return
+        try:
+            sink(kind, body)
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------ host
     async def _start_host(self) -> None:
@@ -1188,6 +1198,23 @@ class SessionService:
             self._revs[uid] = self._revs.get(uid, 0) + 1
             self._broadcast(frame, exclude=peer.peer_id)
             self._emit("object_delete", {"uuid": uid})
+            return
+
+        if frame.type == MessageType.OBJECT_RENAME:
+            body = self._json(frame, 1024)
+            uid = body.get("uuid")
+            name = clean_text(body.get("name"), MAX_NAME)
+            if not isinstance(uid, str) or not name:
+                raise Violation("invalid object rename")
+            if not self._may_edit(peer, uid, now):
+                return
+            self.bump_rev(uid)
+            message = {"uuid": uid, "name": name}
+            self._broadcast(
+                protocol.json_frame(MessageType.OBJECT_RENAME, message),
+                exclude=peer.peer_id,
+            )
+            self._emit("object_rename", message)
             return
 
         if frame.type == MessageType.MATERIAL_UPDATE:
@@ -2338,6 +2365,14 @@ class SessionService:
                 pass
             return
 
+        if frame.type == MessageType.OBJECT_RENAME:
+            body = self._json(frame, 1024)
+            uid = body.get("uuid")
+            name = clean_text(body.get("name"), MAX_NAME)
+            if isinstance(uid, str) and name:
+                self._emit("object_rename", {"uuid": uid, "name": name})
+            return
+
         if frame.type == MessageType.MATERIAL_UPDATE:
             body = self._json(frame, 64 * 1024)
             payload = material_payload.sanitize(body.get("material"))
@@ -2706,6 +2741,7 @@ class SessionService:
         except Exception:  # noqa: BLE001
             return
         self._enqueue(Frame(type=MessageType.TRANSFORM, channel=Channel.TRANSFORM, payload=payload))
+        self._tap("transform", {"uuid": uid, "matrix": [float(value) for value in matrix]})
 
     def send_pose(self, uid: str, bones: list) -> None:
         try:
@@ -2713,6 +2749,7 @@ class SessionService:
         except Exception:  # noqa: BLE001
             return
         self._enqueue(Frame(type=MessageType.POSE, channel=Channel.TRANSFORM, payload=body.payload))
+        self._tap("pose", {"uuid": uid, "bones": bones})
 
     def send_shape_keys(self, uid: str, values: dict) -> None:
         try:
@@ -2720,6 +2757,7 @@ class SessionService:
         except Exception:  # noqa: BLE001
             return
         self._enqueue(frame)
+        self._tap("shape_keys", {"uuid": uid, "values": values})
 
     def send_action(self, uid: str, action: dict | None, nla: dict | None = None) -> None:
         try:
@@ -2730,6 +2768,7 @@ class SessionService:
         if len(frame.payload) > 16 * 1024 * 1024:
             return
         self._enqueue(Frame(type=MessageType.ACTION, channel=Channel.BULK, payload=frame.payload))
+        self._tap("action", body)
 
     def send_mesh(self, obj, kind: str, payload: bytes, rev: int = 0) -> None:
         uid = obj.get("bmp_uuid")
@@ -2743,6 +2782,10 @@ class SessionService:
             return
         type_ = MessageType.MESH_DELTA if kind == "delta" else MessageType.MESH_SNAPSHOT
         self._enqueue(Frame(type=type_, channel=Channel.MESH, payload=body))
+        self._tap(
+            "mesh_delta" if kind == "delta" else "mesh_snapshot",
+            {"uuid": uid, "payload": payload, "rev": int(rev)},
+        )
 
     def send_ping(self) -> None:
         self._enqueue(protocol.json_frame(MessageType.PING, {"t": time.time()}))
@@ -2785,8 +2828,16 @@ class SessionService:
                     },
                 )
             self._emit("transfer_done", {"direction": "send", "id": identity.hex()})
+            self._tap(
+                "object_create",
+                {"uuid": uid, "kind": kind, "meta": meta, "geometry": geometry},
+            )
             return True
         self._enqueue(Frame(type=MessageType.OBJECT_CREATE, channel=Channel.MESH, payload=payload))
+        self._tap(
+            "object_create",
+            {"uuid": uid, "kind": kind, "meta": meta, "geometry": geometry},
+        )
         return True
 
     def send_object_delete(self, uid: str) -> None:
@@ -2795,6 +2846,19 @@ class SessionService:
         except object_payload.ObjectPayloadError:
             return
         self._enqueue(Frame(type=MessageType.OBJECT_DELETE, channel=Channel.CONTROL, payload=payload))
+        self._tap("object_delete", {"uuid": uid})
+
+    def send_object_rename(self, uid: str, name: str) -> bool:
+        if not isinstance(uid, str) or not isinstance(name, str) or not name.strip():
+            return False
+        clean = name.strip()[:48]
+        self._enqueue(
+            protocol.json_frame(
+                MessageType.OBJECT_RENAME, {"uuid": uid, "name": clean}
+            )
+        )
+        self._tap("object_rename", {"uuid": uid, "name": clean})
+        return True
 
     def send_material(self, uid: str, slot: int, material: dict) -> None:
         payload = material_payload.sanitize(material)
@@ -2802,6 +2866,10 @@ class SessionService:
             return
         self._enqueue(
             protocol.json_frame(MessageType.MATERIAL_UPDATE, {"uuid": uid, "slot": int(slot), "material": payload})
+        )
+        self._tap(
+            "material_update",
+            {"uuid": uid, "slot": int(slot), "material": payload},
         )
 
     def send_modifier_stack(self, uid: str, modifiers: list, details: dict | None = None) -> None:
@@ -2812,6 +2880,7 @@ class SessionService:
         if message is None:
             return
         self._enqueue(protocol.json_frame(MessageType.MODIFIER_STACK, message))
+        self._tap("modifier_stack", message)
 
     def send_image(self, name: str, format_hint: str, data: bytes) -> int:
         try:

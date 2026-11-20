@@ -335,8 +335,9 @@ def pack_geometry(payload: bytes) -> bytes:
         return payload
     if payload[:4] not in (GEO_MAGIC, GEO2_MAGIC) or len(payload) < 4096:
         return payload
-    # Large uploads get the slower/higher ratio pass; small edits stay cheap.
-    level = 9 if len(payload) > 10 * 1024 * 1024 else 6
+    # Large uploads get a mid-level pass; small edits stay cheap. Level 9 on a
+    # multi-megabyte mesh can add a second of main-thread time for little gain.
+    level = 3 if len(payload) > 2 * 1024 * 1024 else 6
     magic = GEOZ2_MAGIC if payload[:4] == GEO2_MAGIC else GEOZ_MAGIC
     return magic + zlib.compress(payload, level)
 

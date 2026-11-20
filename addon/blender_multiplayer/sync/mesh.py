@@ -249,8 +249,84 @@ class MeshMirror:
         self.hashes = chunker.chunk_hashes(self.shadow)
 
 
-def snapshot_bmesh(bm) -> bytes:
-    """Encode the live Edit Mode BMesh as a full compressed geometry snapshot."""
+def _snapshot_arrays(bm):
+    """Read a BMesh's geometry as numpy arrays.
+
+    The fast path converts the BMesh to a temporary ``Mesh`` in C and uses
+    ``foreach_get`` for every array. The old pure-Python loops cost roughly a
+    second on a 100k-vertex mesh; this path is a few tens of milliseconds. The
+    slow path is kept as a fallback for Blender builds where ``to_mesh`` or a
+    ``foreach_get`` attribute is unavailable.
+    """
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    active_name = ""
+    try:
+        active_layer = bm.loops.layers.uv.active
+        if active_layer is not None:
+            active_name = active_layer.name
+    except (AttributeError, TypeError, RuntimeError):
+        active_name = ""
+
+    _require_bpy()
+    import bpy
+
+    tmp = bpy.data.meshes.new("__bmp_topology_tmp__")
+    try:
+        bm.to_mesh(tmp)
+        nv, ne, nl, npoly = (
+            len(tmp.vertices),
+            len(tmp.edges),
+            len(tmp.loops),
+            len(tmp.polygons),
+        )
+        positions = np.empty(nv * 3, dtype=np.float32)
+        tmp.vertices.foreach_get("co", positions)
+        edges = np.empty(ne * 2, dtype=np.uint32)
+        if ne:
+            tmp.edges.foreach_get("vertices", edges)
+        loops = np.empty(nl, dtype=np.uint32)
+        if nl:
+            tmp.loops.foreach_get("vertex_index", loops)
+        starts = np.empty(npoly, dtype=np.uint32)
+        totals = np.empty(npoly, dtype=np.uint32)
+        materials = np.empty(npoly, dtype=np.uint32)
+        smooth_bool = np.empty(npoly, dtype=bool)
+        if npoly:
+            tmp.polygons.foreach_get("loop_start", starts)
+            tmp.polygons.foreach_get("loop_total", totals)
+            tmp.polygons.foreach_get("material_index", materials)
+            tmp.polygons.foreach_get("use_smooth", smooth_bool)
+        smooth = smooth_bool.astype(np.uint8)
+        uv_layers = []
+        active_uv = 0
+        for layer_index, layer in enumerate(tmp.uv_layers):
+            if layer.name == active_name:
+                active_uv = layer_index
+            values = np.empty(nl * 2, dtype=np.float32)
+            if nl:
+                layer.data.foreach_get("uv", values)
+            uv_layers.append((layer.name, values))
+        return (
+            positions.reshape(-1, 3),
+            edges,
+            loops,
+            starts,
+            totals,
+            smooth,
+            materials,
+            uv_layers,
+            active_uv,
+        )
+    finally:
+        try:
+            bpy.data.meshes.remove(tmp)
+        except (ReferenceError, RuntimeError):
+            pass
+
+
+def _snapshot_arrays_slow(bm):
     bm.verts.ensure_lookup_table()
     bm.edges.ensure_lookup_table()
     bm.faces.ensure_lookup_table()
@@ -258,21 +334,18 @@ def snapshot_bmesh(bm) -> bytes:
     positions = np.empty(verts * 3, dtype=np.float32)
     try:
         bm.verts.foreach_get("co", positions)
-        positions = positions.reshape(-1, 3)
     except (AttributeError, TypeError, RuntimeError):
-        positions = np.array(
-            [[vert.co.x, vert.co.y, vert.co.z] for vert in bm.verts],
-            dtype=np.float32,
-        ).reshape(-1, 3)
+        for index, vert in enumerate(bm.verts):
+            positions[index * 3 : index * 3 + 3] = (vert.co.x, vert.co.y, vert.co.z)
     edges = np.empty(len(bm.edges) * 2, dtype=np.uint32)
     for index, edge in enumerate(bm.edges):
         edges[index * 2] = edge.verts[0].index
         edges[index * 2 + 1] = edge.verts[1].index
-    loops = []
-    starts = []
-    totals = []
-    smooth = []
-    materials = []
+    loops: list[int] = []
+    starts: list[int] = []
+    totals: list[int] = []
+    smooth: list[int] = []
+    materials: list[int] = []
     for face in bm.faces:
         start = len(loops)
         face_loops = list(face.loops)
@@ -298,27 +371,57 @@ def snapshot_bmesh(bm) -> bytes:
     except (AttributeError, TypeError, RuntimeError):
         uv_layers = []
         active_uv = 0
+    return (
+        positions.reshape(-1, 3),
+        edges,
+        np.asarray(loops, dtype=np.uint32),
+        np.asarray(starts, dtype=np.uint32),
+        np.asarray(totals, dtype=np.uint32),
+        np.asarray(smooth, dtype=np.uint8),
+        np.asarray(materials, dtype=np.uint32),
+        uv_layers,
+        active_uv,
+    )
+
+
+def snapshot_bmesh(bm) -> bytes:
+    """Encode the live Edit Mode BMesh as a full compressed geometry snapshot."""
+    try:
+        arrays = _snapshot_arrays(bm)
+    except Exception:  # noqa: BLE001 - fall back to the portable path
+        arrays = _snapshot_arrays_slow(bm)
+    (
+        positions,
+        edges,
+        loops,
+        starts,
+        totals,
+        smooth,
+        materials,
+        uv_layers,
+        active_uv,
+    ) = arrays
     if uv_layers:
         geometry = chunker.encode_geometry_layers(
             positions,
-            np.asarray(edges, dtype=np.uint32),
-            np.asarray(loops, dtype=np.uint32),
-            np.asarray(starts, dtype=np.uint32),
-            np.asarray(totals, dtype=np.uint32),
-            np.asarray(smooth, dtype=np.uint8),
-            np.asarray(materials, dtype=np.uint32),
+            edges,
+            loops,
+            starts,
+            totals,
+            smooth,
+            materials,
             uv_layers,
             active_uv,
         )
     else:
         geometry = chunker.encode_geometry(
             positions,
-            np.asarray(edges, dtype=np.uint32),
-            np.asarray(loops, dtype=np.uint32),
-            np.asarray(starts, dtype=np.uint32),
-            np.asarray(totals, dtype=np.uint32),
-            np.asarray(smooth, dtype=np.uint8),
-            np.asarray(materials, dtype=np.uint32),
+            edges,
+            loops,
+            starts,
+            totals,
+            smooth,
+            materials,
         )
     return chunker.pack_geometry(geometry)
 

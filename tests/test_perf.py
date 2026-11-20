@@ -10,3 +10,15 @@ def test_budget_records_and_reports():
     assert budget.ok()
     report = perf.report({"apply": budget})
     assert report["apply"]["ok"] is True
+    assert "p99_ms" in report["apply"]
+
+
+def test_registry_snapshot_and_violations():
+    registry = perf.PerfRegistry({"fast": 100.0, "slow": 0.0})
+    registry.record("fast", 1.0)
+    registry.record("slow", 5.0)
+    snapshot = registry.snapshot()
+    assert snapshot["budgets"]["fast"]["ok"] is True
+    assert "slow" in snapshot["violations"]
+    registry.reset()
+    assert registry.budget("fast").samples == []
