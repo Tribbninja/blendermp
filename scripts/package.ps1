@@ -46,7 +46,11 @@ Remove-Item $stage -Recurse -Force
 
 # --- Release app ------------------------------------------------------------
 Write-Host 'Building release desktop app (this takes a few minutes)...' -ForegroundColor Cyan
-& cargo build --release --manifest-path (Join-Path $root 'desktop\src-tauri\Cargo.toml')
+& cargo build --release --offline --manifest-path (Join-Path $root 'desktop\src-tauri\Cargo.toml')
+if ($LASTEXITCODE -ne 0) {
+    Write-Host 'Offline cargo build failed; retrying online...' -ForegroundColor Yellow
+    & cargo build --release --manifest-path (Join-Path $root 'desktop\src-tauri\Cargo.toml')
+}
 if ($LASTEXITCODE -ne 0) { throw 'release build failed' }
 
 $appDir = Join-Path $dist 'blendermp'

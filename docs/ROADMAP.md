@@ -1,14 +1,16 @@
 # Blendermp Master Roadmap: 0.1.7 -> 1.0
 
 Living implementation plan. Last updated: 2026-11-20.
-Baseline: **0.1.6** (public directory, authenticated relay, TLS pinning, scene
+Baseline: **0.1.7** (public directory, authenticated relay, TLS pinning, scene
 bootstrap, object/transform sync, chunked mesh deltas, live Edit Mode vertex
-streaming, edit leases, viewport presence, display interpolation).
+streaming, edit leases, viewport presence, display interpolation, durable
+settings, strict version/capability gate).
 
 Progress log:
 - [x] 2026-11-20: `version.json` + `scripts/check_version.py` + test; build fails on drift.
 - [x] 2026-11-20: durable `%LOCALAPPDATA%\Blendermp\settings.json`; host key, public toggle and layout survive reinstall; localStorage migrated once.
 - [x] 2026-11-20: CI skeleton for Python tests + version check + JS syntax.
+- [x] 2026-11-20: Phase 1 compatibility gate: version/capability HELLO+WELCOME, legacy-client rejection, directory fields, server-browser preflight, update badges.
 - [ ] Phase 0: checked-in e2e harness, diagnostics bundle, error codes, perf baseline, crash marker.
 
 Purpose: ship every feature discussed in the roadmap in dependency order,
@@ -147,7 +149,8 @@ Directory listing gains: `protocol`, `caps`, `min_app`, `updated_at`.
 The desktop app preflights the listing before dialing: if `min_app` > local or
 the required capabilities are missing, show "Host is on X, update to join".
 
-Hard rule after 0.1.7: **same major.minor app/addon version**; allow
+Hard rule: **pre-1.0 requires an exact app/addon version**; from 1.0 on, patch
+releases interoperate and only the major/minor pair must match. Allow
 `--allow-legacy` only for debugging. Bump `PROTOCOL_VERSION` only for framing
 changes; additive messages stay on v2.
 
@@ -350,6 +353,12 @@ locks that never feel broken.
     version and copies the bundled addon when different.
   - Blender is restarted with the new `BMP_ADDON` only when idle or after a
     user prompt.
+- Compatibility gate (shipped in the 0.1.6 rebuild):
+  - HELLO/WELCOME carry `app`, `addon`, `protocol`, `caps`.
+  - Pre-1.0 versions must match exactly; legacy peers without version fields are
+    rejected with a clear update message.
+  - The server browser shows an "update" badge and disables Join for rooms with
+    a different protocol/version or a newer `min_app`.
 - Directory preflight (4.1) blocks mismatched joins with a clear message.
 - Settings/identity persisted (Phase 0) so updates do not reset them.
 - `version.json` exposed in the UI footer; release channel stable/beta.

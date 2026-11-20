@@ -101,6 +101,9 @@ class Directory:
         password = bool(body.get("password", False))
         relay = bool(body.get("relay", False))
         version = clean_text(body.get("version", ""), 16, required=False)
+        protocol = clean_int(body.get("protocol", 0), 0, 999)
+        caps = clean_int(body.get("caps", 0), 0, 2**31 - 1)
+        min_app = clean_text(body.get("min_app", ""), 16, required=False)
 
         with self._lock:
             self._prune(now)
@@ -116,6 +119,9 @@ class Directory:
                 "password": password,
                 "relay": relay,
                 "version": version,
+                "protocol": protocol,
+                "caps": caps,
+                "min_app": min_app,
                 "seen": now,
             }
             self._servers[server_id] = entry
@@ -146,6 +152,9 @@ class Directory:
                     "password": entry["password"],
                     "relay": entry["relay"],
                     "version": entry["version"],
+                    "protocol": entry["protocol"],
+                    "caps": entry["caps"],
+                    "min_app": entry["min_app"],
                     "updated": int(entry["seen"]),
                 }
                 for entry in self._servers.values()

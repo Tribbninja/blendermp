@@ -40,6 +40,7 @@ from .core import chunker
 from .core import image_payload
 from .core import material as material_payload
 from .core import object_payload
+from .core.version import ADDON_VERSION
 from .session import MAX_MESH, SessionService
 from .sync import objects as obj_sync
 from .sync.mesh import EditMirror, MeshMirror
@@ -47,14 +48,13 @@ from .sync.mesh import EditMirror, MeshMirror
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 1, 4),
+    "version": (0, 1, 7),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
     "category": "Network",
 }
 
-ADDON_VERSION = "0.1.6"
 TICK = 1.0 / 30.0
 CONTROL_POLL = 0.5
 STATUS_WRITE = 0.5

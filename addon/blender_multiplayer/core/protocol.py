@@ -22,7 +22,7 @@ import json
 import struct
 import zlib
 from dataclasses import dataclass, field
-from enum import IntEnum
+from enum import IntEnum, IntFlag
 from typing import Any
 
 MAGIC = b"BMP1"
@@ -30,6 +30,24 @@ PROTOCOL_VERSION = 2
 HEADER = struct.Struct("<4sBBBBIII")
 HEADER_SIZE = HEADER.size  # 20 bytes
 MAX_PAYLOAD = 32 * 1024 * 1024
+
+
+class Capability(IntFlag):
+    """Features a peer can understand. Advertised in HELLO/WELCOME."""
+
+    PRESENCE_VIEW = 1 << 0
+    SELECTION = 1 << 1
+    LASER = 1 << 2
+    TOPOLOGY = 1 << 3
+    MATERIAL_GRAPH = 1 << 4
+    ANIMATION = 1 << 5
+    SCULPT = 1 << 6
+    RESUME = 1 << 7
+    ROLES = 1 << 8
+    INTEREST = 1 << 9
+
+
+DEFAULT_CAPABILITIES = int(Capability.PRESENCE_VIEW)
 
 
 class MessageType(IntEnum):

@@ -134,7 +134,9 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.1.6";
+const APP_VERSION = "0.1.7";
+const PROTOCOL_VERSION = 2;
+const CAPABILITIES = 1; // core presence view; keep in sync with core/protocol.py
 const settings = {
   name: "",
   port: 51999,
@@ -332,6 +334,48 @@ function makeServerId() {
 
 function serverDisplayName() {
   return settings.serverName.trim() || `${settings.name}'s server`;
+}
+
+function versionParts(value) {
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(value || "").trim());
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : [0, 0, 0];
+}
+
+function compareVersions(left, right) {
+  const a = versionParts(left);
+  const b = versionParts(right);
+  for (let index = 0; index < 3; index += 1) {
+    if (a[index] !== b[index]) return a[index] < b[index] ? -1 : 1;
+  }
+  return 0;
+}
+
+function majorMinor(value) {
+  const parts = versionParts(value);
+  return `${parts[0]}.${parts[1]}`;
+}
+
+function serverCompatibility(server) {
+  if (!server) return { ok: false, reason: "No server selected." };
+  const protocol = Number(server.protocol || 0);
+  if (protocol && protocol !== PROTOCOL_VERSION) {
+    return {
+      ok: false,
+      reason: `Host uses protocol ${protocol}; update Blendermp to ${APP_VERSION}.`,
+    };
+  }
+  const minApp = String(server.min_app || "").trim();
+  if (minApp && compareVersions(APP_VERSION, minApp) < 0) {
+    return { ok: false, reason: `Host requires Blendermp ${minApp} or newer.` };
+  }
+  const hostVersion = String(server.version || "").trim();
+  if (hostVersion && majorMinor(hostVersion) !== majorMinor(APP_VERSION)) {
+    return {
+      ok: false,
+      reason: `Host is on ${hostVersion}; you are on ${APP_VERSION}. Both sides need the same version.`,
+    };
+  }
+  return { ok: true, reason: "" };
 }
 
 function setPanel(name) {
@@ -856,6 +900,11 @@ async function hostRoom() {
 
 async function joinServer(server, pin = "") {
   if (!server || !server.code) return;
+  const compat = serverCompatibility(server);
+  if (!compat.ok) {
+    toast(compat.reason, "error");
+    return;
+  }
   removeServer();
   const relayUrl = server.relay_url || (server.relay ? hubRelayUrl() : "");
   try {
@@ -1013,6 +1062,8 @@ function renderServers(message) {
   for (const server of visible) {
     const row = document.createElement("div");
     row.className = "server-row";
+    const compat = serverCompatibility(server);
+    if (!compat.ok) row.classList.add("incompatible");
 
     const main = document.createElement("div");
     main.className = "server-main";
@@ -1043,13 +1094,28 @@ function renderServers(message) {
       badge.textContent = "relay";
       tags.append(badge);
     }
+    if (!compat.ok) {
+      const badge = document.createElement("span");
+      badge.className = "badge warn";
+      badge.textContent = "update";
+      badge.title = compat.reason;
+      tags.append(badge);
+    }
     row.append(tags);
 
     const join = document.createElement("button");
     join.className = "mini-btn";
     join.type = "button";
-    join.textContent = "Join";
-    join.addEventListener("click", () => openServerJoin(server));
+    join.textContent = compat.ok ? "Join" : "Update";
+    join.disabled = !compat.ok;
+    join.title = compat.reason || "";
+    join.addEventListener("click", () => {
+      if (!compat.ok) {
+        toast(compat.reason, "error");
+        return;
+      }
+      openServerJoin(server);
+    });
     row.append(join);
 
     list.append(row);
@@ -1057,6 +1123,11 @@ function renderServers(message) {
 }
 
 function openServerJoin(server) {
+  const compat = serverCompatibility(server);
+  if (!compat.ok) {
+    toast(compat.reason, "error");
+    return;
+  }
   state.pendingServer = server;
   $("serverJoinName").textContent = server.name || "server";
   const needsPassword = Boolean(server.password);
@@ -1094,6 +1165,9 @@ function announceServer() {
     relay_url: hubRelayUrl(),
     host_token: hubRelayUrl() ? settings.hostKey : "",
     version: APP_VERSION,
+    protocol: PROTOCOL_VERSION,
+    caps: CAPABILITIES,
+    min_app: APP_VERSION,
   };
   Promise.allSettled(
     targets.map(async (url) => {

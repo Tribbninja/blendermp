@@ -492,6 +492,9 @@ body.resizing { user-select: none; }
   transition: border-color .12s ease, background .12s ease;
 }
 .server-row:hover { border-color: #34343c; background: #141418; }
+.server-row.incompatible { opacity: 0.55; }
+.server-row.incompatible:hover { border-color: var(--line); background: var(--panel-soft); }
+.mini-btn:disabled { opacity: 0.6; cursor: not-allowed; }
 .server-main { flex: 1; min-width: 0; }
 .server-name {
   font-size: 12px;

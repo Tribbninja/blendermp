@@ -168,6 +168,9 @@ export class Hub {
           password: Boolean(body.password),
           relay: Boolean(body.relay),
           version: cleanText(body.version, 16, false),
+          protocol: cleanInt(body.protocol, 0, 0, 999),
+          caps: cleanInt(body.caps, 0, 0, 2147483647),
+          min_app: cleanText(body.min_app, 16, false),
           relay_url: cleanText(body.relay_url, 256, false),
           seen: now(),
         };

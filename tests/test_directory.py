@@ -41,6 +41,9 @@ def entry(**extra):
         "password": True,
         "relay": True,
         "version": "0.1.0",
+        "protocol": 2,
+        "caps": 1,
+        "min_app": "0.1.0",
     }
     body.update(extra)
     return body
@@ -59,6 +62,10 @@ def test_announce_list_search_and_remove(directory_server):
     assert servers[0]["code"] == "K7M2QX9ABCDEFGH"
     assert servers[0]["password"] is True
     assert servers[0]["relay"] is True
+    assert servers[0]["version"] == "0.1.0"
+    assert servers[0]["protocol"] == 2
+    assert servers[0]["caps"] == 1
+    assert servers[0]["min_app"] == "0.1.0"
     assert "id" not in servers[0]
 
     _, _, body = call(directory_server, "GET", "/servers?q=sculpt")

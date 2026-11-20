@@ -39,6 +39,7 @@ if __package__:
     from .core import object_payload, protocol, tls
     from .core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, Frame, MessageType
     from .core.roomcode import FLAG_RELAY, decode_room, room_id
+    from .core.version import ADDON_VERSION, compatible
     from .net.relay import RelayClientAgent, RelayHostAgent
     from .sync.leases import LeaseManager
 else:  # pragma: no cover - allows importing the module standalone (tests)
@@ -48,6 +49,7 @@ else:  # pragma: no cover - allows importing the module standalone (tests)
     from core import object_payload, protocol, tls
     from core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, Frame, MessageType
     from core.roomcode import FLAG_RELAY, decode_room, room_id
+    from core.version import ADDON_VERSION, compatible
     from net.relay import RelayClientAgent, RelayHostAgent
     from sync.leases import LeaseManager
 
@@ -153,6 +155,10 @@ class Peer:
     address: str
     name: str = "user"
     color: tuple = (0.4, 0.8, 1.0, 1.0)
+    app: str = ""
+    addon: str = ""
+    protocol: int = 0
+    caps: int = 0
     authenticated: bool = False
     last_seen: float = field(default_factory=time.monotonic)
     strikes: int = 0
@@ -199,12 +205,16 @@ class SessionService:
         fingerprint: str | None = None,
         pin: str = "",
         relay: tuple[str, int] | None = None,
+        version: str | None = None,
     ):
         self.inbox = inbox
         self.is_host = host
         self.code = code.strip().upper()
         self.name = clean_name(name)
         self.color = clean_color(color)
+        self.version = clean_text(version or ADDON_VERSION, 32) or ADDON_VERSION
+        self.remote_app = ""
+        self.remote_caps = 0
         self.port = int(port or 0)
         self.expected_fingerprint = fingerprint
         self.pin = pin[:64]
@@ -632,6 +642,25 @@ class SessionService:
 
         raise Violation(f"message type {frame.type} is not accepted by the host")
 
+    async def _reject_hello(self, peer: Peer, message: str, code: str = "update_required") -> None:
+        """Write a rejection before the peer is dropped.
+
+        A queued frame may not flush before the connection closes, so write
+        directly. The client shows this message instead of retrying blindly.
+        """
+        try:
+            peer.writer.write(
+                protocol.encode(
+                    protocol.json_frame(
+                        MessageType.ERROR,
+                        {"message": message[:200], "code": code},
+                    )
+                )
+            )
+            await peer.writer.drain()
+        except Exception:  # noqa: BLE001
+            pass
+
     async def _accept_hello(self, peer: Peer, frame: Frame) -> None:
         if peer.authenticated:
             raise Violation("duplicate hello")
@@ -639,18 +668,37 @@ class SessionService:
         if self.pin:
             supplied = body.get("pin")
             if not isinstance(supplied, str) or not hmac.compare_digest(supplied[:64], self.pin):
-                # Write directly: the peer is dropped immediately afterwards,
-                # so a queued frame could be discarded before it is sent.
-                try:
-                    peer.writer.write(
-                        protocol.encode(
-                            protocol.json_frame(MessageType.ERROR, {"message": "invalid server password"})
-                        )
-                    )
-                    await peer.writer.drain()
-                except Exception:  # noqa: BLE001
-                    pass
+                await self._reject_hello(peer, "invalid server password", "invalid_pin")
                 raise Violation("invalid pin")
+        peer.app = clean_text(body.get("app"), 32)
+        peer.addon = clean_text(body.get("addon"), 32)
+        protocol_value = body.get("protocol")
+        if isinstance(protocol_value, int) and not isinstance(protocol_value, bool):
+            peer.protocol = max(0, min(65535, protocol_value))
+        caps_value = body.get("caps")
+        if isinstance(caps_value, int) and not isinstance(caps_value, bool):
+            peer.caps = max(0, caps_value)
+        if peer.protocol == 0 or not peer.app:
+            await self._reject_hello(
+                peer,
+                f"update Blendermp: reinstall the latest {self.version} build to join",
+                "update_required",
+            )
+            raise Violation("legacy client")
+        if peer.protocol != PROTOCOL_VERSION:
+            await self._reject_hello(
+                peer,
+                f"protocol mismatch: host uses {PROTOCOL_VERSION}, client uses {peer.protocol}",
+                "protocol_mismatch",
+            )
+            raise Violation("protocol mismatch")
+        if not compatible(self.version, peer.app):
+            await self._reject_hello(
+                peer,
+                f"update Blendermp: host is {self.version}, client is {peer.app}",
+                "update_required",
+            )
+            raise Violation("version mismatch")
         peer.name = clean_name(body.get("name"))
         # Names are identity for leases, so the host makes them unique.
         existing = {other.name for other in self._peers.values() if other.authenticated} | {self.name}
@@ -674,6 +722,10 @@ class SessionService:
             "fingerprint": self.fingerprint,
             "code": self.code,
             "leases": self._leases.snapshot(time.monotonic()),
+            "app": self.version,
+            "addon": self.version,
+            "protocol": PROTOCOL_VERSION,
+            "caps": protocol.DEFAULT_CAPABILITIES,
         }
         peer.enqueue(protocol.encode(protocol.json_frame(MessageType.WELCOME, welcome)), critical=True)
         self._broadcast(
@@ -981,7 +1033,9 @@ class SessionService:
             protocol.encode(
                 protocol.json_frame(
                     MessageType.HELLO,
-                    {"name": self.name, "color": list(self.color), "pin": self.pin},
+                    {"name": self.name, "color": list(self.color), "pin": self.pin,
+                     "app": self.version, "addon": self.version,
+                     "protocol": PROTOCOL_VERSION, "caps": protocol.DEFAULT_CAPABILITIES},
                 )
             )
         )
@@ -999,6 +1053,28 @@ class SessionService:
         if frame is None or frame.type != MessageType.WELCOME:
             raise RuntimeError("host rejected the join")
         body = self._json(frame, 4096)
+        host_app = clean_text(body.get("app"), 32)
+        host_protocol = body.get("protocol")
+        if not host_app or not isinstance(host_protocol, int) or isinstance(host_protocol, bool) or host_protocol == 0:
+            writer.close()
+            self._fail("host is running an older Blendermp build; the host must reinstall the latest setup")
+            return
+        if host_protocol != PROTOCOL_VERSION:
+            writer.close()
+            self._fail(
+                f"host uses Blendermp protocol {host_protocol}; update Blendermp to {self.version}"
+            )
+            return
+        if not compatible(self.version, host_app):
+            writer.close()
+            self._fail(
+                f"host is on Blendermp {host_app}; update to {self.version} to join"
+            )
+            return
+        self.remote_app = host_app
+        caps_value = body.get("caps")
+        if isinstance(caps_value, int) and not isinstance(caps_value, bool):
+            self.remote_caps = max(0, caps_value)
         self._peer_id = str(body.get("peer_id", ""))[:32]
         self._set_state("connected")
         self._emit("welcome", body)
@@ -1358,10 +1434,21 @@ class SessionService:
         peers = []
         bytes_out = self._bytes_out
         if self.is_host:
-            peers = [{"name": peer.name, "address": peer.address} for peer in self._peers.values() if peer.authenticated]
+            peers = [
+                {
+                    "name": peer.name,
+                    "address": peer.address,
+                    "app": peer.app,
+                    "addon": peer.addon,
+                    "protocol": peer.protocol,
+                    "caps": peer.caps,
+                }
+                for peer in self._peers.values()
+                if peer.authenticated
+            ]
             bytes_out += sum(peer.sent for peer in self._peers.values())
         else:
-            peers = [{"name": "host", "address": self.code}]
+            peers = [{"name": "host", "address": self.code, "app": self.remote_app, "caps": self.remote_caps}]
         return {
             "state": self.state,
             "rtt_ms": round(self._rtt_ms, 1),

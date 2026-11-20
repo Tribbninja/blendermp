@@ -109,6 +109,36 @@ def test_host_and_client_chat(appdir):
         client_events.stop()
 
 
+def test_client_rejects_incompatible_host_version(appdir):
+    port = free_port()
+    code = encode_room("127.0.0.1", port)
+    host_events = Events(queue.Queue())
+    client_events = Events(queue.Queue())
+    host = session_mod.SessionService(
+        host_events.inbox, host=True, code=code, name="host", color=(1, 1, 1, 1), port=port
+    )
+    host.start()
+    assert wait_for(lambda: host.state == "hosting")
+    client = session_mod.SessionService(
+        client_events.inbox,
+        host=False,
+        code=code,
+        name="ada",
+        color=(1, 1, 1, 1),
+        port=port,
+        version="0.1.5",
+    )
+    client.start()
+    try:
+        assert wait_for(lambda: client.failed), "client joined an incompatible host"
+        assert "update" in client.failure_reason.lower()
+    finally:
+        client.stop()
+        host.stop()
+        host_events.stop()
+        client_events.stop()
+
+
 def test_scene_bootstrap_messages(appdir):
     port = free_port()
     code = encode_room("127.0.0.1", port)
