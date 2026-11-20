@@ -140,7 +140,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.8.1";
+const APP_VERSION = "0.8.2";
 const PROTOCOL_VERSION = 3;
 const CAPABILITIES = 1 | (1 << 10) | (1 << 11) | (1 << 12); // presence, bookmarks, bundles, chunks
 const settings = {
@@ -398,11 +398,17 @@ function serverCompatibility(server) {
     return { ok: false, reason: `Host requires Blendermp ${minApp} or newer.` };
   }
   const hostVersion = String(server.version || "").trim();
-  if (hostVersion && majorMinor(hostVersion) !== majorMinor(APP_VERSION)) {
-    return {
-      ok: false,
-      reason: `Host is on ${hostVersion}; you are on ${APP_VERSION}. Both sides need the same version.`,
-    };
+  if (hostVersion) {
+    const exact = APP_VERSION.startsWith("0.");
+    const mismatch = exact
+      ? compareVersions(hostVersion, APP_VERSION) !== 0
+      : majorMinor(hostVersion) !== majorMinor(APP_VERSION);
+    if (mismatch) {
+      return {
+        ok: false,
+        reason: `Host is on ${hostVersion}; you are on ${APP_VERSION}. Both PCs need the same build.`,
+      };
+    }
   }
   return { ok: true, reason: "" };
 }
@@ -1216,9 +1222,13 @@ async function joinServer(server, pin = "") {
     return;
   }
   removeServer();
+  // Prefer the relay whenever the host publishes one: LAN direct uses a random
+  // port that Windows Firewall commonly blocks, which left clients stuck on
+  // "Connecting" with no peer on either side.
   const directCode = server.lan ? String(server.direct_code || "").trim() : "";
-  const code = directCode || server.code;
-  const relayUrl = directCode ? "" : server.relay_url || (server.relay ? hubRelayUrl() : "");
+  const relayUrl = server.relay_url || (server.relay ? hubRelayUrl() : "");
+  const useDirect = !relayUrl && Boolean(directCode);
+  const code = useDirect ? directCode : server.code;
   try {
     await request({
       action: "join",

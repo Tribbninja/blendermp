@@ -235,7 +235,7 @@ server has a password, enter it in the prompt. The first connection pins the
 host certificate and shows a verification code; compare it with the host's. If
 the host's certificate changed (reinstall or the 30-day rotation), the panel
 shows the new short code and a **Trust new certificate** button; compare it with
-the host before trusting. The host can kick anyone from the member list.
+the host before trusting. Joins use the public relay whenever the host publishes one; LAN-direct is only used for LAN-only hosts because the host's random direct port is often blocked by Windows Firewall. The host can kick anyone from the member list.
 
 ### Packaged build
 
