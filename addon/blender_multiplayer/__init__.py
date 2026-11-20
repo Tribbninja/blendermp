@@ -61,7 +61,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 5, 0),
+    "version": (0, 5, 1),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -2292,8 +2292,25 @@ def _process_image_queue(context) -> None:
     )
     if digest in runtime["shared_images"]:
         return
-    if session.send_image(image.name, format_hint, data):
+    wire = session.send_image(image.name, format_hint, data)
+    if wire:
         runtime["shared_images"].add(digest)
+        if len(data) > image_payload.COMPRESS_THRESHOLD and wire < len(data):
+            saved = len(data) - wire
+            _push_message(
+                context,
+                "system",
+                f"Compressed {image.name[:32]} from {len(data) / 1048576:.1f} MB to {wire / 1048576:.1f} MB",
+            )
+            eventlog.log(
+                "info",
+                "IMAGE_COMPRESSED",
+                "image compressed before transfer",
+                name=image.name[:64],
+                raw=len(data),
+                wire=wire,
+                saved=saved,
+            )
 
 
 def _apply_image_settings(image, colorspace, alpha_mode) -> None:

@@ -47,3 +47,20 @@ def test_image_digest_roundtrip_and_integrity():
     with pytest.raises(image_payload.ImagePayloadError):
         image_payload.decode(bytes(payload))
 
+
+def test_large_image_is_compressed_before_transfer():
+    data = b"B" * (image_payload.COMPRESS_THRESHOLD + 1024 * 1024)
+    payload = image_payload.encode("Large", "png", data)
+    assert len(payload) < len(data)
+    body = image_payload.decode(payload)
+    assert body["data"] == data
+    assert body["compressed"] is True
+
+
+def test_small_image_stays_uncompressed():
+    data = b"C" * 1024
+    body = image_payload.decode(image_payload.encode("Small", "png", data))
+    assert body["data"] == data
+    assert body["compressed"] is False
+
+

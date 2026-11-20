@@ -62,7 +62,7 @@ else:  # pragma: no cover - allows importing the module standalone (tests)
 
 RESUME_TTL = 120.0
 MAX_CONTROL = 64 * 1024
-MAX_MESH = 24 * 1024 * 1024
+MAX_MESH = 64 * 1024 * 1024
 MAX_VERTICES = 5_000_000
 MAX_CHAT = 2_000
 MAX_NAME = 48
@@ -2439,15 +2439,15 @@ class SessionService:
             return
         self._enqueue(protocol.json_frame(MessageType.MODIFIER_STACK, message))
 
-    def send_image(self, name: str, format_hint: str, data: bytes) -> bool:
+    def send_image(self, name: str, format_hint: str, data: bytes) -> int:
         try:
             payload = image_payload.encode(name, format_hint, data)
         except image_payload.ImagePayloadError:
-            return False
+            return 0
         if len(payload) > MAX_MESH:
-            return False
+            return 0
         self._enqueue(Frame(type=MessageType.IMAGE_ASSET, channel=Channel.BULK, payload=payload))
-        return True
+        return len(payload)
 
     def request_lease(self, key: str, action: str = "acquire") -> None:
         self._enqueue(protocol.json_frame(MessageType.LEASE, {"key": key, "action": action}))

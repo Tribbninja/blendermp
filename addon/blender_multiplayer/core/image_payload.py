@@ -10,10 +10,13 @@ from __future__ import annotations
 import hashlib
 import struct
 import re
+import zlib
 
 HEADER = struct.Struct("<HBBI")
 DIGEST_SIZE = 20
-MAX_IMAGE = 16 * 1024 * 1024
+MAX_IMAGE = 32 * 1024 * 1024
+COMPRESS_THRESHOLD = 10 * 1024 * 1024
+FLAG_ZLIB = 1
 MAX_NAME = 64
 MAX_FORMAT = 12
 FORMAT_RE = re.compile(r"^[a-z0-9]{2,8}$")
@@ -36,20 +39,27 @@ def encode(name: str, format_hint: str, data: bytes) -> bytes:
     encoded_name = name.encode("utf-8", "replace")
     encoded_format = format_hint.encode("ascii")
     digest = hashlib.sha1(data).digest()
+    flags = 0
+    wire = data
+    if len(data) > COMPRESS_THRESHOLD:
+        packed = zlib.compress(data, 6)
+        if len(packed) < len(data):
+            wire = packed
+            flags |= FLAG_ZLIB
     return (
-        HEADER.pack(len(encoded_name), len(encoded_format), 0, len(data))
+        HEADER.pack(len(encoded_name), len(encoded_format), flags, len(wire))
         + digest
         + encoded_name
         + encoded_format
-        + data
+        + wire
     )
 
 
 def decode(payload: bytes) -> dict:
     if len(payload) < HEADER.size + DIGEST_SIZE:
         raise ImagePayloadError("image frame is truncated")
-    name_len, format_len, _flags, data_len = HEADER.unpack_from(payload, 0)
-    if name_len > MAX_NAME or format_len > MAX_FORMAT or data_len > MAX_IMAGE:
+    name_len, format_len, flags, data_len = HEADER.unpack_from(payload, 0)
+    if name_len > MAX_NAME or format_len > MAX_FORMAT or data_len > MAX_IMAGE * 2:
         raise ImagePayloadError("image frame exceeds its limits")
     offset = HEADER.size
     digest = payload[offset : offset + DIGEST_SIZE]
@@ -63,7 +73,17 @@ def decode(payload: bytes) -> dict:
     offset += format_len
     if not FORMAT_RE.match(format_hint) or format_hint not in ALLOWED:
         raise ImagePayloadError("unsupported image format")
-    data = payload[offset:]
+    wire = payload[offset:]
+    if flags & FLAG_ZLIB:
+        try:
+            decompressor = zlib.decompressobj()
+            data = decompressor.decompress(wire, MAX_IMAGE + 1)
+        except zlib.error as exc:
+            raise ImagePayloadError("invalid compressed image") from exc
+        if len(data) > MAX_IMAGE or decompressor.unconsumed_tail:
+            raise ImagePayloadError("compressed image is too large")
+    else:
+        data = wire
     if hashlib.sha1(data).digest() != digest:
         raise ImagePayloadError("image digest does not match its data")
-    return {"name": name, "format": format_hint, "sha1": digest.hex(), "data": data}
+    return {"name": name, "format": format_hint, "sha1": digest.hex(), "data": data, "compressed": bool(flags & FLAG_ZLIB)}

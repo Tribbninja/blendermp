@@ -29,7 +29,7 @@ MAGIC = b"BMP1"
 PROTOCOL_VERSION = 2
 HEADER = struct.Struct("<4sBBBBIII")
 HEADER_SIZE = HEADER.size  # 20 bytes
-MAX_PAYLOAD = 32 * 1024 * 1024
+MAX_PAYLOAD = 64 * 1024 * 1024
 
 
 class Capability(IntFlag):

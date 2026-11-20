@@ -119,6 +119,9 @@ surface that cross-process re-parenting causes on some GPUs).
 * **Security hardening**: strict webview CSP, command-scoped capabilities,
   path/zip-bomb limits for checkpoints, and randomized decoder fuzz tests for
   geometry, images, objects and materials.
+* **Large uploads**: images over 10 MB are zlib-compressed before transfer when
+  that reduces size, and large mesh geometry snapshots use the higher-ratio
+  compression pass. Image payloads are capped at 32 MB and frames at 64 MB.
 * **Presence, chat and 3D pings** between the addon UI and the desktop app, with
   latency and bandwidth telemetry, pause-sync, follow-host frame, and chat
   commands (`/who`, `/ping`, `/leave`, `/me`).
@@ -139,7 +142,7 @@ surface that cross-process re-parenting causes on some GPUs).
   same animated transition. Blender is hidden while arranging and returns to the
   viewport when you press Done or Escape.
 
-The protocol and engine have **135 passing tests**, including a real TLS
+The protocol and engine have **137 passing tests**, including a real TLS
 host/client session, certificate-mismatch rejection, relay chat, password
 rejection and host kick over a multiplexed tunnel, the public directory API, and
 1,000-vertex delta round-trips under loss/reordering. The Cloudflare Worker hub
@@ -336,7 +339,7 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   `bench/baseline.json`.
 * The production Worker relay was exercised with the host key: no token and a
   wrong token are rejected, a valid host tunnel and client join succeed.
-* `pytest`: 135 passed.
+* `pytest`: 137 passed.
 
 ## Limitations
 

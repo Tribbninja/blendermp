@@ -134,7 +134,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.5.0";
+const APP_VERSION = "0.5.1";
 const PROTOCOL_VERSION = 2;
 const CAPABILITIES = 1; // core presence view; keep in sync with core/protocol.py
 const settings = {

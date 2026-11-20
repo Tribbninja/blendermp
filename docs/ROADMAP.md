@@ -1,7 +1,7 @@
 # Blendermp Master Roadmap: 0.1.7 -> 1.0
 
 Living implementation plan. Last updated: 2026-11-20.
-Baseline: **0.5.0** (public directory, authenticated relay, TLS pinning, scene
+Baseline: **0.5.1** (public directory, authenticated relay, TLS pinning, scene
 bootstrap, object/transform sync, chunked mesh deltas, live Edit Mode vertex
 streaming, edit leases, presence 2.0, exact remote application, durable settings,
 strict version gate, lease request UX, server-enforced roles, optional LAN direct).
@@ -14,6 +14,7 @@ Progress log:
 - [x] 2026-11-20: Phase 1 lock reliability: lease sweep broadcasts `expiring`/`released`, snapshot-driven owner cleanup, expiry auto-renew, request queue, host-side grant/deny, lock status in the N-panel.
 - [x] 2026-11-20: Phase 1 presence 2.0: edit-mode vertex selection relay/points, 3D cursor, follow-user camera, overlay toggles. Laser pointer removed after poor reliability.
 - [x] 2026-11-20: Phase 1 roles: host assigns viewer/commenter/editor/admin, server-enforced mutating-frame guard, downgrade releases leases, role UI in the desktop member list.
+- [x] 2026-11-21: 0.5.1: compress image uploads over 10 MB with zlib and raise mesh/image frame limits; large geometry snapshots use the higher-ratio compression pass.
 - [x] 2026-11-21: 0.5.0: Phase 5: per-object subscriptions and priority rates, client stats/quality tiers, per-peer byte budget and pending-frame resend, Worker Directory/Room split with signed announce verification, macOS/Linux detection and CI checks, fuzz/decoder limits, CSP/security documentation.
 - [x] 2026-11-21: 0.4.0: Phase 4: armature creation with bones/weights and armature-modifier binding; 30 Hz pose bone sync; active action F-curve/keyframe sync; shape-key geometry/values; constraint bindings; Sculpt Mode position deltas with dyntopo topology fallback and multires warning; animation/sculpt two-Blender harnesses.
 - [x] 2026-11-20: 0.3.0: Phase 3: resume with retained leases and no scene reset; offline transform/mesh/material journal with conflict prompts; scoped undo; checkpoint save/restore with live peer resync; Ed25519 signed host identity verified on join; scrypt PIN hashing + per-IP rate limit; role/kick audit events; signed directory source in the Worker.

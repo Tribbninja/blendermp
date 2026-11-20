@@ -286,7 +286,9 @@ def pack_geometry(payload: bytes) -> bytes:
     """Compress a full geometry snapshot when it is worth the CPU."""
     if payload[:4] != GEO_MAGIC or len(payload) < 4096:
         return payload
-    return GEOZ_MAGIC + zlib.compress(payload, 6)
+    # Large uploads get the slower/higher ratio pass; small edits stay cheap.
+    level = 9 if len(payload) > 10 * 1024 * 1024 else 6
+    return GEOZ_MAGIC + zlib.compress(payload, level)
 
 
 def unpack_geometry(payload: bytes) -> bytes:
