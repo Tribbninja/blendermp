@@ -83,6 +83,21 @@ surface that cross-process re-parenting causes on some GPUs).
   viewport/render visibility, for every object rather than the active one.
 * **Edit leases with request/grant**: request edit on the active object, the owner
   gets a notification and can grant it from the panel or with `/grant <user>`.
+* **Reconnect and resume**: a dropped client keeps its scene and reconnects with
+  backoff, retaining its leases and identity. The host resends authoritative
+  state without a scene reset; a host restart falls back to a clean bootstrap.
+* **Offline edit journal**: transforms, mesh snapshots and material changes made
+  while disconnected are recorded locally, replayed on resume, and surfaced as
+  a conflict prompt when the host also changed the object.
+* **Scoped undo**: `Ctrl+Alt+Z` / **Undo my edit** reverts only the local user's
+  last transform if nobody else has changed it since; remote edits are skipped.
+* **Checkpoints**: create a `.bmpz` scene snapshot plus a `.blend` copy, restore
+  it live with peers connected, clear stale leases, and resync clients. Automatic
+  checkpoints run every ten minutes and keep the last three.
+* **Signed host identity and roles**: an Ed25519 host key signs the session
+  descriptor, clients verify it on join, the Worker verifies signed directory
+  announcements, PINs are scrypt-hashed with a per-IP attempt limit, and role
+  changes/kicks are audited.
 * **Presence, chat and 3D pings** between the addon UI and the desktop app, with
   latency and bandwidth telemetry, pause-sync, follow-host frame, and chat
   commands (`/who`, `/ping`, `/leave`, `/me`).
@@ -103,7 +118,7 @@ surface that cross-process re-parenting causes on some GPUs).
   same animated transition. Blender is hidden while arranging and returns to the
   viewport when you press Done or Escape.
 
-The protocol and engine have **126 passing tests**, including a real TLS
+The protocol and engine have **131 passing tests**, including a real TLS
 host/client session, certificate-mismatch rejection, relay chat, password
 rejection and host kick over a multiplexed tunnel, the public directory API, and
 1,000-vertex delta round-trips under loss/reordering. The Cloudflare Worker hub
@@ -291,13 +306,15 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   vertex drags propagate **both ways** without snapping back; the host's
   selection locks the object for the client until the host releases it.
 * Checked-in two-Blender harnesses cover textured material graphs
-  (`tests/e2e/run_material.ps1`), object details (`run_details.ps1`) and live
-  topology snapshots (`run_topology.ps1`); `run_all.ps1` runs all three.
+  (`tests/e2e/run_material.ps1`), object details (`run_details.ps1`), live
+  topology (`run_topology.ps1`), resume/journal (`run_resume.ps1`), checkpoint
+  restore (`run_checkpoint.ps1`) and scoped undo (`run_undo.ps1`);
+  `run_all.ps1` runs all six.
 * Headless `bench/bench_mesh.py` records read/delta/topology/material timings in
   `bench/baseline.json`.
 * The production Worker relay was exercised with the host key: no token and a
   wrong token are rejected, a valid host tunnel and client join succeed.
-* `pytest`: 126 passed.
+* `pytest`: 131 passed.
 
 ## Limitations
 
@@ -327,6 +344,17 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
 * New objects are replicated for meshes, empties, cameras and lights; curve and
   font data is carried for objects created elsewhere but curve/font creation is
   not detected locally.
+* Scoped undo currently covers object transforms. Offline journaling covers
+  transforms plus the active object's mesh and materials; background objects
+  with offline mesh/material edits are not journaled.
+* Checkpoint files use zip (`.bmpz`) rather than zstd, and the automatic
+  interval/retention are fixed at 10 minutes and three files.
+* Signed directory verification is implemented in `cloudflare/src/index.js`;
+  the public Worker must be redeployed for it to take effect. LAN/self-hosted
+  directories store the signature but do not verify it.
+* PINs are scrypt-hashed (stdlib) rather than Argon2id, and the identity private
+  key uses owner-only file permissions rather than DPAPI because Blender owns
+  the key file.
 * Windows-only window docking; other platforms run Blender in its own window.
 * Multires is not supported.
 * Alpha software: back up work before a session.

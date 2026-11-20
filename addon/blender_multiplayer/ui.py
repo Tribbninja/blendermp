@@ -48,12 +48,21 @@ class BMP_PT_main(bpy.types.Panel):
             if settings.state == "connected":
                 row.operator("bmp.ping", text="Ping", icon="SORTTIME")
             row.operator("bmp.ping_mark", text="Ping cursor", icon="CURSOR")
+            row.operator("bmp.undo_shared", text="Undo my edit", icon="LOOP_BACK")
 
         if settings.last_error:
             error = layout.box()
             error.alert = True
             label = f"[{settings.last_error_code}] {settings.last_error}" if settings.last_error_code else settings.last_error
             error.label(text=label[:180], icon="ERROR")
+
+        if settings.conflict_count:
+            conflict = layout.box()
+            conflict.alert = True
+            conflict.label(text=settings.conflict_info or "Offline edits conflict", icon="ERROR")
+            row = conflict.row(align=True)
+            row.operator("bmp.conflict_keep_mine", text="Keep mine", icon="CHECKMARK")
+            row.operator("bmp.conflict_take_host", text="Take host", icon="IMPORT")
 
         if settings.crash_notice:
             crash = layout.box()
@@ -63,6 +72,8 @@ class BMP_PT_main(bpy.types.Panel):
             row = crash.row(align=True)
             row.operator("bmp.recover_checkpoints", text="Recover", icon="FILE_REFRESH")
             row.operator("bmp.dismiss_crash", text="Dismiss", icon="X")
+            if settings.journal_available:
+                crash.operator("bmp.restore_journal", text="Restore offline edits", icon="FILE_TEXT")
 
         if settings.state != "offline":
             box = layout.box()
@@ -80,6 +91,14 @@ class BMP_PT_main(bpy.types.Panel):
                         row.label(text="following", icon="CHECKMARK")
             if settings.overlay_info:
                 box.label(text=settings.overlay_info, icon="HIDE_OFF")
+
+        layout.separator()
+        box = layout.box()
+        box.label(text="Recovery", icon="RECOVER_LAST")
+        row = box.row(align=True)
+        row.operator("bmp.checkpoint_create", text="Checkpoint", icon="FILE_TICK")
+        if settings.is_host or settings.state == "offline":
+            row.operator("bmp.checkpoint_restore", text="Restore", icon="FILE_REFRESH")
 
         layout.separator()
         box = layout.box()

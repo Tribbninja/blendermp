@@ -249,10 +249,10 @@ def read_session() -> dict[str, Any] | None:
 def write_status(data: dict[str, Any]) -> None:
     """Write a bounded, sanitised status document atomically."""
     safe: dict[str, Any] = {}
-    for key in ("state", "code", "name", "addon", "blender", "fingerprint", "verify_code", "last_error", "error_code", "role", "overlay_info", "direct_code"):
+    for key in ("state", "code", "name", "addon", "blender", "fingerprint", "verify_code", "last_error", "error_code", "role", "overlay_info", "direct_code", "identity_public", "identity_signature", "identity_descriptor"):
         value = data.get(key)
         if isinstance(value, str):
-            safe[key] = value[:256]
+            safe[key] = value[:512]
     scene = data.get("scene")
     if isinstance(scene, dict):
         safe["scene"] = {

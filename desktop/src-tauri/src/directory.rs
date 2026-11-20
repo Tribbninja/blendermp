@@ -34,6 +34,9 @@ struct Entry {
     relay: bool,
     version: String,
     direct_code: String,
+    identity_public: String,
+    identity_signature: String,
+    identity_descriptor: Value,
     seen: Instant,
 }
 
@@ -118,6 +121,13 @@ fn parse_entry(body: &Value) -> Result<Entry, String> {
         Some(value) if !value.trim().is_empty() => clean_code(Some(&Value::String(value.to_string())))?,
         _ => String::new(),
     };
+    let identity_public = clean_text(object.get("identity_public"), 128, false)?;
+    let identity_signature = clean_text(object.get("identity_signature"), 512, false)?;
+    let identity_descriptor = object
+        .get("identity_descriptor")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or(Value::Null);
     Ok(Entry {
         id,
         name,
@@ -129,6 +139,9 @@ fn parse_entry(body: &Value) -> Result<Entry, String> {
         relay,
         version,
         direct_code,
+        identity_public,
+        identity_signature,
+        identity_descriptor,
         seen: Instant::now(),
     })
 }
@@ -171,6 +184,9 @@ fn public_list(
                 "relay": entry.relay,
                 "version": entry.version,
                 "direct_code": entry.direct_code,
+                "identity_public": entry.identity_public,
+                "identity_signature": entry.identity_signature,
+                "identity_descriptor": entry.identity_descriptor,
                 "updated": entry.seen.elapsed().as_secs(),
             })
         })

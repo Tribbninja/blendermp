@@ -114,6 +114,59 @@ async function readJson(request) {
   }
 }
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function base64Bytes(value) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9+/=]+$/.test(value)) return null;
+  try {
+    return Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
+  } catch {
+    return null;
+  }
+}
+
+async function verifyIdentity(body) {
+  const publicKey = typeof body.identity_public === "string" ? body.identity_public.trim() : "";
+  const signature = typeof body.identity_signature === "string" ? body.identity_signature.trim() : "";
+  const descriptor = body.identity_descriptor;
+  if (!publicKey && !signature) return { ok: true, publicKey: "", signature: "", descriptor: null };
+  if (!publicKey || !signature || !descriptor || typeof descriptor !== "object") {
+    return { ok: false, error: "incomplete host identity" };
+  }
+  if (
+    descriptor.code !== cleanCode(body.code) ||
+    descriptor.protocol !== Number(body.protocol) ||
+    descriptor.app !== cleanText(body.version, 32, false)
+  ) {
+    return { ok: false, error: "host identity does not match the announcement" };
+  }
+  const keyBytes = base64Bytes(publicKey);
+  const signatureBytes = base64Bytes(signature);
+  if (!keyBytes || !signatureBytes) return { ok: false, error: "invalid host identity encoding" };
+  try {
+    const key = await crypto.subtle.importKey("raw", keyBytes, { name: "Ed25519" }, false, ["verify"]);
+    const valid = await crypto.subtle.verify(
+      { name: "Ed25519" },
+      key,
+      signatureBytes,
+      new TextEncoder().encode(canonicalJson(descriptor)),
+    );
+    if (!valid) return { ok: false, error: "host signature is invalid" };
+  } catch {
+    return { ok: false, error: "host identity algorithm is unavailable" };
+  }
+  return { ok: true, publicKey, signature, descriptor };
+}
+
 export default {
   async fetch(request, env) {
     const id = env.HUB.idFromName("hub");
@@ -158,6 +211,8 @@ export class Hub {
         const body = await readJson(request);
         if (!body || typeof body !== "object") return json({ error: "expected an object" }, 400);
         if (!validId(body.id)) return json({ error: "invalid server id" }, 400);
+        const identity = await verifyIdentity(body);
+        if (!identity.ok) return json({ error: identity.error }, 400);
         const entry = {
           id: body.id,
           name: cleanText(body.name, 48, true),
@@ -172,6 +227,9 @@ export class Hub {
           caps: cleanInt(body.caps, 0, 0, 2147483647),
           min_app: cleanText(body.min_app, 16, false),
           relay_url: cleanText(body.relay_url, 256, false),
+          identity_public: identity.publicKey,
+          identity_signature: identity.signature,
+          identity_descriptor: identity.descriptor,
           seen: now(),
         };
         if (entry.players > entry.max) return json({ error: "player count is above the maximum" }, 400);

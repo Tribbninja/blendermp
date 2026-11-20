@@ -19,6 +19,7 @@ if _VENDOR.is_dir() and str(_VENDOR) not in sys.path:
     sys.path.insert(0, str(_VENDOR))
 
 import atexit
+import base64
 import hashlib
 import json
 import math
@@ -41,9 +42,12 @@ from bpy_extras.io_utils import ExportHelper
 
 from . import control, ui
 from .core import chunker
+from .core import checkpoints
 from .core import eventlog
 from .core import heartbeat
 from .core import image_payload
+from .core import journal
+from .core import undo as undo_log
 from .core import material as material_payload
 from .core import object_payload
 from .core.version import ADDON_VERSION
@@ -54,7 +58,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 1, 17),
+    "version": (0, 3, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -167,6 +171,16 @@ runtime: dict = {
     "last_scene_stats": 0.0,
     "heartbeat_last": 0.0,
     "crash_entries": [],
+    "scene_revs": {},
+    "journal_session": "",
+    "journal_active": False,
+    "journal_pending": {},
+    "journal_last_flush": 0.0,
+    "journal_conflicts": [],
+    "journal_files": [],
+    "last_journal_capture": 0.0,
+    "undo": undo_log.UndoLog(),
+    "last_checkpoint": 0.0,
     "last_mesh": 0.0,
     "last_edit": 0.0,
     "mesh_cursor": 0,
@@ -266,6 +280,9 @@ class BMPState(PropertyGroup):
     direct_code: StringProperty()
     crash_notice: StringProperty()
     recovery_available: BoolProperty(default=False)
+    conflict_count: IntProperty(default=0, min=0)
+    conflict_info: StringProperty()
+    journal_available: BoolProperty(default=False)
 
 
 def state(context) -> BMPState:
@@ -389,6 +406,9 @@ def start_host(
     settings.show_labels = True
     settings.last_error = ""
     settings.last_error_code = ""
+    settings.journal_available = False
+    runtime["journal_active"] = False
+    runtime["journal_files"] = []
     runtime["session_started"] = time.monotonic()
     runtime["bootstrapping"] = False
     runtime["bootstraps"] = {}
@@ -569,8 +589,10 @@ def _handle_event(context, kind: str, body: dict) -> None:
     settings = context.window_manager.bmp
     if kind == "state":
         value = body.get("state")
-        if value in {"offline", "hosting", "joining", "connected"}:
+        if value in {"offline", "hosting", "joining", "connected", "reconnecting"}:
             settings.state = value
+            if value == "reconnecting" and not settings.is_host:
+                _start_journal(context)
     elif kind == "host_ready":
         settings.code = body.get("code", settings.code)
         settings.direct_code = body.get("direct_code", "")
@@ -586,8 +608,6 @@ def _handle_event(context, kind: str, body: dict) -> None:
         settings.host_name = body.get("name", "")
         if body.get("you"):
             settings.name = body["you"]
-        runtime["bootstrapping"] = True
-        runtime["bootstrap_deadline"] = time.monotonic() + 20.0
         leases = body.get("leases")
         if isinstance(leases, dict):
             runtime["lease_owners"] = {
@@ -595,11 +615,47 @@ def _handle_event(context, kind: str, body: dict) -> None:
                 for key, info in leases.items()
                 if isinstance(key, str) and isinstance(info, dict) and isinstance(info.get("owner"), str)
             }
-        _push_message(context, "system", "Connected - loading host scene")
+        if body.get("resumed"):
+            runtime["bootstrapping"] = False
+            runtime["bootstrap_deadline"] = 0.0
+            _push_message(context, "system", "Reconnected - scene kept")
+        else:
+            runtime["bootstrapping"] = True
+            runtime["bootstrap_deadline"] = time.monotonic() + 20.0
+            runtime["journal_active"] = False
+            _push_message(context, "system", "Connected - loading host scene")
+        revs = body.get("revs")
+        if isinstance(revs, dict):
+            runtime["scene_revs"] = {
+                str(key): int(value)
+                for key, value in revs.items()
+                if isinstance(key, str) and isinstance(value, int) and not isinstance(value, bool)
+            }
+        if body.get("resumed"):
+            _replay_journal(context, body)
         _upsert_user(context, body.get("name", "host"), body.get("color", (1, 1, 1, 1)), host=True)
         for peer in body.get("peers", []):
             _upsert_user(context, peer.get("name", "?"), peer.get("color", (1, 1, 1, 1)))
         # The host now streams its scene; the client does not upload its own.
+    elif kind == "peer_resume":
+        name = body.get("name", "?")
+        _upsert_user(context, name, body.get("color", (1, 1, 1, 1)))
+        _push_message(context, "system", f"{name} reconnected")
+        if settings.is_host:
+            _resume_peer(context, name)
+    elif kind == "resume_state":
+        allowed = {str(item) for item in body.get("objects", []) if isinstance(item, str)}
+        for obj in list(context.scene.objects):
+            if obj.get("bmp_ping"):
+                continue
+            uid = obj.get("bmp_uuid")
+            if uid and uid not in allowed:
+                try:
+                    bpy.data.objects.remove(obj, do_unlink=True)
+                except Exception:  # noqa: BLE001
+                    pass
+        runtime["bootstrapping"] = False
+        runtime["bootstrap_deadline"] = 0.0
     elif kind == "relay":
         settings.last_error = ""
         _push_message(context, "system", body.get("message", "Relay connected"))
@@ -1418,6 +1474,7 @@ def _sync_materials(context) -> None:
             if runtime["material_shadow"].get(key) == signature:
                 continue
             runtime["material_shadow"][key] = signature
+            _note_rev(uid)
             session.send_material(uid, index, data)
             _queue_material_images(material)
 
@@ -1586,6 +1643,7 @@ def _sync_modifiers(context) -> None:
         if runtime["modifier_shadow"].get(uid) == signature:
             continue
         runtime["modifier_shadow"][uid] = signature
+        _note_rev(uid)
         session.send_modifier_stack(uid, snapshot, details)
 
 
@@ -2097,6 +2155,437 @@ def _send_object_details(session: SessionService, obj) -> None:
         runtime["modifier_shadow"][uid] = _modifier_signature(snapshot, details)
 
 
+def _note_rev(uid: str) -> None:
+    if not uid:
+        return
+    runtime["scene_revs"][uid] = runtime["scene_revs"].get(uid, 0) + 1
+    session: SessionService | None = runtime.get("session")
+    if session is not None:
+        session.bump_rev(uid)
+
+
+def _start_journal(context) -> None:
+    session: SessionService | None = runtime.get("session")
+    settings = context.window_manager.bmp
+    if session is None or settings.is_host:
+        return
+    session_id = getattr(session, "session_id", "") or settings.code
+    if not session_id:
+        return
+    runtime["journal_session"] = session_id
+    runtime["journal_active"] = True
+    runtime["journal_pending"] = {}
+    runtime["journal_last_flush"] = 0.0
+    runtime["last_journal_capture"] = 0.0
+
+
+def _journal_capture(context) -> None:
+    if not runtime.get("journal_active"):
+        return
+    session: SessionService | None = runtime.get("session")
+    if session is not None and session.state in {"connected"}:
+        return
+    now = time.monotonic()
+    if now - runtime.get("last_journal_capture", 0.0) < 0.2:
+        return
+    runtime["last_journal_capture"] = now
+    shadow = runtime["object_shadow"]
+    for obj in context.scene.objects:
+        if obj.get("bmp_ping"):
+            continue
+        uid = obj.get("bmp_uuid")
+        if not uid:
+            continue
+        matrix = obj.matrix_world
+        current = tuple(round(float(value), 6) for row in matrix for value in row)
+        previous = shadow.get(uid)
+        if previous is None:
+            shadow[uid] = current
+            continue
+        if current == previous:
+            continue
+        shadow[uid] = current
+        runtime["journal_pending"][uid] = {
+            "ts": journal.stamp(),
+            "uid": uid,
+            "kind": "transform",
+            "base_rev": int(runtime["scene_revs"].get(uid, 0)),
+            "matrix": list(current),
+        }
+    active = context.active_object
+    if (
+        active is not None
+        and active.type == "MESH"
+        and context.mode != "EDIT_MESH"
+        and (uid := active.get("bmp_uuid"))
+    ):
+        mirror = runtime["mirrors"].get(uid)
+        if mirror is not None:
+            try:
+                delta = mirror.poll(active.data)
+            except Exception:  # noqa: BLE001
+                delta = None
+            if delta is not None:
+                try:
+                    payload = mirror.full_snapshot(active.data)
+                except Exception:  # noqa: BLE001
+                    payload = b""
+                if payload:
+                    runtime["journal_pending"][(uid, "mesh")] = {
+                        "ts": journal.stamp(),
+                        "uid": uid,
+                        "kind": "mesh_snapshot",
+                        "base_rev": int(runtime["scene_revs"].get(uid, 0)),
+                        "payload": base64.b64encode(payload).decode("ascii"),
+                    }
+        for index, slot in enumerate(getattr(active, "material_slots", [])[:16]):
+            material = slot.material
+            if material is None:
+                continue
+            data = material_values(material)
+            signature = _material_signature(data)
+            key = (uid, index)
+            if runtime["material_shadow"].get(key) == signature:
+                continue
+            runtime["material_shadow"][key] = signature
+            runtime["journal_pending"][(uid, index, "material")] = {
+                "ts": journal.stamp(),
+                "uid": uid,
+                "kind": "material",
+                "slot": index,
+                "base_rev": int(runtime["scene_revs"].get(uid, 0)),
+                "material": data,
+            }
+    if runtime["journal_pending"] and now - runtime.get("journal_last_flush", 0.0) > 0.5:
+        _flush_journal()
+
+
+def _flush_journal() -> None:
+    session_id = runtime.get("journal_session", "")
+    if not session_id:
+        return
+    for entry in runtime["journal_pending"].values():
+        journal.append(session_id, entry)
+    runtime["journal_pending"] = {}
+    runtime["journal_last_flush"] = time.monotonic()
+
+
+def _replay_journal(context, body: dict) -> None:
+    session_id = runtime.get("journal_session", "") or str(body.get("session_id", ""))
+    if not session_id:
+        return
+    _flush_journal()
+    entries, skipped = journal.read(session_id)
+    revs = body.get("revs") if isinstance(body.get("revs"), dict) else {}
+    settings = context.window_manager.bmp
+    session: SessionService | None = runtime.get("session")
+    conflicts = []
+    replayed = 0
+    if session is not None:
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            kind = entry.get("kind")
+            if kind not in {"transform", "mesh_snapshot", "material"}:
+                continue
+            uid = entry.get("uid")
+            if not isinstance(uid, str):
+                continue
+            base = entry.get("base_rev", 0)
+            try:
+                host_rev = int(revs.get(uid, 0))
+            except (TypeError, ValueError):
+                host_rev = 0
+            if host_rev > int(base):
+                conflicts.append(entry)
+                continue
+            if kind == "transform":
+                matrix = entry.get("matrix")
+                if not isinstance(matrix, list) or len(matrix) != 16:
+                    continue
+                session.send_transform(uid, matrix)
+                obj = obj_sync.find(uid)
+                if obj is not None:
+                    obj_sync.apply(uid, matrix)
+                    runtime["object_shadow"][uid] = tuple(round(float(value), 6) for value in matrix)
+                replayed += 1
+            elif kind == "mesh_snapshot":
+                payload = entry.get("payload")
+                if not isinstance(payload, str):
+                    continue
+                try:
+                    data = base64.b64decode(payload.encode("ascii"))
+                except (ValueError, TypeError):
+                    continue
+                obj = obj_sync.find(uid)
+                if obj is not None and obj.type == "MESH" and data:
+                    session.send_mesh(obj, "snapshot", data, 0)
+                    replayed += 1
+            elif kind == "material":
+                slot = entry.get("slot")
+                material = entry.get("material")
+                if isinstance(slot, int) and isinstance(material, dict):
+                    session.send_material(uid, slot, material)
+                    replayed += 1
+    runtime["journal_conflicts"] = conflicts
+    settings.conflict_count = len(conflicts)
+    settings.conflict_info = (
+        f"{len(conflicts)} offline edit(s) conflict with host changes"
+        if conflicts
+        else ""
+    )
+    if conflicts:
+        eventlog.log("warn", "JOURNAL_CONFLICT", "offline edits conflict", count=len(conflicts))
+        _push_message(context, "system", settings.conflict_info)
+    else:
+        journal.clear(session_id)
+        runtime["journal_active"] = False
+        runtime["journal_pending"] = {}
+        runtime["journal_files"] = []
+        settings.journal_available = False
+        if replayed:
+            _push_message(context, "system", f"Restored {replayed} offline edit(s)")
+        if skipped:
+            eventlog.log("warn", "JOURNAL_CORRUPT", "skipped journal lines", count=skipped)
+
+
+def _resolve_conflict(context, keep_mine: bool) -> None:
+    conflicts = runtime.get("journal_conflicts") or []
+    if not conflicts:
+        return
+    entry = conflicts.pop(0)
+    session_id = runtime.get("journal_session", "")
+    session: SessionService | None = runtime.get("session")
+    settings = context.window_manager.bmp
+    if keep_mine and session is not None:
+        uid = entry.get("uid")
+        kind = entry.get("kind")
+        if isinstance(uid, str):
+            if kind == "transform":
+                matrix = entry.get("matrix")
+                if isinstance(matrix, list) and len(matrix) == 16:
+                    session.send_transform(uid, matrix)
+                    obj = obj_sync.find(uid)
+                    if obj is not None:
+                        obj_sync.apply(uid, matrix)
+                        runtime["object_shadow"][uid] = tuple(round(float(value), 6) for value in matrix)
+            elif kind == "mesh_snapshot":
+                payload = entry.get("payload")
+                if isinstance(payload, str):
+                    try:
+                        data = base64.b64decode(payload.encode("ascii"))
+                    except (ValueError, TypeError):
+                        data = b""
+                    obj = obj_sync.find(uid)
+                    if obj is not None and obj.type == "MESH" and data:
+                        session.send_mesh(obj, "snapshot", data, 0)
+            elif kind == "material":
+                slot = entry.get("slot")
+                material = entry.get("material")
+                if isinstance(slot, int) and isinstance(material, dict):
+                    session.send_material(uid, slot, material)
+    settings.conflict_count = len(conflicts)
+    settings.conflict_info = (
+        f"{len(conflicts)} offline edit(s) conflict with host changes" if conflicts else ""
+    )
+    if not conflicts and session_id:
+        journal.clear(session_id)
+        runtime["journal_active"] = False
+        runtime["journal_pending"] = {}
+        runtime["journal_files"] = []
+        settings.journal_available = False
+        _push_message(context, "system", "Offline journal resolved")
+
+
+def _resume_peer(context, name: str) -> None:
+    """Resend authoritative state to a client that reconnected."""
+    session: SessionService | None = runtime.get("session")
+    if session is None or not session.is_host:
+        return
+    objects = [obj for obj in context.scene.objects if not obj.get("bmp_ping")]
+    uids = [obj.get("bmp_uuid") for obj in objects if obj.get("bmp_uuid")]
+    session.send_resume(uids)
+    runtime["shared_images"].clear()
+    runtime["material_shadow"].clear()
+    runtime["modifier_shadow"].clear()
+    for obj in objects:
+        _send_object_create(session, obj)
+        uid = obj.get("bmp_uuid")
+        if uid:
+            session.send_transform(uid, [float(value) for row in obj.matrix_world for value in row])
+        _send_object_details(session, obj)
+    for obj in objects:
+        if obj.type != "MESH":
+            continue
+        uid = obj.get("bmp_uuid")
+        if not uid:
+            continue
+        try:
+            mirror = MeshMirror()
+            payload = mirror.full_snapshot(obj.data)
+            session.send_mesh(obj, "snapshot", payload, 0)
+            runtime["mirrors"][uid] = mirror
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+    _push_message(context, "system", f"Resent scene to {name}")
+
+
+def _apply_world_render(context, world_values, render_values) -> None:
+    scene = context.scene
+    if isinstance(world_values, dict) and scene.world is not None:
+        world = scene.world
+        world.use_nodes = True
+        tree = world.node_tree
+        if tree is not None:
+            for node in tree.nodes:
+                if node.type != "BACKGROUND":
+                    continue
+                color = world_values.get("color")
+                if isinstance(color, list) and len(color) == 3:
+                    node.inputs["Color"].default_value = tuple(float(v) for v in color) + (1.0,)
+                strength = world_values.get("strength")
+                if isinstance(strength, (int, float)):
+                    node.inputs["Strength"].default_value = float(strength)
+                break
+    if isinstance(render_values, dict):
+        engine = render_values.get("engine")
+        if engine in {"BLENDER_EEVEE_NEXT", "BLENDER_EEVEE", "CYCLES", "BLENDER_WORKBENCH"}:
+            try:
+                scene.render.engine = engine
+            except Exception:  # noqa: BLE001
+                pass
+        limits = {
+            "resolution_x": (1, 16384),
+            "resolution_y": (1, 16384),
+            "resolution_percentage": (1, 1000),
+            "fps": (1, 240),
+        }
+        for key, (low, high) in limits.items():
+            value = render_values.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                try:
+                    setattr(scene.render, key, max(low, min(high, int(value))))
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+def _checkpoint_scene(context) -> dict:
+    objects = []
+    for obj in context.scene.objects:
+        if obj.get("bmp_ping"):
+            continue
+        body = _object_create_payload(obj)
+        geometry = body.get("geometry") or b""
+        objects.append(
+            {
+                "uuid": body["uuid"],
+                "kind": body["kind"],
+                "meta": body["meta"],
+                "geometry": base64.b64encode(geometry).decode("ascii") if geometry else "",
+            }
+        )
+    camera = context.scene.camera
+    return {
+        "format": 1,
+        "addon": ADDON_VERSION,
+        "blender": bpy.app.version_string,
+        "code": context.window_manager.bmp.code,
+        "objects": objects,
+        "camera": camera.get("bmp_uuid") if camera is not None else None,
+        "world": _world_values(context.scene.world),
+        "render": _render_snapshot(context),
+    }
+
+
+def _restore_checkpoint(context, scene: dict) -> bool:
+    objects = scene.get("objects")
+    if not isinstance(objects, list):
+        return False
+    _clear_scene(context)
+    for item in objects:
+        if not isinstance(item, dict):
+            continue
+        try:
+            geometry = base64.b64decode(str(item.get("geometry", "")).encode("ascii")) if item.get("geometry") else b""
+        except (ValueError, TypeError):
+            geometry = b""
+        _apply_object_create(
+            context,
+            {
+                "uuid": item.get("uuid"),
+                "kind": item.get("kind"),
+                "meta": item.get("meta") or {},
+                "geometry": geometry,
+            },
+        )
+    _apply_world_render(context, scene.get("world"), scene.get("render"))
+    camera_uid = scene.get("camera")
+    if isinstance(camera_uid, str):
+        camera = obj_sync.find(camera_uid)
+        if camera is not None:
+            context.scene.camera = camera
+    runtime["mirrors"].clear()
+    runtime["edit_mirrors"].clear()
+    runtime["object_shadow"].clear()
+    runtime["material_shadow"].clear()
+    runtime["modifier_shadow"].clear()
+    runtime["tracked"].clear()
+    runtime["known_objects"].clear()
+    _prime_objects(context)
+    for obj in context.scene.objects:
+        uid = obj.get("bmp_uuid")
+        if not uid:
+            continue
+        runtime["object_shadow"][uid] = tuple(round(float(value), 6) for row in obj.matrix_world for value in row)
+        if obj.type == "MESH":
+            mirror = MeshMirror()
+            mirror.remember(obj.data)
+            runtime["mirrors"][uid] = mirror
+            runtime["tracked"].add(obj.name)
+        for index, slot in enumerate(getattr(obj, "material_slots", []) or []):
+            if slot.material is not None:
+                runtime["material_shadow"][(uid, index)] = _material_signature(material_values(slot.material))
+        if hasattr(obj, "modifiers"):
+            runtime["modifier_shadow"][uid] = _modifier_signature(modifier_snapshot(obj), object_details(obj))
+    session: SessionService | None = runtime.get("session")
+    if session is not None and session.is_host:
+        session.reset_leases()
+        collections = _collection_snapshot(context)
+        for name in session.peer_names():
+            session.send_scene_reset(name, {"collections": collections})
+            _queue_scene_bootstrap(context, name)
+    return True
+
+
+def _create_checkpoint(context, announce: bool = False) -> str:
+    settings = context.window_manager.bmp
+    scene = _checkpoint_scene(context)
+    path = checkpoints.create(settings.code or "offline", scene)
+    try:
+        blend = path.with_suffix(".blend")
+        bpy.ops.wm.save_as_mainfile(filepath=str(blend), copy=True)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+    if announce:
+        _push_message(context, "system", f"Checkpoint saved: {path.name}")
+    eventlog.log("info", "CHECKPOINT_CREATE", "checkpoint saved", file=path.name, objects=len(scene["objects"]))
+    return str(path)
+
+
+def _maybe_auto_checkpoint(context) -> None:
+    session: SessionService | None = runtime.get("session")
+    if session is None or not session.is_host or not context.scene.objects:
+        return
+    now = time.monotonic()
+    if now - runtime.get("last_checkpoint", 0.0) < 600.0:
+        return
+    runtime["last_checkpoint"] = now
+    try:
+        _create_checkpoint(context, announce=False)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+
+
 def _world_values(world):
     if world is None or not getattr(world, "use_nodes", False) or world.node_tree is None:
         return None
@@ -2366,7 +2855,7 @@ def _finish_scene_bootstrap(context, body: dict | None = None) -> None:
     _push_message(context, "system", "Host scene loaded")
 
 
-def _send_object_create(session: SessionService, obj) -> None:
+def _object_create_payload(obj) -> dict:
     uid = obj.get("bmp_uuid") or str(uuid.uuid4())
     obj["bmp_uuid"] = uid
     kind = _object_kind(obj)
@@ -2423,8 +2912,15 @@ def _send_object_create(session: SessionService, obj) -> None:
         meta["light_type"] = obj.data.type
         meta["energy"] = float(obj.data.energy)
         meta["color"] = list(obj.data.color)[:3]
+    return {"uuid": uid, "kind": kind, "meta": meta, "geometry": geometry}
+
+
+def _send_object_create(session: SessionService, obj) -> None:
+    body = _object_create_payload(obj)
+    uid = body["uuid"]
+    kind = body["kind"]
     try:
-        sent = session.send_object_create(uid, kind, meta, geometry)
+        sent = session.send_object_create(uid, kind, body["meta"], body["geometry"])
     except Exception:  # noqa: BLE001
         traceback.print_exc()
         sent = False
@@ -2432,7 +2928,7 @@ def _send_object_create(session: SessionService, obj) -> None:
         if uid not in runtime["create_errors"]:
             runtime["create_errors"].add(uid)
             _push_message(
-                context,
+                bpy.context,
                 "system",
                 f"{obj.name[:40]} is too large to sync; reduce its geometry and re-import",
             )
@@ -2658,6 +3154,8 @@ def _sync_transforms(context) -> None:
     settings = context.window_manager.bmp
     if session is None or not settings.sync_transforms or settings.paused or runtime.get("bootstrapping"):
         return
+    if not settings.is_host and session.state != "connected":
+        return
     now = time.monotonic()
     if now - runtime["last_transform"] < runtime["transform_interval"]:
         return
@@ -2715,6 +3213,8 @@ def _sync_transforms(context) -> None:
             shadow[uid] = current
             runtime["transform_smoothers"].pop(uid, None)
             runtime["local_transform"][uid] = time.monotonic()
+            runtime["undo"].push(uid, "transform", previous, current)
+            _note_rev(uid)
             session.send_transform(uid, current)
     for stale in list(shadow.keys() - seen):
         del shadow[stale]
@@ -2823,6 +3323,7 @@ def _sync_edit_mesh(context, session: SessionService, obj) -> None:
         return
     if delta is not None:
         rev, payload = delta
+        _note_rev(uid)
         session.send_mesh(obj, "delta", payload, rev)
 
 
@@ -2870,6 +3371,7 @@ def _sync_mesh(context) -> None:
         runtime["mirrors"][uid] = mirror
         try:
             snapshot = mirror.full_snapshot(obj.data)
+            _note_rev(uid)
             session.send_mesh(obj, "snapshot", snapshot, 0)
         except Exception:  # noqa: BLE001
             traceback.print_exc()
@@ -2881,6 +3383,7 @@ def _sync_mesh(context) -> None:
         return
     if delta is not None:
         rev, payload = delta
+        _note_rev(uid)
         session.send_mesh(obj, "delta", payload, rev)
 
 
@@ -3464,6 +3967,14 @@ def _heartbeat_tick(context) -> None:
         settings.recovery_available = True
         _push_message(context, "system", settings.crash_notice)
         eventlog.log("warn", "CRASH_DETECTED", settings.crash_notice, entries=entries[:4])
+    if runtime.get("journal_files"):
+        settings.journal_available = True
+        if not settings.crash_notice:
+            settings.crash_notice = (
+                "Unsynced offline edits were found. Reconnect to the original room, "
+                "then restore the journal."
+            )
+            _push_message(context, "system", settings.crash_notice)
 
 
 def _write_status(context, force: bool = False) -> None:
@@ -3483,7 +3994,7 @@ def _write_status(context, force: bool = False) -> None:
     name = settings.name
     if session is not None:
         live_state = getattr(session, "state", None)
-        if live_state in {"offline", "hosting", "joining", "connected"}:
+        if live_state in {"offline", "hosting", "joining", "connected", "reconnecting"}:
             state = live_state
         code = getattr(session, "code", None) or code
         is_host = bool(getattr(session, "is_host", is_host))
@@ -3528,6 +4039,9 @@ def _write_status(context, force: bool = False) -> None:
             "verify_code": settings.verify_code,
             "last_error": settings.last_error,
             "error_code": settings.last_error_code,
+            "identity_public": getattr(session, "identity_public", "") if session else "",
+            "identity_signature": getattr(session, "identity_signature", "") if session else "",
+            "identity_descriptor": json.dumps(getattr(session, "identity_descriptor", {}) or {}, separators=(",", ":")) if session else "{}",
             "scene": _scene_stats(context) if now - runtime.get("last_scene_stats", 0.0) > 5.0 else runtime.get("scene_stats", {}),
             "relay": bool(stats.get("relay", False)),
             "rtt_ms": live_rtt,
@@ -3772,6 +4286,8 @@ def bmp_tick():
             _sync_modifiers(context)
             _process_image_queue(context)
             _send_presence(context)
+        _journal_capture(context)
+        _maybe_auto_checkpoint(context)
         _pump_scene_bootstrap(context)
         _sync_remote_visuals(context)
         _apply_follow(context)
@@ -4088,6 +4604,127 @@ class BMP_OT_ping_mark(Operator):
         return {"FINISHED"}
 
 
+class BMP_OT_undo_shared(Operator):
+    bl_idname = "bmp.undo_shared"
+    bl_label = "Undo Shared Edit"
+    bl_description = "Undo your last shared edit if nobody else changed that object since"
+
+    def execute(self, context):
+        log = runtime.get("undo")
+        entry = log.pop() if log is not None else None
+        if entry is None:
+            self.report({"INFO"}, "Nothing to undo")
+            return {"CANCELLED"}
+        obj = obj_sync.find(entry.uid)
+        if obj is None:
+            self.report({"WARNING"}, "The object no longer exists")
+            return {"CANCELLED"}
+        if entry.kind != "transform":
+            self.report({"WARNING"}, "That edit cannot be undone safely")
+            return {"CANCELLED"}
+        values = obj_sync.normalize(entry.after)
+        current = tuple(round(float(value), 6) for row in obj.matrix_world for value in row)
+        expected = tuple(round(float(value), 6) for value in values) if values else ()
+        if current != expected:
+            self.report({"WARNING"}, "Changed by someone else; not undone")
+            return {"CANCELLED"}
+        before = obj_sync.normalize(entry.before)
+        if before is None or not obj_sync.apply(entry.uid, before):
+            self.report({"ERROR"}, "Could not restore the previous transform")
+            return {"CANCELLED"}
+        runtime["object_shadow"][entry.uid] = tuple(round(float(value), 6) for value in before)
+        session: SessionService | None = runtime.get("session")
+        if session is not None:
+            _note_rev(entry.uid)
+            session.send_transform(entry.uid, before)
+        self.report({"INFO"}, f"Undid {obj.name}'s last edit")
+        return {"FINISHED"}
+
+
+class BMP_OT_conflict_keep_mine(Operator):
+    bl_idname = "bmp.conflict_keep_mine"
+    bl_label = "Keep My Offline Edit"
+    bl_description = "Replay the next offline edit even though the host changed that object"
+
+    def execute(self, context):
+        _resolve_conflict(context, True)
+        return {"FINISHED"}
+
+
+class BMP_OT_conflict_take_host(Operator):
+    bl_idname = "bmp.conflict_take_host"
+    bl_label = "Take Host Version"
+    bl_description = "Discard the next conflicting offline edit"
+
+    def execute(self, context):
+        _resolve_conflict(context, False)
+        return {"FINISHED"}
+
+
+class BMP_OT_checkpoint_create(Operator):
+    bl_idname = "bmp.checkpoint_create"
+    bl_label = "Create Checkpoint"
+    bl_description = "Save a recovery checkpoint of this scene"
+
+    def execute(self, context):
+        try:
+            path = _create_checkpoint(context, announce=True)
+        except Exception as exc:  # noqa: BLE001
+            traceback.print_exc()
+            self.report({"ERROR"}, f"Checkpoint failed: {exc}")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Checkpoint saved: {path}")
+        return {"FINISHED"}
+
+
+class BMP_OT_checkpoint_restore(Operator):
+    bl_idname = "bmp.checkpoint_restore"
+    bl_label = "Restore Checkpoint"
+    bl_description = "Replace this scene with the newest checkpoint and resync peers"
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        if not settings.is_host and settings.state != "offline":
+            self.report({"ERROR"}, "Only the host can restore a shared scene")
+            return {"CANCELLED"}
+        path = checkpoints.latest(settings.code or "offline")
+        if path is None:
+            self.report({"INFO"}, "No checkpoint found")
+            return {"CANCELLED"}
+        scene = checkpoints.read(path)
+        if not scene or not _restore_checkpoint(context, scene):
+            self.report({"ERROR"}, "Checkpoint is corrupt or unsupported")
+            return {"CANCELLED"}
+        _push_message(context, "system", f"Restored checkpoint {path.name}")
+        eventlog.log("info", "CHECKPOINT_RESTORE", "checkpoint restored", file=path.name)
+        return {"FINISHED"}
+
+
+class BMP_OT_restore_journal(Operator):
+    bl_idname = "bmp.restore_journal"
+    bl_label = "Restore Offline Edits"
+    bl_description = "Replay unsynced offline edits after reconnecting to the original room"
+
+    def execute(self, context):
+        session: SessionService | None = runtime.get("session")
+        settings = context.window_manager.bmp
+        if session is None or settings.state not in {"connected"}:
+            self.report({"WARNING"}, "Reconnect to the original room first")
+            return {"CANCELLED"}
+        _replay_journal(context, {"revs": runtime.get("scene_revs", {})})
+        if settings.conflict_count:
+            self.report({"INFO"}, f"{settings.conflict_count} edit(s) need a conflict decision")
+        else:
+            settings.crash_notice = ""
+            settings.journal_available = False
+            runtime["journal_files"] = []
+            self.report({"INFO"}, "Offline edits restored")
+        return {"FINISHED"}
+
+
 class BMP_OT_recover_checkpoints(Operator):
     bl_idname = "bmp.recover_checkpoints"
     bl_label = "Recover Checkpoints"
@@ -4095,6 +4732,18 @@ class BMP_OT_recover_checkpoints(Operator):
 
     def execute(self, context):
         settings = context.window_manager.bmp
+        try:
+            latest = checkpoints.latest(settings.code or "offline") or checkpoints.latest_any()
+        except OSError:
+            latest = None
+        if latest is not None:
+            scene = checkpoints.read(latest)
+            if scene and _restore_checkpoint(context, scene):
+                settings.crash_notice = ""
+                settings.recovery_available = False
+                eventlog.log("info", "CHECKPOINT_RECOVER", "recovered checkpoint", file=latest.name)
+                _push_message(context, "system", f"Recovered checkpoint {latest.name}")
+                return {"FINISHED"}
         try:
             files = sorted(
                 (
@@ -4133,6 +4782,12 @@ class BMP_OT_dismiss_crash(Operator):
 
     def execute(self, context):
         settings = context.window_manager.bmp
+        for session_id in runtime.get("journal_files", []) or []:
+            journal.clear(session_id)
+        runtime["journal_files"] = []
+        runtime["journal_active"] = False
+        runtime["journal_pending"] = {}
+        settings.journal_available = False
         settings.crash_notice = ""
         settings.recovery_available = False
         return {"FINISHED"}
@@ -4336,6 +4991,12 @@ classes = (
     BMP_OT_deny_edit,
     BMP_OT_recover_checkpoints,
     BMP_OT_dismiss_crash,
+    BMP_OT_conflict_keep_mine,
+    BMP_OT_conflict_take_host,
+    BMP_OT_undo_shared,
+    BMP_OT_checkpoint_create,
+    BMP_OT_checkpoint_restore,
+    BMP_OT_restore_journal,
     BMP_OT_export_log,
 )
 
@@ -4349,10 +5010,27 @@ def register() -> None:
         bpy.utils.register_class(cls)
     bpy.types.WindowManager.bmp = bpy.props.PointerProperty(type=BMPState)
     try:
+        keyconfig = bpy.context.window_manager.keyconfigs.addon
+        if keyconfig is not None:
+            keymap = keyconfig.keymaps.new(name="3D View", space_type="VIEW_3D")
+            item = keymap.keymap_items.new("bmp.undo_shared", "Z", "PRESS", ctrl=True, alt=True)
+            addon_keymaps.append((keymap, item))
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+    try:
         runtime["crash_entries"] = heartbeat.unclean_exits()
     except Exception:  # noqa: BLE001
         traceback.print_exc()
         runtime["crash_entries"] = []
+    try:
+        pending_journals = journal.pending()
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        pending_journals = []
+    if pending_journals:
+        runtime["journal_session"] = pending_journals[0][0]
+        runtime["journal_active"] = True
+        runtime["journal_files"] = [name for name, _path in pending_journals[:8]]
     atexit.register(heartbeat.mark_clean)
     try:
         heartbeat.write("starting", "", {"blender": bpy.app.version_string, "addon": ADDON_VERSION})

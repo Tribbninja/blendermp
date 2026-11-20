@@ -1,4 +1,4 @@
-﻿"""BMP/1 wire protocol.
+"""BMP/1 wire protocol.
 
 Every message is a single frame::
 
@@ -97,6 +97,7 @@ class MessageType(IntEnum):
     SELECTION = 26
     LASER = 27
     ROLE = 38
+    RESUME = 39
 
 
 class Channel(IntEnum):

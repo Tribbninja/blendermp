@@ -18,6 +18,7 @@ Security properties enforced here
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import math
@@ -36,6 +37,8 @@ from typing import Any
 if __package__:
     from . import control
     from .core import image_payload
+    from .core import eventlog
+    from .core import identity
     from .core import material as material_payload
     from .core import object_payload, protocol, tls
     from .core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, ErrorCode, Frame, MessageType
@@ -46,6 +49,8 @@ if __package__:
 else:  # pragma: no cover - allows importing the module standalone (tests)
     import control
     from core import image_payload
+    from core import eventlog
+    from core import identity
     from core import material as material_payload
     from core import object_payload, protocol, tls
     from core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, ErrorCode, Frame, MessageType
@@ -54,6 +59,7 @@ else:  # pragma: no cover - allows importing the module standalone (tests)
     from net.relay import RelayClientAgent, RelayHostAgent
     from sync.leases import LeaseManager, Role, can_edit
 
+RESUME_TTL = 120.0
 MAX_CONTROL = 64 * 1024
 MAX_MESH = 24 * 1024 * 1024
 MAX_VERTICES = 5_000_000
@@ -196,6 +202,8 @@ class Peer:
     queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=256))
     writer_task: asyncio.Task | None = None
     closed: bool = False
+    kicked: bool = False
+    resume_token: str = ""
     sent: int = 0
     bucket: TokenBucket = field(default_factory=lambda: TokenBucket(240.0, 480.0))
 
@@ -249,6 +257,17 @@ class SessionService:
         self.port = int(port or 0)
         self.expected_fingerprint = fingerprint
         self.pin = pin[:64]
+        self._pin_salt = secrets.token_bytes(16)
+        self._pin_hash = (
+            hashlib.scrypt(self.pin.encode("utf-8"), salt=self._pin_salt, n=2**14, r=8, p=1, dklen=32)
+            if self.pin
+            else b""
+        )
+        self._pin_attempts: dict[str, list[float]] = {}
+        self.identity = None
+        self.identity_public = ""
+        self.identity_signature = ""
+        self.identity_descriptor: dict = {}
 
         self.relay_addr: tuple[str, int] | None = None
         self.relay_mode = False
@@ -268,6 +287,10 @@ class SessionService:
         self.failed = False
         self.failure_reason = ""
         self.failure_code = ""
+        self.session_id = secrets.token_hex(16) if host else ""
+        self.resume_token = ""
+        self._ever_connected = False
+        self._recent: dict[str, dict] = {}
         self.fingerprint = ""
         self.bound_port = 0
         self.state = "offline"
@@ -288,6 +311,7 @@ class SessionService:
         self._expiry_notified: set[str] = set()
         self._bytes_in = 0
         self._bytes_out = 0
+        self._revs: dict[str, int] = {}
         self._rtt_ms = 0.0
         self._last_ping = 0.0
         self._last_host_ping = 0.0
@@ -375,10 +399,22 @@ class SessionService:
     def stop(self) -> None:
         loop = self._loop
         if loop and loop.is_running():
-            loop.call_soon_threadsafe(self._request_stop)
+            if not self.is_host and self._writer is not None:
+                loop.call_soon_threadsafe(self._send_bye)
+            else:
+                loop.call_soon_threadsafe(self._request_stop)
         thread = self._thread
         if thread and thread is not threading.current_thread():
             thread.join(timeout=3.0)
+
+    def _send_bye(self) -> None:
+        writer = self._writer
+        if writer is not None:
+            try:
+                writer.write(protocol.encode(protocol.json_frame(MessageType.BYE, {})))
+            except Exception:  # noqa: BLE001
+                pass
+        self._request_stop()
 
     def _request_stop(self) -> None:
         if self._stop_event:
@@ -387,6 +423,15 @@ class SessionService:
     # ------------------------------------------------------------------ helpers
     def _emit(self, kind: str, body: dict[str, Any]) -> None:
         self.inbox.put((kind, body))
+
+    def _identity_body(self) -> dict:
+        if not self.identity_public or not self.identity_signature:
+            return {}
+        return {
+            "public_key": self.identity_public,
+            "signature": self.identity_signature,
+            "descriptor": self.identity_descriptor,
+        }
 
     def _set_state(self, value: str) -> None:
         self.state = value
@@ -415,6 +460,18 @@ class SessionService:
             return
 
         self.fingerprint = fingerprint
+        self.identity = identity.load_or_create()
+        if self.identity:
+            self.identity_public = str(self.identity.get("public", ""))
+            self.identity_descriptor = identity.descriptor(
+                self.code,
+                self.version,
+                self.version,
+                PROTOCOL_VERSION,
+                fingerprint,
+                protocol.DEFAULT_CAPABILITIES,
+            )
+            self.identity_signature = identity.sign(self.identity, self.identity_descriptor)
         if self.relay_mode:
             bind_host = "0.0.0.0"
             port = self.port or 0
@@ -580,6 +637,7 @@ class SessionService:
             return
 
         if frame.type == MessageType.BYE:
+            peer.resume_token = ""
             raise Violation("peer left")
 
         if frame.type == MessageType.PRESENCE:
@@ -641,6 +699,7 @@ class SessionService:
             uid, values = decode_transform(frame.payload)
             if not self._may_edit(peer, uid, now):
                 return
+            self.bump_rev(uid)
             self._broadcast(frame, exclude=peer.peer_id, critical=False)
             self._emit("transform", {"uuid": uid, "matrix": values})
             return
@@ -650,6 +709,7 @@ class SessionService:
             if not self._may_edit(peer, uid, now):
                 return
             self._validate_mesh(frame.type, payload)
+            self.bump_rev(uid)
             self._broadcast(frame, exclude=peer.peer_id, critical=True)
             kind = "mesh_delta" if frame.type == MessageType.MESH_DELTA else "mesh_snapshot"
             self._emit(kind, {"uuid": uid, "rev": rev, "payload": payload})
@@ -773,6 +833,7 @@ class SessionService:
                 uid = object_payload.decode_delete(frame.payload)
             except object_payload.ObjectPayloadError as exc:
                 raise Violation(str(exc)) from exc
+            self._revs[uid] = self._revs.get(uid, 0) + 1
             self._broadcast(frame, exclude=peer.peer_id)
             self._emit("object_delete", {"uuid": uid})
             return
@@ -790,6 +851,7 @@ class SessionService:
             if payload is None:
                 raise Violation("invalid material payload")
             message = {"uuid": uid, "slot": slot, "material": payload}
+            self.bump_rev(uid)
             self._broadcast(protocol.json_frame(MessageType.MATERIAL_UPDATE, message), exclude=peer.peer_id)
             self._emit("material_update", message)
             return
@@ -799,6 +861,7 @@ class SessionService:
             message = self._sanitize_modifiers(body)
             if message is None:
                 raise Violation("invalid modifier stack")
+            self.bump_rev(message["uuid"])
             self._broadcast(protocol.json_frame(MessageType.MODIFIER_STACK, message), exclude=peer.peer_id)
             self._emit("modifier_stack", message)
             return
@@ -839,10 +902,25 @@ class SessionService:
             raise Violation("duplicate hello")
         body = self._json(frame, 4096)
         if self.pin:
+            ip = peer.address.rsplit(":", 1)[0] if ":" in peer.address else peer.address
+            now = time.monotonic()
+            attempts = [stamp for stamp in self._pin_attempts.get(ip, []) if now - stamp < 60.0]
+            if len(attempts) >= 5:
+                self._pin_attempts[ip] = attempts
+                await self._reject_hello(peer, "too many password attempts; wait a minute", ErrorCode.AUTH_FAILED.value)
+                raise Violation("pin rate limited")
             supplied = body.get("pin")
-            if not isinstance(supplied, str) or not hmac.compare_digest(supplied[:64], self.pin):
+            candidate = (
+                hashlib.scrypt(str(supplied)[:64].encode("utf-8"), salt=self._pin_salt, n=2**14, r=8, p=1, dklen=32)
+                if isinstance(supplied, str)
+                else b""
+            )
+            if not candidate or not hmac.compare_digest(candidate, self._pin_hash):
+                attempts.append(now)
+                self._pin_attempts[ip] = attempts
                 await self._reject_hello(peer, "invalid server password", ErrorCode.AUTH_FAILED.value)
                 raise Violation("invalid pin")
+            self._pin_attempts.pop(ip, None)
         peer.app = clean_text(body.get("app"), 32)
         peer.addon = clean_text(body.get("addon"), 32)
         protocol_value = body.get("protocol")
@@ -872,6 +950,62 @@ class SessionService:
                 ErrorCode.UPDATE_REQUIRED.value,
             )
             raise Violation("version mismatch")
+        existing = {other.name for other in self._peers.values() if other.authenticated} | {self.name}
+        now = time.monotonic()
+        resume = body.get("resume")
+        if isinstance(resume, dict) and self.session_id:
+            token = clean_text(resume.get("token"), 64)
+            entry = self._recent.get(token) if token else None
+            if (
+                entry is not None
+                and resume.get("session_id") == self.session_id
+                and now - float(entry.get("last_seen", 0.0)) <= RESUME_TTL
+                and entry.get("name") not in existing
+            ):
+                peer.name = str(entry["name"])
+                peer.color = tuple(entry.get("color", peer.color))
+                peer.role = int(entry.get("role", int(Role.EDITOR)))
+                peer.resume_token = token
+                peer.authenticated = True
+                self._peers[peer.peer_id] = peer
+                entry["last_seen"] = now
+                entry["peer_id"] = peer.peer_id
+                self._recent[token] = entry
+                peers = [
+                    {"name": other.name, "color": list(other.color), "role": int(other.role)}
+                    for other in self._peers.values()
+                    if other.authenticated and other.peer_id != peer.peer_id
+                ]
+                welcome = {
+                    "peer_id": peer.peer_id,
+                    "name": self.name,
+                    "you": peer.name,
+                    "color": list(self.color),
+                    "role": int(peer.role),
+                    "peers": peers,
+                    "fingerprint": self.fingerprint,
+                    "code": self.code,
+                    "leases": self._leases.snapshot(now),
+                    "app": self.version,
+                    "addon": self.version,
+                    "protocol": PROTOCOL_VERSION,
+                    "caps": protocol.DEFAULT_CAPABILITIES,
+                    "revs": dict(self._revs),
+                    "resumed": True,
+                    "session_id": self.session_id,
+                    "resume_token": token,
+                    "identity": self._identity_body(),
+                }
+                peer.enqueue(protocol.encode(protocol.json_frame(MessageType.WELCOME, welcome)), critical=True)
+                self._broadcast(
+                    protocol.json_frame(
+                        MessageType.PRESENCE,
+                        {"name": peer.name, "color": list(peer.color), "joined": True, "role": int(peer.role), "scene": "", "frame": 0, "mode": ""},
+                    ),
+                    exclude=peer.peer_id,
+                )
+                self._emit("peer_resume", {"name": peer.name, "peer_id": peer.peer_id})
+                return
         peer.name = clean_name(body.get("name"))
         # Names are identity for leases, so the host makes them unique.
         existing = {other.name for other in self._peers.values() if other.authenticated} | {self.name}
@@ -880,6 +1014,15 @@ class SessionService:
         peer.color = clean_color(body.get("color"))
         peer.authenticated = True
         self._peers[peer.peer_id] = peer
+        peer.resume_token = secrets.token_urlsafe(24)
+        self._recent[peer.resume_token] = {
+            "name": peer.name,
+            "color": list(peer.color),
+            "role": int(peer.role),
+            "peer_id": peer.peer_id,
+            "last_seen": now,
+            "leases": [],
+        }
 
         peers = [
             {"name": other.name, "color": list(other.color), "role": int(other.role)}
@@ -900,6 +1043,11 @@ class SessionService:
             "addon": self.version,
             "protocol": PROTOCOL_VERSION,
             "caps": protocol.DEFAULT_CAPABILITIES,
+            "revs": dict(self._revs),
+            "resumed": False,
+            "session_id": self.session_id,
+            "resume_token": peer.resume_token,
+            "identity": self._identity_body(),
         }
         peer.enqueue(protocol.encode(protocol.json_frame(MessageType.WELCOME, welcome)), critical=True)
         self._broadcast(
@@ -1228,6 +1376,7 @@ class SessionService:
             protocol.json_frame(MessageType.ROLE, {"name": name, "role": role})
         )
         self._emit("role", {"name": name, "role": role})
+        eventlog.log("info", "ROLE_CHANGE", "role changed", target=name, role=int(role))
 
     def kick(self, name: str) -> None:
         """Ask the host loop to disconnect a peer by its assigned name."""
@@ -1242,6 +1391,9 @@ class SessionService:
         )
         if target is None:
             return
+        target.kicked = True
+        self._recent.pop(target.resume_token, None)
+        eventlog.log("warn", "KICK", "peer kicked", target=name)
         try:
             target.writer.write(
                 protocol.encode(protocol.json_frame(MessageType.KICK, {"message": "Kicked by host"}))
@@ -1265,19 +1417,32 @@ class SessionService:
         self._peers.pop(peer.peer_id, None)
         if was_authenticated:
             now = time.monotonic()
-            released = False
-            for key in self._leases.held_by(peer.name, now):
-                if self._leases.release(key, peer.name):
-                    self._expiry_notified.discard(key)
-                    released = True
-            if released:
-                self._broadcast(
-                    protocol.json_frame(
-                        MessageType.LEASE,
-                        {"action": "release", "leases": self._leases.snapshot(now)},
+            held = self._leases.held_by(peer.name, now)
+            retain = bool(peer.resume_token) and not peer.kicked
+            if retain:
+                entry = self._recent.get(peer.resume_token)
+                if entry is not None:
+                    entry["last_seen"] = now
+                    entry["peer_id"] = peer.peer_id
+                    entry["role"] = int(peer.role)
+                    entry["color"] = list(peer.color)
+                    entry["leases"] = held
+                    self._recent[peer.resume_token] = entry
+            if not retain:
+                self._recent.pop(peer.resume_token, None)
+                released = False
+                for key in held:
+                    if self._leases.release(key, peer.name):
+                        self._expiry_notified.discard(key)
+                        released = True
+                if released:
+                    self._broadcast(
+                        protocol.json_frame(
+                            MessageType.LEASE,
+                            {"action": "release", "leases": self._leases.snapshot(now)},
+                        )
                     )
-                )
-            self._emit("peer_leave", {"name": peer.name})
+            self._emit("peer_leave", {"name": peer.name, "temporary": retain})
             self._broadcast(protocol.json_frame(MessageType.BYE, {"name": peer.name}))
         try:
             await peer.writer.wait_closed()
@@ -1286,21 +1451,24 @@ class SessionService:
 
     # ------------------------------------------------------------------ client
     async def _client_loop(self) -> None:
-        delay = 1.0
+        delay = 0.5
         while self._stop_event and not self._stop_event.is_set():
             try:
                 await self._connect_once()
-                delay = 1.0
+                delay = 0.5
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 if self.failed:
                     return
-                self._emit("error", {"message": str(exc)[:200]})
+                if not self._ever_connected:
+                    self._emit("error", {"message": str(exc)[:200], "code": ErrorCode.PROTOCOL.value})
             if self._stop_event.is_set():
                 return
+            if self._ever_connected:
+                self._set_state("reconnecting")
             await asyncio.sleep(delay)
-            delay = min(delay * 2.0, 10.0)
+            delay = min(delay * 2.0, 30.0)
 
     async def _connect_once(self) -> None:
         try:
@@ -1345,16 +1513,18 @@ class SessionService:
         self.fingerprint = actual or ""
         self._reader = reader
         self._writer = writer
-        writer.write(
-            protocol.encode(
-                protocol.json_frame(
-                    MessageType.HELLO,
-                    {"name": self.name, "color": list(self.color), "pin": self.pin,
-                     "app": self.version, "addon": self.version,
-                     "protocol": PROTOCOL_VERSION, "caps": protocol.DEFAULT_CAPABILITIES},
-                )
-            )
-        )
+        hello = {
+            "name": self.name,
+            "color": list(self.color),
+            "pin": self.pin,
+            "app": self.version,
+            "addon": self.version,
+            "protocol": PROTOCOL_VERSION,
+            "caps": protocol.DEFAULT_CAPABILITIES,
+        }
+        if self.session_id and self.resume_token:
+            hello["resume"] = {"session_id": self.session_id, "token": self.resume_token}
+        writer.write(protocol.encode(protocol.json_frame(MessageType.HELLO, hello)))
         await writer.drain()
 
         frame = await asyncio.wait_for(self._read_frame(reader), timeout=8.0)
@@ -1389,6 +1559,32 @@ class SessionService:
                 f"host is on Blendermp {host_app}; update to {self.version} to join"
             )
             return
+        identity_body = body.get("identity")
+        if not isinstance(identity_body, dict):
+            writer.close()
+            self._fail("host did not present a signed identity; update Blendermp on the host")
+            return
+        public_key = clean_text(identity_body.get("public_key"), 64)
+        signature = clean_text(identity_body.get("signature"), 256)
+        descriptor = identity_body.get("descriptor")
+        if not public_key or not signature or not isinstance(descriptor, dict):
+            writer.close()
+            self._fail("host identity is incomplete")
+            return
+        if not identity.verify(public_key, descriptor, signature):
+            writer.close()
+            self._fail("host identity signature is invalid")
+            return
+        if (
+            descriptor.get("code") != self.code
+            or descriptor.get("cert_fingerprint") != (actual or "")
+            or descriptor.get("protocol") != PROTOCOL_VERSION
+            or not compatible(self.version, str(descriptor.get("app", "")))
+        ):
+            writer.close()
+            self._fail("host identity does not match this session")
+            return
+        self.identity_public = public_key
         self.remote_app = host_app
         caps_value = body.get("caps")
         if isinstance(caps_value, int) and not isinstance(caps_value, bool):
@@ -1397,6 +1593,12 @@ class SessionService:
         if isinstance(role_value, int) and not isinstance(role_value, bool) and 0 <= role_value <= 4:
             self.role = role_value
             self._emit("role", {"name": self.name, "role": role_value})
+        self.session_id = clean_text(body.get("session_id"), 64) or self.session_id
+        self.resume_token = clean_text(body.get("resume_token"), 64) or self.resume_token
+        resumed = bool(body.get("resumed")) and self._ever_connected
+        self._ever_connected = True
+        if resumed:
+            body["resumed"] = True
         self._peer_id = str(body.get("peer_id", ""))[:32]
         self._set_state("connected")
         self._emit("welcome", body)
@@ -1643,6 +1845,13 @@ class SessionService:
             self._emit("scene_reset" if frame.type == MessageType.SCENE_RESET else "scene_ready", body)
             return
 
+        if frame.type == MessageType.RESUME:
+            body = self._json(frame, 4 * 1024 * 1024)
+            objects = body.get("objects")
+            if isinstance(objects, list):
+                self._emit("resume_state", {"objects": [str(item) for item in objects[:100000]]})
+            return
+
         if frame.type == MessageType.ERROR:
             body = self._json(frame, 1024)
             self._emit(
@@ -1689,6 +1898,23 @@ class SessionService:
                     if now - peer.last_seen > PEER_TIMEOUT:
                         asyncio.create_task(self._drop_peer(peer))
                 result = self._leases.sweep(now)
+                expired_tokens = []
+                for token, entry in list(self._recent.items()):
+                    if now - float(entry.get("last_seen", 0.0)) <= RESUME_TTL:
+                        continue
+                    for key in entry.get("leases", []) or []:
+                        self._leases.release(key, entry.get("name"))
+                        self._expiry_notified.discard(key)
+                    expired_tokens.append(token)
+                if expired_tokens:
+                    for token in expired_tokens:
+                        self._recent.pop(token, None)
+                    self._broadcast(
+                        protocol.json_frame(
+                            MessageType.LEASE,
+                            {"action": "released", "leases": self._leases.snapshot(now)},
+                        )
+                    )
                 snapshot = self._leases.snapshot(now)
                 if result.released:
                     self._expiry_notified.difference_update(result.released)
@@ -1729,6 +1955,32 @@ class SessionService:
         if isinstance(extra, dict):
             body.update(extra)
         self._enqueue(protocol.json_frame(MessageType.SCENE_READY, body))
+
+    def send_resume(self, uids) -> None:
+        objects = [str(uid) for uid in list(uids)[:100000]]
+        self._enqueue(protocol.json_frame(MessageType.RESUME, {"objects": objects}))
+
+    def peer_names(self) -> list[str]:
+        return [peer.name for peer in self._peers.values() if peer.authenticated]
+
+    def reset_leases(self) -> None:
+        loop = self._loop
+        if self.is_host and loop and loop.is_running():
+            loop.call_soon_threadsafe(self._reset_leases)
+
+    def _reset_leases(self) -> None:
+        now = time.monotonic()
+        for key in list(self._leases.snapshot(now)):
+            self._leases.release(key)
+        self._broadcast(
+            protocol.json_frame(MessageType.LEASE, {"action": "released", "leases": {}})
+        )
+
+    def bump_rev(self, uid: str) -> int:
+        if not uid:
+            return 0
+        self._revs[uid] = self._revs.get(uid, 0) + 1
+        return self._revs[uid]
 
     def send_presence(self, body: dict[str, Any]) -> None:
         payload = {

@@ -134,7 +134,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.1.17";
+const APP_VERSION = "0.3.0";
 const PROTOCOL_VERSION = 2;
 const CAPABILITIES = 1; // core presence view; keep in sync with core/protocol.py
 const settings = {
@@ -557,6 +557,8 @@ function renderState(status) {
   const blender = status?.blender;
   $("blenderLabel").textContent = blender ? `Blender ${blender}` : settings.blender ? "Blender ready" : "Blender 5.x not detected";
   $("statusRight").textContent = blender ? `Blender ${blender} Â· v${APP_VERSION}` : `v${APP_VERSION}`;
+  const secure = $("secureLabel");
+  if (secure) secure.textContent = status?.identity_public ? "TLS 1.3 + signed host" : "TLS 1.3 + pinned";
   $("stageMode").textContent = state.embedded ? "Blender docked" : active ? "Blender separate" : "no Blender window";
   $("statusLeft").textContent = active
     ? `${labels[value]} - ${hosting ? serverDisplayName() : state.joinedServerName || "server"}`
@@ -1221,6 +1223,16 @@ async function connectServer() {
   await joinServer(server, pin);
 }
 
+function parseIdentityDescriptor(value) {
+  if (!value || typeof value !== "string") return null;
+  try {
+    const body = JSON.parse(value);
+    return body && typeof body === "object" ? body : null;
+  } catch {
+    return null;
+  }
+}
+
 function announceServer() {
   if (!isTauri || !settings.public) return;
   const status = state.status;
@@ -1245,6 +1257,9 @@ function announceServer() {
     protocol: PROTOCOL_VERSION,
     caps: CAPABILITIES,
     min_app: APP_VERSION,
+    identity_public: status.identity_public || "",
+    identity_signature: status.identity_signature || "",
+    identity_descriptor: parseIdentityDescriptor(status.identity_descriptor),
   };
   const lanBody = status.direct_code
     ? { ...body, direct_code: status.direct_code }
