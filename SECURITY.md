@@ -182,5 +182,10 @@ password is still verified by the host.
 The relay's `host` WebSocket requires the installation host key in an
 `X-BMP-Host-Token` header. The Worker hashes it and compares it in constant time
 to the hash registered by the host's announcement; no token and a wrong token
-are rejected with 403. The key is never included in `/servers` responses and is
-not the room code. A client joining the room does not need it.
+are rejected with 403. The hash is persisted by the directory and pushed to the
+room's Durable Object on every announce, and the room verifies the token on the
+WebSocket request itself. Verification is deliberately not a pre-flight
+subrequest from the upgrade path: such a subrequest can resolve to a different
+Durable Object namespace with empty state and reject a legitimate host. The key
+is never included in `/servers` responses and is not the room code. A client
+joining the room does not need it.

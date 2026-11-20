@@ -143,11 +143,14 @@ async function verifyIdentity(body) {
     return { ok: false, error: "incomplete host identity" };
   }
   if (
-    descriptor.code !== cleanCode(body.code) ||
+    cleanCode(descriptor.code) !== cleanCode(body.code) ||
     descriptor.protocol !== Number(body.protocol) ||
     descriptor.app !== cleanText(body.version, 32, false)
   ) {
-    return { ok: false, error: "host identity does not match the announcement" };
+    return {
+      ok: false,
+      error: `host identity does not match the announcement [d.code=${descriptor.code} b.code=${body.code} d.protocol=${descriptor.protocol} b.protocol=${body.protocol} d.app=${descriptor.app} b.version=${body.version}]`,
+    };
   }
   const keyBytes = base64Bytes(publicKey);
   const signatureBytes = base64Bytes(signature);
@@ -172,21 +175,10 @@ export default {
     const url = new URL(request.url);
     if (url.pathname.startsWith("/relay/")) {
       const roomId = url.pathname.slice("/relay/".length).toLowerCase();
-      const role = url.searchParams.get("role");
-      if (role === "host" && /^[0-9a-f]{16}$/.test(roomId)) {
-        const directory = env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));
-        const verify = await directory.fetch(
-          new Request("https://directory/verify", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              room: roomId,
-              token: request.headers.get("x-bmp-host-token") || "",
-            }),
-          }),
-        );
-        if (!verify.ok) return new Response("host token required", { status: 403, headers: CORS });
-      }
+      // The Room verifies the host token against its own storage. Verification
+      // must happen in the request that owns the room: a pre-flight subrequest
+      // to the Directory from a WebSocket upgrade context can land in a
+      // different Durable Object namespace and see empty state.
       const room = env.ROOM.get(env.ROOM.idFromName(roomId || "invalid"));
       return room.fetch(request);
     }
@@ -196,10 +188,32 @@ export default {
 };
 
 export class Hub {
-  constructor(state) {
+  constructor(state, env) {
     this.state = state;
+    this.env = env;
     this.rooms = new Map();
     this.tokens = new Map();
+    this.tokensLoaded = null;
+    this.hostTokenHash = null;
+  }
+
+  // Host tokens must survive Durable Object eviction: the directory listing is
+  // persisted, but an in-memory token map would make every host reconnect fail
+  // with 403 until it re-announces.
+  async loadTokens() {
+    if (!this.tokensLoaded) {
+      this.tokensLoaded = (async () => {
+        const stored = (await this.state.storage.get("tokens")) || {};
+        for (const [room, record] of Object.entries(stored)) {
+          if (record && typeof record.hash === "string") this.tokens.set(room, record);
+        }
+      })();
+    }
+    return this.tokensLoaded;
+  }
+
+  async saveTokens() {
+    await this.state.storage.put("tokens", Object.fromEntries(this.tokens));
   }
 
   async fetch(request) {
@@ -211,10 +225,19 @@ export class Hub {
         const servers = await this.loadServers();
         return json({ ok: true, servers: Object.keys(servers).length });
       }
+      if (url.pathname === "/host-token" && request.method === "POST") {
+        const body = await readJson(request);
+        const hash = typeof body.hash === "string" ? body.hash : "";
+        if (!/^[0-9a-f]{64}$/.test(hash)) return json({ error: "invalid token hash" }, 400);
+        this.hostTokenHash = hash;
+        await this.state.storage.put("host-token", hash);
+        return json({ ok: true });
+      }
       if (url.pathname === "/verify" && request.method === "POST") {
         const body = await readJson(request);
         const room = typeof body.room === "string" ? body.room.toLowerCase() : "";
         const token = cleanToken(body.token);
+        await this.loadTokens();
         const record = this.tokens.get(room);
         if (!record || !token || !timingSafeEqual(record.hash, await hashToken(token))) {
           return json({ error: "invalid host token" }, 403);
@@ -275,11 +298,29 @@ export class Hub {
         if (entry.relay) {
           const room = await roomIdFromCode(entry.code);
           const hash = await hashToken(hostToken);
+          await this.loadTokens();
           const existing = this.tokens.get(room);
           if (existing && !timingSafeEqual(existing.hash, hash)) {
             return json({ error: "this room is already owned by another host" }, 409);
           }
-          this.tokens.set(room, { hash, id: entry.id, seen: now() });
+          if (!existing) {
+            this.tokens.set(room, { hash, id: entry.id, seen: now() });
+            await this.saveTokens();
+          }
+          // The Room enforces the host token on the WebSocket request itself, so
+          // give it the hash on every announce (it may have been evicted).
+          try {
+            const stub = this.env.ROOM.get(this.env.ROOM.idFromName(room));
+            await stub.fetch(
+              new Request("https://room/host-token", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ hash }),
+              }),
+            );
+          } catch {
+            /* the next announce retries */
+          }
         }
         servers[entry.id] = entry;
         await this.state.storage.put("servers", servers);
@@ -293,7 +334,9 @@ export class Hub {
         const entry = servers[body.id];
         if (entry && entry.code) {
           try {
+            await this.loadTokens();
             this.tokens.delete(await roomIdFromCode(entry.code));
+            await this.saveTokens();
           } catch {
             /* ignore a malformed stored entry */
           }
@@ -312,11 +355,13 @@ export class Hub {
     const stored = (await this.state.storage.get("servers")) || {};
     const cutoff = now() - TTL;
     let changed = false;
+    await this.loadTokens();
+    let tokensChanged = false;
     for (const [id, entry] of Object.entries(stored)) {
       if (!entry || entry.seen < cutoff) {
         if (entry && entry.code) {
           try {
-            this.tokens.delete(await roomIdFromCode(entry.code));
+            tokensChanged = this.tokens.delete(await roomIdFromCode(entry.code)) || tokensChanged;
           } catch {
             /* ignore a malformed stored entry */
           }
@@ -326,6 +371,7 @@ export class Hub {
       }
     }
     if (changed) await this.state.storage.put("servers", stored);
+    if (tokensChanged) await this.saveTokens();
     return stored;
   }
 
@@ -339,6 +385,7 @@ export class Hub {
       return new Response("websocket required", { status: 426, headers: CORS });
     }
     if (role === "host") {
+      await this.loadTokens();
       const record = this.tokens.get(roomId);
       if (!record) return new Response("host token required", { status: 403, headers: CORS });
       const supplied = request.headers.get("x-bmp-host-token") || "";
@@ -446,6 +493,17 @@ export class Room extends Hub {
     if (role !== "host" && role !== "join") return new Response("bad role", { status: 400, headers: CORS });
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("websocket required", { status: 426, headers: CORS });
+    }
+    if (role === "host") {
+      if (!this.hostTokenHash) {
+        this.hostTokenHash = (await this.state.storage.get("host-token")) || "";
+      }
+      const record = this.hostTokenHash;
+      if (!record) return new Response("host token required", { status: 403, headers: CORS });
+      const supplied = request.headers.get("x-bmp-host-token") || "";
+      if (!timingSafeEqual(await hashToken(supplied), record)) {
+        return new Response("invalid host token", { status: 403, headers: CORS });
+      }
     }
     let room = this.rooms.get(roomId);
     if (!room) {
