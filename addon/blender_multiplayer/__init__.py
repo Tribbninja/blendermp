@@ -18,6 +18,7 @@ _VENDOR = _Path(os.environ.get("LOCALAPPDATA", _Path.home() / ".local" / "share"
 if _VENDOR.is_dir() and str(_VENDOR) not in sys.path:
     sys.path.insert(0, str(_VENDOR))
 
+import hashlib
 import json
 import queue
 import socket
@@ -45,14 +46,14 @@ from .sync.mesh import EditMirror, MeshMirror
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 1, 3),
+    "version": (0, 1, 4),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
     "category": "Network",
 }
 
-ADDON_VERSION = "0.1.3"
+ADDON_VERSION = "0.1.4"
 TICK = 1.0 / 30.0
 CONTROL_POLL = 0.5
 STATUS_WRITE = 0.5
@@ -60,6 +61,32 @@ MESH_POLL = 1.0 / 20.0
 EDIT_POLL = 1.0 / 30.0
 SELECTION_POLL = 0.2
 LEASE_RENEW = 30.0
+PRESENCE_POLL = 0.2
+REMOTE_POLL = 0.2
+DEFAULT_COLOR = (0.35, 0.8, 0.95, 1.0)
+USER_PALETTE = (
+    (0.35, 0.8, 0.95, 1.0),
+    (0.98, 0.65, 0.25, 1.0),
+    (0.55, 0.85, 0.45, 1.0),
+    (0.85, 0.5, 0.9, 1.0),
+    (0.95, 0.45, 0.45, 1.0),
+    (0.95, 0.85, 0.35, 1.0),
+    (0.45, 0.7, 1.0, 1.0),
+    (0.65, 0.9, 0.8, 1.0),
+)
+
+
+def effective_color(name: str, color) -> tuple:
+    try:
+        values = tuple(float(value) for value in color)[:4]
+    except (TypeError, ValueError):
+        values = DEFAULT_COLOR
+    if len(values) < 4:
+        values = values + (1.0,) * (4 - len(values))
+    if all(abs(values[index] - DEFAULT_COLOR[index]) < 0.02 for index in range(3)):
+        digest = hashlib.sha256(str(name).encode("utf-8")).digest()
+        return USER_PALETTE[digest[0] % len(USER_PALETTE)]
+    return values
 
 runtime: dict = {
     "session": None,
@@ -73,7 +100,14 @@ runtime: dict = {
     "selection": set(),
     "hidden_objects": set(),
     "deselected": {},
+    "owned_leases": set(),
     "last_selection": 0.0,
+    "remote_batches": [],
+    "remote_labels": [],
+    "remote_shader": None,
+    "last_remote": 0.0,
+    "draw_lines": None,
+    "draw_labels": None,
     "lease_renew": 0.0,
     "bootstrapping": False,
     "bootstrap_deadline": 0.0,
@@ -108,6 +142,11 @@ class BMPUser(PropertyGroup):
     frame: IntProperty()
     mode: StringProperty()
     active: StringProperty()
+    view: FloatVectorProperty(size=16)
+    has_view: BoolProperty()
+    view_aspect: FloatProperty(default=1.6)
+    view_persp: StringProperty()
+    selected: StringProperty()
     host: BoolProperty()
 
 
@@ -370,6 +409,7 @@ def stop_session(context, publish: bool = True) -> None:
     runtime["edit_mirrors"].clear()
     runtime["object_shadow"].clear()
     runtime["lease_owners"].clear()
+    runtime["owned_leases"].clear()
     runtime["local_transform"].clear()
     runtime["selection"].clear()
     runtime["hidden_objects"].clear()
@@ -479,6 +519,24 @@ def _handle_event(context, kind: str, body: dict) -> None:
                 user.frame = int(body.get("frame", 0))
                 user.mode = body.get("mode", "")
                 user.active = str(body.get("active", ""))[:64]
+                view = body.get("view")
+                if isinstance(view, list) and len(view) == 16:
+                    try:
+                        values = [float(value) for value in view]
+                    except (TypeError, ValueError):
+                        values = []
+                    if len(values) == 16:
+                        user.view = values
+                        user.has_view = True
+                    else:
+                        user.has_view = False
+                else:
+                    user.has_view = False
+                aspect = body.get("aspect")
+                if isinstance(aspect, (int, float)) and not isinstance(aspect, bool):
+                    user.view_aspect = max(0.1, min(10.0, float(aspect)))
+                user.view_persp = str(body.get("persp", ""))[:16]
+                user.selected = str(body.get("selected", ""))[:512]
                 if body.get("name") == settings.name:
                     user.ping_ms = settings.rtt_ms
         if (
@@ -505,6 +563,11 @@ def _handle_event(context, kind: str, body: dict) -> None:
         action = body.get("action")
         if action != "release" and isinstance(key, str) and isinstance(owner, str):
             runtime["lease_owners"][key] = owner
+        runtime["owned_leases"] = {
+            item
+            for item, lease_owner in runtime["lease_owners"].items()
+            if lease_owner == settings.name
+        }
         if action in {"denied", "held"}:
             _push_message(context, "system", f"Locked by {body.get('owner', 'someone')}")
         elif action == "requested":
@@ -1352,6 +1415,7 @@ def _clear_scene(context, body: dict | None = None) -> None:
     runtime["selection"].clear()
     runtime["hidden_objects"].clear()
     runtime["deselected"].clear()
+    runtime["owned_leases"].clear()
     runtime["last_selection"] = 0.0
     runtime["lease_renew"] = 0.0
 
@@ -1443,6 +1507,11 @@ def _finish_scene_bootstrap(context, body: dict | None = None) -> None:
                 hidden.add(uid)
             except Exception:  # noqa: BLE001
                 pass
+    runtime["owned_leases"] = {
+        uid
+        for uid, owner in runtime["lease_owners"].items()
+        if owner == settings.name
+    }
     _push_message(context, "system", "Host scene loaded")
 
 
@@ -1612,17 +1681,20 @@ def _sync_selection(context) -> None:
         if (uid := obj.get("bmp_uuid"))
     }
     previous = runtime["selection"]
+    owned = runtime["owned_leases"]
 
-    for uid in previous - selected:
-        if owners.get(uid) == settings.name:
-            runtime["deselected"].setdefault(uid, now)
+    # Any lease we own that is no longer selected must be released. This also
+    # covers a lease that was granted after the object was already deselected.
+    for uid in owned - selected:
+        runtime["deselected"].setdefault(uid, now)
     for uid in selected:
         runtime["deselected"].pop(uid, None)
     for uid, stamp in list(runtime["deselected"].items()):
-        if now - stamp < 0.35:
+        if now - stamp < 0.2:
             continue
-        if owners.get(uid) == settings.name:
+        if uid in owned or owners.get(uid) == settings.name:
             _lease_request(session, uid, "release")
+            owned.discard(uid)
             owners.pop(uid, None)
         runtime["deselected"].pop(uid, None)
 
@@ -1632,6 +1704,7 @@ def _sync_selection(context) -> None:
             granted = _lease_request(session, uid, "acquire")
             if granted and session.is_host:
                 owners[uid] = settings.name
+                owned.add(uid)
             owner = owners.get(uid)
         if owner not in (None, settings.name):
             obj = obj_sync.find(uid)
@@ -1748,6 +1821,7 @@ def _sync_edit_mesh(context, session: SessionService, obj) -> None:
         _lease_request(session, uid, "acquire")
         if session.is_host:
             runtime["lease_owners"][uid] = settings.name
+            runtime["owned_leases"].add(uid)
     try:
         import bmesh
         bm = bmesh.from_edit_mesh(obj.data)
@@ -1851,22 +1925,290 @@ def on_frame_change(scene) -> None:
     )
 
 
+def _viewport_view(context):
+    screen = getattr(context, "screen", None)
+    if screen is None:
+        return None
+    area = next((item for item in screen.areas if item.type == "VIEW_3D"), None)
+    if area is None or area.spaces.active is None:
+        return None
+    region_3d = area.spaces.active.region_3d
+    if region_3d is None:
+        return None
+    try:
+        matrix = region_3d.view_matrix.inverted()
+    except Exception:  # noqa: BLE001
+        return None
+    return {
+        "matrix": [float(value) for row in matrix for value in row],
+        "aspect": float(area.width) / max(1.0, float(area.height)),
+        "persp": str(region_3d.view_perspective)[:16],
+    }
+
+
+def _selected_uids(context) -> list:
+    return [
+        uid
+        for obj in context.selected_objects
+        if (uid := obj.get("bmp_uuid")) and not obj.get("bmp_remote")
+    ][:10]
+
+
+def _camera_segments(matrix, aspect: float) -> list:
+    from mathutils import Vector
+
+    distance = 0.7
+    height = 0.22
+    width = height * max(0.6, min(2.6, float(aspect or 1.6)))
+    local = [
+        Vector((0.0, 0.0, 0.0)),
+        Vector((-width, -height, -distance)),
+        Vector((width, -height, -distance)),
+        Vector((width, height, -distance)),
+        Vector((-width, height, -distance)),
+    ]
+    world = [matrix @ point for point in local]
+    return [
+        (world[0], world[1]),
+        (world[0], world[2]),
+        (world[0], world[3]),
+        (world[0], world[4]),
+        (world[1], world[2]),
+        (world[2], world[3]),
+        (world[3], world[4]),
+        (world[4], world[1]),
+    ]
+
+
+def _object_segments(obj) -> list:
+    from mathutils import Vector
+
+    matrix = obj.matrix_world
+    if obj.type == "MESH" and len(obj.data.edges) <= 8000:
+        vertices = obj.data.vertices
+        segments = []
+        for edge in obj.data.edges:
+            first, second = edge.vertices
+            segments.append((matrix @ vertices[first].co, matrix @ vertices[second].co))
+        return segments
+    pairs = (
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    )
+    corners = [matrix @ Vector(corner) for corner in obj.bound_box]
+    return [(corners[first], corners[second]) for first, second in pairs]
+
+
+def _object_label(obj):
+    from mathutils import Vector
+
+    corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+    if not corners:
+        return obj.matrix_world.translation
+    top = max(corners, key=lambda point: point.z)
+    return top + Vector((0.0, 0.0, 0.12))
+
+
+def _build_remote_batches(lines: list) -> list:
+    try:
+        import gpu
+        from gpu_extras.batch import batch_for_shader
+    except ImportError:  # pragma: no cover - background Blender
+        return []
+    shader = runtime.get("remote_shader")
+    if shader is None:
+        try:
+            shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        except Exception:  # noqa: BLE001
+            try:
+                shader = gpu.shader.from_builtin("3D_UNIFORM_COLOR")
+            except Exception:  # noqa: BLE001
+                return []
+        runtime["remote_shader"] = shader
+    batches = []
+    for color, segments in lines:
+        if not segments:
+            continue
+        coords = []
+        for first, second in segments:
+            coords.extend((first.x, first.y, first.z, second.x, second.y, second.z))
+        try:
+            batch = batch_for_shader(shader, "LINES", {"pos": coords})
+        except Exception:  # noqa: BLE001
+            continue
+        batches.append((color, batch))
+    return batches
+
+
+def _sync_remote_visuals(context) -> None:
+    session: SessionService | None = runtime.get("session")
+    now = time.monotonic()
+    if now - runtime["last_remote"] < REMOTE_POLL:
+        return
+    runtime["last_remote"] = now
+    if session is None:
+        runtime["remote_batches"] = []
+        runtime["remote_labels"] = []
+        return
+    settings = context.window_manager.bmp
+    from mathutils import Matrix, Vector
+
+    lines = []
+    labels = []
+    total = 0
+    for user in settings.users:
+        if user.name == settings.name:
+            continue
+        color = effective_color(user.name, user.color)
+        if user.has_view:
+            try:
+                values = list(user.view)
+                matrix = Matrix((values[0:4], values[4:8], values[8:12], values[12:16]))
+            except Exception:  # noqa: BLE001
+                matrix = None
+            if matrix is not None:
+                segments = _camera_segments(matrix, user.view_aspect)
+                lines.append((color, segments))
+                total += len(segments)
+                origin = matrix.translation
+                labels.append((origin + Vector((0.0, 0.0, 0.25)), user.name, color))
+        uids = [uid for uid in str(user.selected or "").split(",") if uid]
+        for uid in uids[:6]:
+            obj = obj_sync.find(uid)
+            if obj is None or obj.get("bmp_remote"):
+                continue
+            segments = _object_segments(obj)
+            if not segments:
+                continue
+            lines.append((color, segments))
+            labels.append((_object_label(obj), user.name, color))
+            total += len(segments)
+            if total > 30000:
+                break
+        if total > 30000:
+            break
+    runtime["remote_labels"] = labels[:24]
+    runtime["remote_batches"] = _build_remote_batches(lines)
+
+
+def _draw_remote_lines() -> None:
+    try:
+        import gpu
+        shader = runtime.get("remote_shader")
+        batches = runtime.get("remote_batches") or []
+        if shader is None or not batches:
+            return
+        gpu.state.blend_set("ALPHA")
+        gpu.state.depth_test_set("NONE")
+        try:
+            gpu.state.line_width_set(2.0)
+        except Exception:  # noqa: BLE001
+            pass
+        for color, batch in batches:
+            shader.uniform_float("color", color)
+            batch.draw(shader)
+        try:
+            gpu.state.line_width_set(1.0)
+        except Exception:  # noqa: BLE001
+            pass
+        gpu.state.depth_test_set("LESS_EQUAL")
+        gpu.state.blend_set("NONE")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _draw_remote_labels() -> None:
+    try:
+        import blf
+        from mathutils import Vector
+    except ImportError:
+        return
+    context = bpy.context
+    region = getattr(context, "region", None)
+    region_data = getattr(context, "region_data", None)
+    if region is None or region_data is None:
+        return
+    labels = runtime.get("remote_labels") or []
+    if not labels:
+        return
+    width = float(region.width)
+    height = float(region.height)
+    matrix = region_data.perspective_matrix
+    font = 0
+    try:
+        blf.size(font, 13)
+    except Exception:  # noqa: BLE001
+        pass
+    for position, name, color in labels:
+        clip = matrix @ Vector((position[0], position[1], position[2], 1.0))
+        if clip.w <= 0.0001:
+            continue
+        x = (clip.x / clip.w * 0.5 + 0.5) * width
+        y = (clip.y / clip.w * 0.5 + 0.5) * height
+        if x < -120 or y < -120 or x > width + 120 or y > height + 120:
+            continue
+        try:
+            blf.color(font, 0.0, 0.0, 0.0, 0.8)
+            blf.position(font, x + 1.0, y - 1.0, 0.0)
+            blf.draw(font, name)
+            blf.color(font, color[0], color[1], color[2], 1.0)
+            blf.position(font, x, y, 0.0)
+            blf.draw(font, name)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _register_remote_draw() -> None:
+    try:
+        from bpy.types import SpaceView3D
+
+        if runtime.get("draw_lines") is None:
+            runtime["draw_lines"] = SpaceView3D.draw_handler_add(
+                _draw_remote_lines, (), "WINDOW", "POST_VIEW"
+            )
+        if runtime.get("draw_labels") is None:
+            runtime["draw_labels"] = SpaceView3D.draw_handler_add(
+                _draw_remote_labels, (), "WINDOW", "POST_PIXEL"
+            )
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+
+
+def _unregister_remote_draw() -> None:
+    for key in ("draw_lines", "draw_labels"):
+        handle = runtime.pop(key, None)
+        if handle is None:
+            continue
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(handle, "WINDOW")
+        except Exception:  # noqa: BLE001
+            pass
+    runtime["remote_batches"] = []
+    runtime["remote_labels"] = []
+
+
 def _send_presence(context) -> None:
     session: SessionService | None = runtime.get("session")
     if session is None:
         return
     now = time.monotonic()
-    if now - runtime["last_presence"] < 1.0:
+    if now - runtime["last_presence"] < PRESENCE_POLL:
         return
     runtime["last_presence"] = now
-    session.send_presence(
-        {
-            "scene": context.scene.name,
-            "frame": context.scene.frame_current,
-            "mode": context.mode,
-            "active": context.active_object.name if context.active_object is not None else "",
-        }
-    )
+    body = {
+        "scene": context.scene.name,
+        "frame": context.scene.frame_current,
+        "mode": context.mode,
+        "active": context.active_object.name if context.active_object is not None else "",
+        "selected": ",".join(_selected_uids(context)),
+    }
+    view = _viewport_view(context)
+    if view:
+        body["view"] = view["matrix"]
+        body["aspect"] = view["aspect"]
+        body["persp"] = view["persp"]
+    session.send_presence(body)
 
 
 def _write_status(context, force: bool = False) -> None:
@@ -1899,7 +2241,7 @@ def _write_status(context, force: bool = False) -> None:
     users = [
         {
             "name": user.name,
-            "color": list(user.color),
+            "color": list(effective_color(user.name, user.color)),
             "ping_ms": user.ping_ms,
             "host": user.host,
             "active": user.active,
@@ -1956,6 +2298,7 @@ def bmp_tick():
             _sync_modifiers(context)
             _send_presence(context)
         _pump_scene_bootstrap(context)
+        _sync_remote_visuals(context)
         if (
             runtime.get("bootstrapping")
             and runtime.get("bootstrap_deadline")
@@ -2284,6 +2627,7 @@ def register() -> None:
     ui.register()
     runtime["started"] = time.monotonic()
     bpy.app.timers.register(bmp_tick, first_interval=0.5, persistent=True)
+    _register_remote_draw()
     bpy.app.handlers.frame_change_post.append(on_frame_change)
 
 
@@ -2291,6 +2635,7 @@ def unregister() -> None:
     if not getattr(bpy, "_blendermp_active", False):
         return
     bpy._blendermp_active = False
+    _unregister_remote_draw()
     try:
         bpy.app.timers.unregister(bmp_tick)
     except ValueError:

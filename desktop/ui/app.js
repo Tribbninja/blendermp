@@ -60,7 +60,7 @@ const store = {
 };
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.1.3";
+const APP_VERSION = "0.1.4";
 const storedDirectory = store.get("directory", DEFAULT_HUB);
 // Drop the localhost values used while developing the Worker hub; a deployment
 // URL (or a deliberately configured hub) is kept.

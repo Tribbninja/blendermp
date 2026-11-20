@@ -490,7 +490,22 @@ class SessionService:
                 "frame": int(body.get("frame", 0)) if isinstance(body.get("frame"), (int, float)) else 0,
                 "mode": clean_text(body.get("mode"), 32),
                 "active": clean_text(body.get("active"), 64),
+                "selected": clean_text(body.get("selected"), 512),
             }
+            view = body.get("view")
+            if isinstance(view, list) and len(view) == 16:
+                try:
+                    values = [float(value) for value in view]
+                except (TypeError, ValueError):
+                    values = []
+                if len(values) == 16 and all(math.isfinite(value) and abs(value) < 1e12 for value in values):
+                    presence["view"] = values
+            aspect = body.get("aspect")
+            if isinstance(aspect, (int, float)) and not isinstance(aspect, bool):
+                presence["aspect"] = max(0.1, min(10.0, float(aspect)))
+            persp = clean_text(body.get("persp"), 16)
+            if persp:
+                presence["persp"] = persp
             self._broadcast(protocol.json_frame(MessageType.PRESENCE, presence), exclude=peer.peer_id)
             self._emit("presence", presence)
             return
@@ -1023,16 +1038,30 @@ class SessionService:
 
         if frame.type == MessageType.PRESENCE:
             body = self._json(frame, 8192)
-            self._emit(
-                "presence",
-                {
-                    "name": clean_text(body.get("name"), MAX_NAME),
-                    "color": clean_color(body.get("color")),
-                    "scene": clean_text(body.get("scene"), 64),
-                    "frame": int(body.get("frame", 0)) if isinstance(body.get("frame"), (int, float)) else 0,
-                    "mode": clean_text(body.get("mode"), 32),
-                },
-            )
+            presence = {
+                "name": clean_text(body.get("name"), MAX_NAME),
+                "color": clean_color(body.get("color")),
+                "scene": clean_text(body.get("scene"), 64),
+                "frame": int(body.get("frame", 0)) if isinstance(body.get("frame"), (int, float)) else 0,
+                "mode": clean_text(body.get("mode"), 32),
+                "active": clean_text(body.get("active"), 64),
+                "selected": clean_text(body.get("selected"), 512),
+            }
+            view = body.get("view")
+            if isinstance(view, list) and len(view) == 16:
+                try:
+                    values = [float(value) for value in view]
+                except (TypeError, ValueError):
+                    values = []
+                if len(values) == 16 and all(math.isfinite(value) and abs(value) < 1e12 for value in values):
+                    presence["view"] = values
+            aspect = body.get("aspect")
+            if isinstance(aspect, (int, float)) and not isinstance(aspect, bool):
+                presence["aspect"] = max(0.1, min(10.0, float(aspect)))
+            persp = clean_text(body.get("persp"), 16)
+            if persp:
+                presence["persp"] = persp
+            self._emit("presence", presence)
             return
 
         if frame.type == MessageType.CHAT:
@@ -1182,7 +1211,23 @@ class SessionService:
             "scene": clean_text(body.get("scene"), 64),
             "frame": int(body.get("frame", 0)) if isinstance(body.get("frame"), (int, float)) else 0,
             "mode": clean_text(body.get("mode"), 32),
+            "active": clean_text(body.get("active"), 64),
+            "selected": clean_text(body.get("selected"), 512),
         }
+        view = body.get("view")
+        if isinstance(view, list) and len(view) == 16:
+            try:
+                values = [float(value) for value in view]
+            except (TypeError, ValueError):
+                values = []
+            if len(values) == 16 and all(math.isfinite(value) and abs(value) < 1e12 for value in values):
+                payload["view"] = values
+        aspect = body.get("aspect")
+        if isinstance(aspect, (int, float)) and not isinstance(aspect, bool):
+            payload["aspect"] = max(0.1, min(10.0, float(aspect)))
+        persp = clean_text(body.get("persp"), 16)
+        if persp:
+            payload["persp"] = persp
         if self.is_host:
             payload.update({"name": self.name, "color": list(self.color)})
         self._enqueue(protocol.json_frame(MessageType.PRESENCE, payload))
