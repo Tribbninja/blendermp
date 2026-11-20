@@ -1,10 +1,10 @@
 # Blendermp Master Roadmap: 0.1.7 -> 1.0
 
 Living implementation plan. Last updated: 2026-11-20.
-Baseline: **0.1.9** (public directory, authenticated relay, TLS pinning, scene
+Baseline: **0.1.10** (public directory, authenticated relay, TLS pinning, scene
 bootstrap, object/transform sync, chunked mesh deltas, live Edit Mode vertex
 streaming, edit leases, presence 2.0, display interpolation, durable settings,
-strict version gate, lease request UX, server-enforced roles).
+strict version gate, lease request UX, server-enforced roles, optional LAN direct).
 
 Progress log:
 - [x] 2026-11-20: `version.json` + `scripts/check_version.py` + test; build fails on drift.
@@ -12,8 +12,9 @@ Progress log:
 - [x] 2026-11-20: CI skeleton for Python tests + version check + JS syntax.
 - [x] 2026-11-20: Phase 1 compatibility gate: version/capability HELLO+WELCOME, legacy-client rejection, directory fields, server-browser preflight, update badges.
 - [x] 2026-11-20: Phase 1 lock reliability: lease sweep broadcasts `expiring`/`released`, snapshot-driven owner cleanup, expiry auto-renew, request queue, host-side grant/deny, lock status in the N-panel.
-- [x] 2026-11-20: Phase 1 presence 2.0: edit-mode vertex selection relay/points, 3D cursor, laser pointer (`Alt+L`), follow-user camera, overlay toggles.
+- [x] 2026-11-20: Phase 1 presence 2.0: edit-mode vertex selection relay/points, 3D cursor, follow-user camera, overlay toggles. Laser pointer removed after poor reliability.
 - [x] 2026-11-20: Phase 1 roles: host assigns viewer/commenter/editor/admin, server-enforced mutating-frame guard, downgrade releases leases, role UI in the desktop member list.
+- [x] 2026-11-20: 0.1.10: LAN direct path (dual listener + local directory `direct_code`), 60 Hz transforms/presence on low latency, 18-25 ms smoothing, client-reported ping, total data stat, stable dock bounds (no scrollbar flash).
 - [ ] Phase 2: live topology, material graphs/textures, object details.
 - [ ] Phase 0 backlog: checked-in e2e harness, diagnostics bundle, error codes, perf baseline, crash marker.
 

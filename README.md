@@ -38,13 +38,14 @@ surface that cross-process re-parenting causes on some GPUs).
 * **Remote presence in the viewport**: each player's viewport camera is drawn as
   a colored view pyramid with a look-direction ray and their name above it, and
   their selected objects are wireframed in their color with a name tag. Camera
-  poses stream at 20 Hz, interpolate at 30 Hz, and are normalized so
-  orthographic zoom cannot distort the widget. Name tags use a DPI-scaled
+  poses stream at up to 30 Hz on low-latency links, interpolate at 60 Hz display
+  rate, and are normalized so orthographic zoom cannot distort the widget. Name
+  tags use a DPI-scaled
   outlined font so they stay crisp. Each user gets a stable color derived from
   their name if they have not chosen one.
 * **Presence 2.0**: remote Edit Mode vertex selections as colored points, a
-  remote 3D cursor crosshair, a fading laser pointer (`Alt+L`), follow a user's
-  viewport, and per-overlay visibility toggles.
+  remote 3D cursor crosshair, follow a user's viewport, and per-overlay
+  visibility toggles.
 * **Server-enforced roles**: the host assigns viewer, commenter, editor or admin
   from the member list. Mutating frames and lease acquisition are rejected for
   viewers/commenters; downgrading releases their leases.
@@ -62,8 +63,9 @@ surface that cross-process re-parenting causes on some GPUs).
 * **Object creation and deletion**: new mesh/empty/camera/light/curve/text objects
   are sent with a full geometry snapshot (mesh) and appear on the other side,
   respecting the source collection name when it exists; deleting sends a UUID
-  tombstone. Transforms stream at 30 Hz and multiple tracked meshes round-robin
-  at 12 Hz.
+  tombstone. Transforms stream at up to 60 Hz on low-latency/LAN links (30 Hz
+  otherwise) and multiple tracked meshes round-robin at 20 Hz. A LAN-discovered
+  host advertises a direct code that bypasses the relay.
 * **Smooth remote motion**: received transforms and vertex deltas are linearly
   eased to their exact target over ~35-45 ms at 60 Hz on the receiving side.
   Network state stays exact; only the local display interpolates, so remote
@@ -94,7 +96,7 @@ surface that cross-process re-parenting causes on some GPUs).
   same animated transition. Blender is hidden while arranging and returns to the
   viewport when you press Done or Escape.
 
-The protocol and engine have **106 passing tests**, including a real TLS
+The protocol and engine have **114 passing tests**, including a real TLS
 host/client session, certificate-mismatch rejection, relay chat, password
 rejection and host kick over a multiplexed tunnel, the public directory API, and
 1,000-vertex delta round-trips under loss/reordering. The Cloudflare Worker hub

@@ -104,6 +104,8 @@ class Directory:
         protocol = clean_int(body.get("protocol", 0), 0, 999)
         caps = clean_int(body.get("caps", 0), 0, 2**31 - 1)
         min_app = clean_text(body.get("min_app", ""), 16, required=False)
+        direct_code_text = clean_text(body.get("direct_code", ""), 16, required=False)
+        direct_code = clean_code(direct_code_text) if direct_code_text else ""
 
         with self._lock:
             self._prune(now)
@@ -122,6 +124,7 @@ class Directory:
                 "protocol": protocol,
                 "caps": caps,
                 "min_app": min_app,
+                "direct_code": direct_code,
                 "seen": now,
             }
             self._servers[server_id] = entry
@@ -155,6 +158,7 @@ class Directory:
                     "protocol": entry["protocol"],
                     "caps": entry["caps"],
                     "min_app": entry["min_app"],
+                    "direct_code": entry["direct_code"],
                     "updated": int(entry["seen"]),
                 }
                 for entry in self._servers.values()

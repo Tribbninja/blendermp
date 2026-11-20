@@ -427,7 +427,7 @@ body.resizing { user-select: none; }
 .members .host-badge { font-size: 8.5px; letter-spacing: .7px; text-transform: uppercase; color: var(--faint); }
 .members .ms { color: var(--faint); font-size: 10px; font-variant-numeric: tabular-nums; }
 
-.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--line-soft); border-radius: 6px; overflow: hidden; }
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--line-soft); border-radius: 6px; overflow: hidden; }
 .stats div { background: var(--bg); padding: 8px; }
 .stats b { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .stats small { display: block; color: var(--faint); font-size: 9px; text-transform: uppercase; letter-spacing: .7px; margin-top: 2px; }
@@ -609,6 +609,9 @@ body.resizing { user-select: none; }
 .bridge-pill.mock { color: #cfa96a; border-color: #3a2f1f; }
 
 .stage-body { position: relative; flex: 1; min-height: 0; overflow: hidden; background: #0b0b0d; }
+#app, #tileViewport { overflow: hidden; }
+#tileViewport, .stage-body { scrollbar-width: none; }
+#tileViewport::-webkit-scrollbar, .stage-body::-webkit-scrollbar { width: 0; height: 0; }
 .placeholder {
   position: absolute;
   inset: 0;

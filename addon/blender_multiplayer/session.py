@@ -24,6 +24,7 @@ import math
 import queue
 import re
 import secrets
+import socket
 import struct
 import threading
 import time
@@ -38,7 +39,7 @@ if __package__:
     from .core import material as material_payload
     from .core import object_payload, protocol, tls
     from .core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, Frame, MessageType
-    from .core.roomcode import FLAG_RELAY, decode_room, room_id
+    from .core.roomcode import FLAG_RELAY, decode_room, encode_room, room_id
     from .core.version import ADDON_VERSION, compatible
     from .net.relay import RelayClientAgent, RelayHostAgent
     from .sync.leases import LeaseManager, Role, can_edit
@@ -48,7 +49,7 @@ else:  # pragma: no cover - allows importing the module standalone (tests)
     from core import material as material_payload
     from core import object_payload, protocol, tls
     from core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, Frame, MessageType
-    from core.roomcode import FLAG_RELAY, decode_room, room_id
+    from core.roomcode import FLAG_RELAY, decode_room, encode_room, room_id
     from core.version import ADDON_VERSION, compatible
     from net.relay import RelayClientAgent, RelayHostAgent
     from sync.leases import LeaseManager, Role, can_edit
@@ -105,6 +106,17 @@ def clean_text(value: Any, limit: int) -> str:
 def clean_name(value: Any, fallback: str = "user") -> str:
     name = clean_text(value, MAX_NAME)
     return name or fallback
+
+
+def _local_ip() -> str:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 80))
+        return probe.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        probe.close()
 
 
 def clean_color(value: Any) -> tuple[float, float, float, float]:
@@ -174,6 +186,7 @@ class Peer:
     last_seen: float = field(default_factory=time.monotonic)
     strikes: int = 0
     rtt_ms: float = 0.0
+    ping_sent: float = 0.0
     queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=256))
     writer_task: asyncio.Task | None = None
     closed: bool = False
@@ -260,6 +273,7 @@ class SessionService:
         self._server: asyncio.AbstractServer | None = None
         self._peers: dict[str, Peer] = {}
         self._peer_id: str | None = None
+        self.direct_code = ""
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._ping_task: asyncio.Task | None = None
@@ -269,6 +283,7 @@ class SessionService:
         self._bytes_out = 0
         self._rtt_ms = 0.0
         self._last_ping = 0.0
+        self._last_host_ping = 0.0
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -393,8 +408,8 @@ class SessionService:
 
         self.fingerprint = fingerprint
         if self.relay_mode:
-            bind_host = "127.0.0.1"
-            port = 0
+            bind_host = "0.0.0.0"
+            port = self.port or 0
         else:
             bind_host = "0.0.0.0"
             port = self.port
@@ -419,6 +434,10 @@ class SessionService:
 
         sockets = self._server.sockets or []
         self.bound_port = sockets[0].getsockname()[1] if sockets else port
+        try:
+            self.direct_code = encode_room(_local_ip(), self.bound_port)
+        except Exception:  # noqa: BLE001
+            self.direct_code = ""
         if self.relay_mode and self.relay_addr:
             self._relay_host = RelayHostAgent(
                 self.relay_addr,
@@ -434,6 +453,7 @@ class SessionService:
             {
                 "code": self.code,
                 "port": self.bound_port,
+                "direct_code": self.direct_code,
                 "fingerprint": fingerprint,
                 "short": tls.short_fingerprint(fingerprint),
                 "relay": self.relay_mode,
@@ -513,6 +533,16 @@ class SessionService:
             peer.enqueue(protocol.encode(Frame(type=MessageType.PONG, payload=frame.payload)), critical=True)
             return
 
+        if frame.type == MessageType.PONG:
+            try:
+                body = json.loads(frame.payload.decode("utf-8"))
+                sent = float(body.get("t", 0.0))
+            except (ValueError, json.JSONDecodeError):
+                return
+            if sent:
+                peer.rtt_ms = max(0.0, min(5000.0, (time.time() - sent) * 1000.0))
+            return
+
         if frame.type == MessageType.BYE:
             raise Violation("peer left")
 
@@ -527,6 +557,11 @@ class SessionService:
                 "active": clean_text(body.get("active"), 64),
                 "selected": clean_text(body.get("selected"), 512),
                 "role": int(peer.role),
+                "ping_ms": (
+                    max(0.0, min(5000.0, float(body["ping_ms"])))
+                    if isinstance(body.get("ping_ms"), (int, float)) and not isinstance(body.get("ping_ms"), bool)
+                    else round(max(0.0, float(peer.rtt_ms)), 1)
+                ),
             }
             cursor = body.get("cursor")
             if isinstance(cursor, list) and len(cursor) == 3:
@@ -1316,6 +1351,9 @@ class SessionService:
             role_value = body.get("role")
             if isinstance(role_value, int) and not isinstance(role_value, bool) and 0 <= role_value <= 4:
                 presence["role"] = role_value
+            ping_value = body.get("ping_ms")
+            if isinstance(ping_value, (int, float)) and not isinstance(ping_value, bool):
+                presence["ping_ms"] = max(0.0, min(5000.0, float(ping_value)))
             cursor = body.get("cursor")
             if isinstance(cursor, list) and len(cursor) == 3:
                 try:
@@ -1616,6 +1654,8 @@ class SessionService:
                 values = []
             if len(values) == 3 and all(math.isfinite(value) and abs(value) < 1e7 for value in values):
                 payload["cursor"] = values
+        if not self.is_host and self._rtt_ms > 0:
+            payload["ping_ms"] = round(max(0.0, min(5000.0, self._rtt_ms)), 1)
         distance = body.get("dist")
         if isinstance(distance, (int, float)) and not isinstance(distance, bool):
             payload["dist"] = max(0.01, min(100000.0, float(distance)))
@@ -1832,16 +1872,20 @@ class SessionService:
                     "protocol": peer.protocol,
                     "caps": peer.caps,
                     "role": int(peer.role),
+                    "rtt_ms": round(max(0.0, float(peer.rtt_ms)), 1),
                 }
                 for peer in self._peers.values()
                 if peer.authenticated
             ]
             bytes_out += sum(peer.sent for peer in self._peers.values())
+            measured = [float(peer.rtt_ms) for peer in self._peers.values() if peer.authenticated and peer.rtt_ms > 0]
+            rtt_ms = round(sum(measured) / len(measured), 1) if measured else 0.0
         else:
             peers = [{"name": "host", "address": self.code, "app": self.remote_app, "caps": self.remote_caps, "role": int(Role.OWNER)}]
+            rtt_ms = round(self._rtt_ms, 1)
         return {
             "state": self.state,
-            "rtt_ms": round(self._rtt_ms, 1),
+            "rtt_ms": rtt_ms,
             "bytes_in": self._bytes_in,
             "bytes_out": bytes_out,
             "peers": peers,

@@ -225,3 +225,21 @@ def test_host_can_kick_client(appdir):
         host.stop()
         host_events.stop()
         client_events.stop()
+
+def test_client_measures_rtt(appdir):
+    port = free_port()
+    code = encode_room("127.0.0.1", port)
+    host_events = Events(queue.Queue())
+    client_events = Events(queue.Queue())
+    host = session_mod.SessionService(host_events.inbox, host=True, code=code, name="host", color=(1, 1, 1, 1), port=port)
+    client = session_mod.SessionService(client_events.inbox, host=False, code=code, name="ada", color=(1, 1, 1, 1), port=port)
+    host.start()
+    client.start()
+    try:
+        assert wait_for(lambda: client.state == "connected")
+        assert wait_for(lambda: client.stats().get("rtt_ms", 0) > 0, timeout=8), client.stats()
+    finally:
+        client.stop()
+        host.stop()
+        host_events.stop()
+        client_events.stop()

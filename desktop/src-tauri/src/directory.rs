@@ -33,6 +33,7 @@ struct Entry {
     password: bool,
     relay: bool,
     version: String,
+    direct_code: String,
     seen: Instant,
 }
 
@@ -113,6 +114,10 @@ fn parse_entry(body: &Value) -> Result<Entry, String> {
     let password = object.get("password").and_then(Value::as_bool).unwrap_or(false);
     let relay = object.get("relay").and_then(Value::as_bool).unwrap_or(false);
     let version = clean_text(object.get("version"), 16, false)?;
+    let direct_code = match object.get("direct_code").and_then(Value::as_str) {
+        Some(value) if !value.trim().is_empty() => clean_code(Some(&Value::String(value.to_string())))?,
+        _ => String::new(),
+    };
     Ok(Entry {
         id,
         name,
@@ -123,6 +128,7 @@ fn parse_entry(body: &Value) -> Result<Entry, String> {
         password,
         relay,
         version,
+        direct_code,
         seen: Instant::now(),
     })
 }
@@ -164,6 +170,7 @@ fn public_list(
                 "password": entry.password,
                 "relay": entry.relay,
                 "version": entry.version,
+                "direct_code": entry.direct_code,
                 "updated": entry.seen.elapsed().as_secs(),
             })
         })

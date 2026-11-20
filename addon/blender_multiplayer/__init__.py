@@ -48,14 +48,14 @@ from .sync.mesh import EditMirror, MeshMirror
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 1, 9),
+    "version": (0, 1, 10),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
     "category": "Network",
 }
 
-TICK = 1.0 / 30.0
+TICK = 1.0 / 60.0
 CONTROL_POLL = 0.5
 STATUS_WRITE = 0.5
 MESH_POLL = 1.0 / 20.0
@@ -64,9 +64,9 @@ SELECTION_POLL = 0.2
 LEASE_RENEW = 30.0
 PRESENCE_POLL = 1.0 / 20.0
 REMOTE_POLL = 1.0 / 30.0
-TRANSFORM_SMOOTH = 0.035
-MESH_SMOOTH = 0.045
-VIEW_SMOOTH = 0.075
+TRANSFORM_SMOOTH = 0.02
+MESH_SMOOTH = 0.03
+VIEW_SMOOTH = 0.05
 DEFAULT_COLOR = (0.35, 0.8, 0.95, 1.0)
 USER_PALETTE = (
     (0.35, 0.8, 0.95, 1.0),
@@ -129,6 +129,13 @@ runtime: dict = {
     "remote_selections": {},
     "remote_points": [],
     "lasers": {},
+    "last_transform": 0.0,
+    "fast_mode": True,
+    "transform_interval": 1.0 / 60.0,
+    "presence_interval": 1.0 / 30.0,
+    "transform_smooth": TRANSFORM_SMOOTH,
+    "mesh_smooth": MESH_SMOOTH,
+    "view_smooth": VIEW_SMOOTH,
     "selection_digest": {},
     "last_edit_sel": 0.0,
     "last_selection_uid": "",
@@ -159,6 +166,7 @@ runtime: dict = {
     "last_presence": 0.0,
     "control_checked": 0.0,
     "started": 0.0,
+    "session_started": 0.0,
     "relay_bridge": None,
 }
 
@@ -220,7 +228,6 @@ class BMPState(PropertyGroup):
     show_cameras: BoolProperty(name="Show cameras", default=True)
     show_selections: BoolProperty(name="Show selections", default=True)
     show_labels: BoolProperty(name="Show name tags", default=True)
-    show_laser: BoolProperty(name="Show laser pointers", default=True)
     host_name: StringProperty()
     sync_transforms: BoolProperty(name="Sync object transforms", default=True)
     users: CollectionProperty(type=BMPUser)
@@ -230,6 +237,8 @@ class BMPState(PropertyGroup):
     lease_info: StringProperty()
     lease_requester: StringProperty()
     role: StringProperty(default="editor")
+    overlay_info: StringProperty()
+    direct_code: StringProperty()
 
 
 def state(context) -> BMPState:
@@ -348,7 +357,11 @@ def start_host(
     settings.is_host = True
     settings.state = "hosting"
     settings.role = "owner"
+    settings.show_cameras = True
+    settings.show_selections = True
+    settings.show_labels = True
     settings.last_error = ""
+    runtime["session_started"] = time.monotonic()
     runtime["bootstrapping"] = False
     runtime["bootstraps"] = {}
     name = settings.name or f"user-{uuid.uuid4().hex[:4]}"
@@ -393,7 +406,11 @@ def start_join(context, code: str, relay_url: str | None = None) -> None:
     settings.is_host = False
     settings.state = "joining"
     settings.role = "editor"
+    settings.show_cameras = True
+    settings.show_selections = True
+    settings.show_labels = True
     settings.last_error = ""
+    runtime["session_started"] = time.monotonic()
     runtime["bootstrapping"] = True
     runtime["bootstrap_deadline"] = time.monotonic() + 20.0
     runtime["bootstraps"] = {}
@@ -518,6 +535,7 @@ def _handle_event(context, kind: str, body: dict) -> None:
             settings.state = value
     elif kind == "host_ready":
         settings.code = body.get("code", settings.code)
+        settings.direct_code = body.get("direct_code", "")
         settings.fingerprint = body.get("fingerprint", "")
         settings.verify_code = body.get("short", "")
         _push_message(context, "system", f"Room {settings.code} ready")
@@ -632,6 +650,9 @@ def _handle_event(context, kind: str, body: dict) -> None:
                 else:
                     user.has_cursor = False
                 user.selected = str(body.get("selected", ""))[:512]
+                ping_value = body.get("ping_ms")
+                if isinstance(ping_value, (int, float)) and not isinstance(ping_value, bool):
+                    user.ping_ms = max(0, min(5000, int(round(float(ping_value)))))
                 if body.get("name") == settings.name:
                     user.ping_ms = settings.rtt_ms
         if (
@@ -729,6 +750,8 @@ def _handle_event(context, kind: str, body: dict) -> None:
         count = body.get("count")
         mask = body.get("mask")
         if name and isinstance(uid, str) and isinstance(count, int) and isinstance(mask, (bytes, bytearray)):
+            if len(mask) != (count + 7) // 8:
+                return
             entry = runtime["remote_selections"].setdefault(name, {})
             if count == 0:
                 entry.pop(uid, None)
@@ -781,7 +804,7 @@ def _handle_event(context, kind: str, body: dict) -> None:
             "start": current,
             "target": tuple(values),
             "t0": time.monotonic(),
-            "duration": TRANSFORM_SMOOTH,
+            "duration": runtime.get("transform_smooth", TRANSFORM_SMOOTH),
         }
         # Remember the final target so the next local sync does not echo it.
         runtime["object_shadow"][uid] = tuple(round(float(value), 6) for value in values)
@@ -853,7 +876,7 @@ def _apply_mesh_delta(context, body: dict) -> None:
         return
     smoother = runtime["mesh_smoothers"].get(uid)
     if smoother is None or smoother.get("obj") is not obj:
-        smoother = {"obj": obj, "entries": {}, "duration": MESH_SMOOTH}
+        smoother = {"obj": obj, "entries": {}, "duration": runtime.get("mesh_smooth", MESH_SMOOTH)}
         runtime["mesh_smoothers"][uid] = smoother
     mesh = obj.data
     now = time.monotonic()
@@ -1982,6 +2005,10 @@ def _sync_transforms(context) -> None:
     settings = context.window_manager.bmp
     if session is None or not settings.sync_transforms or settings.paused or runtime.get("bootstrapping"):
         return
+    now = time.monotonic()
+    if now - runtime["last_transform"] < runtime["transform_interval"]:
+        return
+    runtime["last_transform"] = now
     known = runtime["known_objects"]
     current = set()
     for obj in context.scene.objects:
@@ -2421,7 +2448,7 @@ def _smooth_view(name: str, values, now: float):
         state["target_rotation"] = rotation
         state["started"] = now
         state["key"] = key
-    duration = max(0.001, VIEW_SMOOTH)
+    duration = max(0.001, float(runtime.get("view_smooth", VIEW_SMOOTH)))
     t = min(1.0, max(0.0, (now - state["started"]) / duration))
     state["location"] = state["start_location"].lerp(state["target_location"], t)
     target_rotation = state["target_rotation"].copy()
@@ -2448,6 +2475,9 @@ def _sync_remote_visuals(context) -> None:
     settings = context.window_manager.bmp
     from mathutils import Vector
 
+    show_cameras = bool(getattr(settings, "show_cameras", True))
+    show_selections = bool(getattr(settings, "show_selections", True))
+
     lines = []
     labels = []
     points = []
@@ -2460,7 +2490,7 @@ def _sync_remote_visuals(context) -> None:
             continue
         seen_users.add(user.name)
         color = effective_color(user.name, user.color)
-        if settings.show_cameras and user.has_view:
+        if show_cameras and user.has_view:
             matrix = _smooth_view(user.name, list(user.view), now)
             if matrix is not None:
                 segments = _camera_segments(matrix, user.view_aspect, user.view_distance)
@@ -2473,7 +2503,7 @@ def _sync_remote_visuals(context) -> None:
                 labels.append(
                     (origin + Vector((0.0, 0.0, widget * 0.5)), user.name, color)
                 )
-        if settings.show_cameras and user.has_cursor:
+        if show_cameras and user.has_cursor:
             try:
                 cursor = Vector((float(user.cursor[0]), float(user.cursor[1]), float(user.cursor[2])))
             except (TypeError, ValueError, IndexError):
@@ -2491,17 +2521,6 @@ def _sync_remote_visuals(context) -> None:
                     )
                 )
                 total += 3
-        if settings.show_laser:
-            laser = runtime["lasers"].get(user.name)
-            if laser and now - float(laser.get("stamp", 0.0)) < 1.5:
-                points = [Vector(tuple(point)) for point in laser.get("points", [])]
-                segments = [
-                    (points[index], points[index + 1])
-                    for index in range(len(points) - 1)
-                ]
-                if segments:
-                    lines.append((color, segments))
-                    total += len(segments)
         uids = [uid for uid in str(user.selected or "").split(",") if uid]
         for uid in uids[:6]:
             obj = obj_sync.find(uid)
@@ -2517,7 +2536,7 @@ def _sync_remote_visuals(context) -> None:
                 max_segment = max(max_segment, float((second - first).length))
             if total > 30000:
                 break
-        if settings.show_selections:
+        if show_selections:
             selections = runtime["remote_selections"].get(user.name) or {}
             for uid, entry in list(selections.items())[:4]:
                 obj = obj_sync.find(uid)
@@ -2554,6 +2573,12 @@ def _sync_remote_visuals(context) -> None:
         "labels": len(labels),
         "users": sorted(seen_users),
     }
+    try:
+        settings.overlay_info = (
+            f"{len(labels)} tags, {total} lines, {point_total} points"
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _draw_remote_lines() -> None:
@@ -2583,8 +2608,11 @@ def _draw_remote_lines() -> None:
             except Exception:  # noqa: BLE001
                 pass
             for color, batch in point_batches:
-                shader.uniform_float("color", color)
-                batch.draw(shader)
+                try:
+                    shader.uniform_float("color", color)
+                    batch.draw(shader)
+                except Exception:  # noqa: BLE001
+                    break
             try:
                 gpu.state.point_size_set(1.0)
             except Exception:  # noqa: BLE001
@@ -2699,7 +2727,7 @@ def _send_presence(context) -> None:
     if session is None:
         return
     now = time.monotonic()
-    if now - runtime["last_presence"] < PRESENCE_POLL:
+    if now - runtime["last_presence"] < runtime.get("presence_interval", PRESENCE_POLL):
         return
     runtime["last_presence"] = now
     body = {
@@ -2746,6 +2774,10 @@ def _write_status(context, force: bool = False) -> None:
         if user.name == settings.name:
             user.active = local_active
             break
+    live_rtt = stats.get("rtt_ms", 0)
+    if is_host and not live_rtt:
+        pings = [user.ping_ms for user in settings.users if user.ping_ms > 0]
+        live_rtt = round(sum(pings) / len(pings), 1) if pings else 0
     users = [
         {
             "name": user.name,
@@ -2768,11 +2800,16 @@ def _write_status(context, force: bool = False) -> None:
             "is_host": is_host,
             "name": name,
             "role": "owner" if is_host else settings.role,
+            "overlay_info": settings.overlay_info,
+            "direct_code": settings.direct_code,
+            "uptime": max(0, int(time.monotonic() - runtime.get("session_started", runtime["started"]))),
+            "total_bytes": int(stats.get("bytes_in", 0)) + int(stats.get("bytes_out", 0)),
+            "fast_mode": bool(runtime.get("fast_mode", True)),
             "fingerprint": settings.fingerprint,
             "verify_code": settings.verify_code,
             "last_error": settings.last_error,
             "relay": bool(stats.get("relay", False)),
-            "rtt_ms": stats.get("rtt_ms", 0),
+            "rtt_ms": live_rtt,
             "bytes_in": stats.get("bytes_in", 0),
             "bytes_out": stats.get("bytes_out", 0),
             "peers": stats.get("peers", []),
@@ -2801,7 +2838,7 @@ def _smooth_transforms(context) -> None:
         if not _object_alive(obj):
             runtime["transform_smoothers"].pop(uid, None)
             continue
-        duration = float(item.get("duration") or TRANSFORM_SMOOTH)
+        duration = float(item.get("duration") or runtime.get("transform_smooth", TRANSFORM_SMOOTH))
         t = min(1.0, max(0.0, (now - item["t0"]) / max(0.001, duration)))
         start = item["start"]
         target = item["target"]
@@ -2855,7 +2892,7 @@ def _smooth_meshes(context) -> None:
             continue
         mesh = obj.data
         entries = item.get("entries") or {}
-        duration = float(item.get("duration") or MESH_SMOOTH)
+        duration = float(item.get("duration") or runtime.get("mesh_smooth", MESH_SMOOTH))
         changed = False
         for index, (start, target, t0) in list(entries.items()):
             t = min(1.0, max(0.0, (now - t0) / max(0.001, duration)))
@@ -2967,6 +3004,27 @@ def _apply_follow(context) -> None:
         pass
 
 
+def _update_timing(session: SessionService | None) -> None:
+    """Use the fastest rates and shortest smoothing when latency is low."""
+    rtt = 0.0
+    relay = False
+    if session is not None:
+        try:
+            stats = session.stats()
+            rtt = float(stats.get("rtt_ms") or 0.0)
+            relay = bool(stats.get("relay"))
+        except Exception:  # noqa: BLE001
+            rtt = 0.0
+            relay = False
+    fast = not relay or rtt <= 0.0 or rtt <= 60.0
+    runtime["fast_mode"] = fast
+    runtime["transform_interval"] = 1.0 / 60.0 if fast else 1.0 / 30.0
+    runtime["presence_interval"] = 1.0 / 30.0 if fast else 1.0 / 20.0
+    runtime["transform_smooth"] = 0.018 if fast else 0.035
+    runtime["mesh_smooth"] = 0.025 if fast else 0.045
+    runtime["view_smooth"] = 0.045 if fast else 0.075
+
+
 def bmp_tick():
     context = bpy.context
     if context is None or context.window_manager is None:
@@ -2974,6 +3032,7 @@ def bmp_tick():
     try:
         _poll_control(context)
         session: SessionService | None = runtime.get("session")
+        _update_timing(session)
         inbox = runtime["inbox"]
         _expire_pings(context)
         while True:
@@ -3275,62 +3334,6 @@ class BMP_OT_follow_user(Operator):
         return {"FINISHED"}
 
 
-class BMP_OT_laser(Operator):
-    bl_idname = "bmp.laser"
-    bl_label = "Laser Pointer"
-    bl_description = "Drag in the viewport to draw a temporary laser for others"
-
-    _points: list = []
-    _last: float = 0.0
-
-    def invoke(self, context, event):
-        session: SessionService | None = runtime.get("session")
-        if session is None:
-            self.report({"ERROR"}, "Not connected")
-            return {"CANCELLED"}
-        self._points = []
-        self._last = 0.0
-        context.window_manager.modal_handler_add(self)
-        return {"RUNNING_MODAL"}
-
-    def _send(self) -> None:
-        session: SessionService | None = runtime.get("session")
-        if session is not None and self._points:
-            session.send_laser(self._points)
-        self._last = time.monotonic()
-
-    def modal(self, context, event):
-        if event.type in {"ESC", "RIGHTMOUSE"}:
-            return {"CANCELLED"}
-        if event.type == "LEFTMOUSE" and event.value == "RELEASE":
-            self._send()
-            return {"FINISHED"}
-        if event.type == "MOUSEMOVE":
-            region = getattr(context, "region", None)
-            region_data = getattr(context, "region_data", None)
-            if region is not None and region_data is not None and region.type == "WINDOW":
-                try:
-                    from bpy_extras.view3d_utils import (
-                        region_2d_to_origin_3d,
-                        region_2d_to_vector_3d,
-                    )
-
-                    position = (event.mouse_region_x, event.mouse_region_y)
-                    origin = region_2d_to_origin_3d(region, region_data, position)
-                    direction = region_2d_to_vector_3d(region, region_data, position)
-                    distance = max(1.0, float(region_data.view_distance or 7.0) * 0.5)
-                    point = origin + direction * distance
-                    self._points.append((float(point.x), float(point.y), float(point.z)))
-                    if len(self._points) > 64:
-                        self._points.pop(0)
-                    now = time.monotonic()
-                    if now - self._last > 0.05:
-                        self._send()
-                except Exception:  # noqa: BLE001
-                    pass
-        return {"RUNNING_MODAL"}
-
-
 class BMP_OT_ping(Operator):
     bl_idname = "bmp.ping"
     bl_label = "Ping"
@@ -3398,7 +3401,6 @@ classes = (
     BMP_OT_untrack_mesh,
     BMP_OT_ping,
     BMP_OT_ping_mark,
-    BMP_OT_laser,
     BMP_OT_follow_user,
     BMP_OT_share_images,
     BMP_OT_request_edit,
@@ -3417,14 +3419,6 @@ def register() -> None:
         bpy.utils.register_class(cls)
     bpy.types.WindowManager.bmp = bpy.props.PointerProperty(type=BMPState)
     ui.register()
-    try:
-        keyconfig = bpy.context.window_manager.keyconfigs.addon
-        if keyconfig is not None and not addon_keymaps:
-            keymap = keyconfig.keymaps.new(name="3D View", space_type="VIEW_3D")
-            item = keymap.keymap_items.new("bmp.laser", "L", "PRESS", alt=True)
-            addon_keymaps.append((keymap, item))
-    except Exception:  # noqa: BLE001
-        traceback.print_exc()
     runtime["started"] = time.monotonic()
     bpy.app.timers.register(bmp_tick, first_interval=0.5, persistent=True)
     if not bpy.app.timers.is_registered(bmp_smooth_tick):

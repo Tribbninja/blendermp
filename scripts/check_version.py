@@ -73,6 +73,12 @@ def main() -> int:
     version = expected_version()
     values = collect()
     bad = {name: value for name, value in values.items() if value != version}
+    if re.search(
+        r'^ADDON_VERSION\s*=',
+        _read(ROOT / "addon" / "blender_multiplayer" / "__init__.py"),
+        re.MULTILINE,
+    ):
+        bad["stale ADDON_VERSION in __init__.py"] = "present"
     crate = crate_version()
     cargo = _search(ROOT / "desktop" / "src-tauri" / "Cargo.toml", r'^version\s*=\s*"([^"]+)"')
     if crate and cargo != crate:

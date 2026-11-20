@@ -243,15 +243,18 @@ def read_session() -> dict[str, Any] | None:
 def write_status(data: dict[str, Any]) -> None:
     """Write a bounded, sanitised status document atomically."""
     safe: dict[str, Any] = {}
-    for key in ("state", "code", "name", "addon", "blender", "fingerprint", "verify_code", "last_error", "role"):
+    for key in ("state", "code", "name", "addon", "blender", "fingerprint", "verify_code", "last_error", "role", "overlay_info", "direct_code"):
         value = data.get(key)
         if isinstance(value, str):
             safe[key] = value[:256]
-    for key in ("is_host", "relay"):
+    for key in ("is_host", "relay", "fast_mode"):
         value = data.get(key)
         if isinstance(value, bool):
             safe[key] = value
-    for key in ("rtt_ms", "bytes_in", "bytes_out", "pid"):
+    rtt = data.get("rtt_ms")
+    if isinstance(rtt, (int, float)) and not isinstance(rtt, bool):
+        safe["rtt_ms"] = round(max(0.0, min(5000.0, float(rtt))), 1)
+    for key in ("bytes_in", "bytes_out", "pid", "uptime", "total_bytes"):
         value = data.get(key)
         if isinstance(value, int) and not isinstance(value, bool):
             safe[key] = max(-1, min(value, 1 << 62))

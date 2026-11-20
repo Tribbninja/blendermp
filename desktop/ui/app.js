@@ -134,7 +134,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.1.9";
+const APP_VERSION = "0.1.10";
 const PROTOCOL_VERSION = 2;
 const CAPABILITIES = 1; // core presence view; keep in sync with core/protocol.py
 const settings = {
@@ -234,6 +234,7 @@ const state = {
   wasHosting: false,
   offlineStreak: 0,
   demo: demoMode,
+  boundsKey: "",
 };
 
 let serverSearchTimer = 0;
@@ -418,18 +419,29 @@ async function updateBounds() {
     boundsPending = true;
     return;
   }
+  const box = insets();
+  const key = [
+    Math.round(box.x),
+    Math.round(box.y),
+    Math.round(box.width),
+    Math.round(box.height),
+    Math.round(box.viewportW),
+    Math.round(box.viewportH),
+  ].join(":");
+  if (key === state.boundsKey) return;
+  state.boundsKey = key;
   boundsBusy = true;
   try {
-    const box = insets();
     await invoke("set_embed_bounds", {
-      xPx: box.x,
-      yPx: box.y,
-      widthPx: box.width,
-      heightPx: box.height,
-      viewportW: box.viewportW,
-      viewportH: box.viewportH,
+      xPx: Math.round(box.x),
+      yPx: Math.round(box.y),
+      widthPx: Math.round(box.width),
+      heightPx: Math.round(box.height),
+      viewportW: Math.round(box.viewportW),
+      viewportH: Math.round(box.viewportH),
     });
   } catch (error) {
+    state.boundsKey = "";
     log(`bounds failed: ${error}`);
     const alive = await invoke("blender_running").catch(() => true);
     if (alive === false) {
@@ -702,6 +714,8 @@ function renderStats(status) {
 
   $("downValue").textContent = state.rates.down > 0 ? state.rates.down.toFixed(0) : "0";
   $("upValue").textContent = state.rates.up > 0 ? state.rates.up.toFixed(0) : "0";
+  const total = (bytesIn + bytesOut) / (1024 * 1024);
+  $("totalValue").textContent = total > 0.01 ? total.toFixed(1) : "0";
 
   const rtt = Number(status?.rtt_ms || 0);
   if (rtt > 0) {
@@ -934,11 +948,13 @@ async function joinServer(server, pin = "") {
     return;
   }
   removeServer();
-  const relayUrl = server.relay_url || (server.relay ? hubRelayUrl() : "");
+  const directCode = server.lan ? String(server.direct_code || "").trim() : "";
+  const code = directCode || server.code;
+  const relayUrl = directCode ? "" : server.relay_url || (server.relay ? hubRelayUrl() : "");
   try {
     await request({
       action: "join",
-      code: server.code,
+      code,
       name: settings.name,
       pin: pin || null,
       relay_url: relayUrl || null,
@@ -1032,7 +1048,7 @@ async function loadServers() {
       const response = await fetch(`${url}/servers?q=${query}&limit=100`, { cache: "no-store" });
       if (!response.ok) throw new Error(`directory returned ${response.status}`);
       const body = await response.json();
-      return Array.isArray(body.servers) ? body.servers : [];
+      return { url, servers: Array.isArray(body.servers) ? body.servers : [] };
     }),
   );
 
@@ -1043,9 +1059,18 @@ async function loadServers() {
       failures += 1;
       continue;
     }
-    for (const server of result.value) {
+    const { url, servers } = result.value;
+    const lan =
+      url === state.localDirectory ||
+      url === state.lanDirectory ||
+      state.discovered.some((item) => item && item.url === url);
+    for (const server of servers) {
       if (!server || !server.code) continue;
-      merged.set(server.code, server);
+      const entry = { ...server, lan };
+      const existing = merged.get(server.code);
+      if (!existing || (entry.direct_code && !existing.direct_code)) {
+        merged.set(server.code, entry);
+      }
     }
   }
   if (failures === unique.length) {
@@ -1120,6 +1145,12 @@ function renderServers(message) {
       const badge = document.createElement("span");
       badge.className = "badge";
       badge.textContent = "relay";
+      tags.append(badge);
+    }
+    if (server.lan) {
+      const badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = "LAN";
       tags.append(badge);
     }
     if (!compat.ok) {
@@ -1197,12 +1228,15 @@ function announceServer() {
     caps: CAPABILITIES,
     min_app: APP_VERSION,
   };
+  const lanBody = status.direct_code
+    ? { ...body, direct_code: status.direct_code }
+    : body;
   Promise.allSettled(
     targets.map(async (url) => {
       const response = await fetch(`${url}/announce`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify(url === state.localDirectory ? lanBody : body),
         cache: "no-store",
       });
       if (!response.ok) throw new Error(`directory returned ${response.status}`);
@@ -1493,6 +1527,11 @@ async function boot() {
   });
   markBridge();
   setPanel("session");
+  try {
+    new ResizeObserver(scheduleBounds).observe(document.querySelector(".stage-body"));
+  } catch {
+    /* ResizeObserver is optional */
+  }
   $("meAvatar").textContent = initials(settings.name);
   $("serverName").value = settings.serverName || `${settings.name}'s server`;
   $("serverPublic").checked = settings.public;
