@@ -80,6 +80,49 @@ fn data_dir() -> PathBuf {
     base.join(APP_DIR)
 }
 
+fn copy_dir_all(source: &Path, target: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        let destination = target.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir_all(&path, &destination)?;
+        } else {
+            fs::copy(&path, &destination)?;
+        }
+    }
+    Ok(())
+}
+
+fn python_vendor_paths() -> Vec<PathBuf> {
+    let mut paths = vec![data_dir().join("python")];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(directory) = exe.parent() {
+            let bundled = directory.join("python");
+            if bundled.is_dir() {
+                paths.push(bundled);
+            }
+        }
+    }
+    paths
+}
+
+fn ensure_python_vendor() {
+    let target = data_dir().join("python");
+    if target.join("cryptography").is_dir() && target.join("cffi").is_dir() {
+        return;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(directory) = exe.parent() {
+            let bundled = directory.join("python");
+            if bundled.is_dir() {
+                let _ = copy_dir_all(&bundled, &target);
+            }
+        }
+    }
+}
+
 fn normalize_code(value: &str) -> Result<String, String> {
     let cleaned: String = value
         .chars()
@@ -267,6 +310,14 @@ fn launch_blender(state: State<AppState>, path: String, blend_file: Option<Strin
 
     let mut command = Command::new(&exe);
     command.arg("--python-expr").arg(expression);
+    ensure_python_vendor();
+    let mut python_paths = python_vendor_paths();
+    if let Some(existing) = std::env::var_os("PYTHONPATH") {
+        python_paths.extend(std::env::split_paths(&existing));
+    }
+    if let Ok(value) = std::env::join_paths(python_paths) {
+        command.env("PYTHONPATH", value);
+    }
     if let Some(file) = blend_file {
         if !file.is_empty() {
             let blend = PathBuf::from(&file).canonicalize().map_err(|_| "blend file does not exist".to_string())?;

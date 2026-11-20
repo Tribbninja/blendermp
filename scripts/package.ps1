@@ -63,6 +63,17 @@ if (-not (Test-Path $loader)) { throw 'WebView2Loader.dll was not produced by th
 Copy-Item $loader $appDir
 Copy-Item (Join-Path $root 'addon') (Join-Path $appDir 'addon') -Recurse
 Get-ChildItem (Join-Path $appDir 'addon') -Directory -Filter '__pycache__' -Recurse | Remove-Item -Recurse -Force
+# Bundle Blender's TLS dependency (cp313) so a fresh PC can host without pip.
+$vendorSource = Join-Path $env:LOCALAPPDATA 'Blendermp\python'
+$vendorTarget = Join-Path $appDir 'python'
+if (Test-Path (Join-Path $vendorSource 'cryptography')) {
+    Copy-Item $vendorSource $vendorTarget -Recurse
+    Get-ChildItem $vendorTarget -Directory -Filter '__pycache__' -Recurse | Remove-Item -Recurse -Force
+    Write-Host "Bundled Python vendor: $vendorTarget" -ForegroundColor Green
+} else {
+    New-Item -ItemType Directory -Force -Path $vendorTarget | Out-Null
+    Write-Host 'WARNING: vendor python (cryptography) not found; the installer will need it for TLS hosting.' -ForegroundColor Yellow
+}
 Copy-Item (Join-Path $root 'README.md') $appDir
 Copy-Item (Join-Path $root 'SECURITY.md') $appDir
 Copy-Item (Join-Path $root 'LICENSE') $appDir

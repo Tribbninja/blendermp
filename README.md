@@ -212,10 +212,11 @@ Tool prerequisites:
 * Blender 5.x
 * Python 3.11+ for tests, with `numpy`, `pytest`, `cryptography`
 
-Blender's Python disables the user site, so the bootstrap installs
-`cryptography` into `%LOCALAPPDATA%\Blendermp\python`, which the addon adds to
-`sys.path` at load time. Without it the addon still loads and reports a clear
-error instead of crashing.
+Blender's Python disables the user site, so the installer bundles a cp313
+`cryptography` vendor tree into `%LOCALAPPDATA%\Blendermp\python`, which the
+addon adds to `sys.path` at load time. The desktop app also sets `PYTHONPATH`
+and copies the vendor from a portable install if it is missing. Without it the
+addon still loads and reports a clear error instead of crashing.
 
 ## Layout
 

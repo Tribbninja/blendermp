@@ -9,7 +9,7 @@ Unicode true
 
 !define APPNAME "Blendermp"
 !ifndef VERSION
-!define VERSION "0.1.13"
+!define VERSION "0.1.14"
 !endif
 !define PUBLISHER "Blendermp"
 !define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Blendermp"
@@ -203,6 +203,11 @@ Section "Blendermp" SecMain
 
     SetOutPath "$INSTDIR\addon"
     File /r "..\dist\blendermp\addon\*.*"
+
+    ; Python wheels used by Blender for TLS certificate generation. Install
+    ; into app data so Blender's addon search path finds them.
+    SetOutPath "$LOCALAPPDATA\Blendermp\python"
+    File /r "..\dist\blendermp\python\*.*"
 
     WriteUninstaller "$INSTDIR\Uninstall.exe"
     WriteRegStr HKCU "Software\Blendermp" "InstallDir" "$INSTDIR"
