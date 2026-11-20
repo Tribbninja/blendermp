@@ -107,6 +107,8 @@ class BMP_PT_main(bpy.types.Panel):
         box.prop(settings, "sync_mesh")
         box.prop(settings, "sync_materials")
         box.prop(settings, "sync_modifiers")
+        box.prop(settings, "sync_visible_only")
+        box.operator("bmp.toggle_mute", text="Mute active object", icon="HIDE_ON")
         box.prop(settings, "paused")
         box.prop(settings, "follow_host")
         box.prop(settings, "show_cameras")

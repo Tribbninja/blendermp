@@ -31,6 +31,7 @@ import threading
 import time
 import traceback
 import uuid as uuidlib
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -210,11 +211,28 @@ class Peer:
     resume_token: str = ""
     sent: int = 0
     bucket: TokenBucket = field(default_factory=lambda: TokenBucket(240.0, 480.0))
+    subscriptions: dict[str, str] = field(default_factory=dict)
+    priorities: dict[str, int] = field(default_factory=dict)
+    last_sent: dict[tuple[str, int], float] = field(default_factory=dict)
+    stats: dict = field(default_factory=dict)
+    quality: int = 0
+    byte_window: deque = field(default_factory=deque)
+    pending: dict[tuple[str, int], tuple[bytes, float, bool]] = field(default_factory=dict)
+    dropped: bool = False
 
     def enqueue(self, data: bytes, critical: bool = False) -> None:
+        now = time.monotonic()
+        while self.byte_window and now - self.byte_window[0][0] > 1.0:
+            self.byte_window.popleft()
+        used = sum(size for _stamp, size in self.byte_window)
+        if not critical and used + len(data) > 1024 * 1024:
+            self.dropped = True
+            return
         try:
             self.queue.put_nowait(data)
+            self.byte_window.append((now, len(data)))
         except asyncio.QueueFull:
+            self.dropped = True
             if critical:
                 raise Violation("peer is not keeping up")
             # Non-critical frames (transforms, presence) are dropped rather than
@@ -699,6 +717,64 @@ class SessionService:
                 message = {"name": peer.name, "color": list(peer.color), "text": text}
                 self._broadcast(protocol.json_frame(MessageType.CHAT, message), exclude=peer.peer_id)
                 self._emit("chat", message)
+            return
+
+        if frame.type == MessageType.SUBSCRIPTION:
+            body = self._json(frame, 1024 * 1024)
+            uids = body.get("uids")
+            modes = body.get("modes")
+            priorities = body.get("priorities")
+            if not isinstance(uids, list) or len(uids) > 20000:
+                raise Violation("invalid subscription list")
+            if modes is not None and not isinstance(modes, dict):
+                raise Violation("invalid subscription modes")
+            if priorities is not None and not isinstance(priorities, dict):
+                raise Violation("invalid subscription priorities")
+            subscriptions = {}
+            for uid in uids:
+                if not isinstance(uid, str):
+                    continue
+                try:
+                    uid = str(uuidlib.UUID(uid))
+                except ValueError:
+                    continue
+                mode = modes.get(uid, "full") if isinstance(modes, dict) else "full"
+                if mode not in {"full", "key", "mute"}:
+                    mode = "full"
+                subscriptions[uid] = mode
+            peer.subscriptions = subscriptions
+            clean_priorities = {}
+            if isinstance(priorities, dict):
+                for uid, value in list(priorities.items())[:20000]:
+                    if not isinstance(uid, str) or not isinstance(value, int) or isinstance(value, bool):
+                        continue
+                    try:
+                        clean_priorities[str(uuidlib.UUID(uid))] = max(0, min(2, value))
+                    except ValueError:
+                        continue
+            peer.priorities = clean_priorities
+            return
+
+        if frame.type == MessageType.CLIENT_STATS:
+            body = self._json(frame, 4096)
+            stats = {}
+            for key in ("apply_ms_p95", "fps", "rx_kbps", "tx_kbps", "queue_depth"):
+                value = body.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
+                    stats[key] = max(0.0, min(1e9, float(value)))
+            peer.stats = stats
+            apply_ms = float(stats.get("apply_ms_p95", 0.0))
+            fps = float(stats.get("fps", 60.0))
+            queue_depth = float(stats.get("queue_depth", 0.0))
+            quality = 0
+            if apply_ms > 25.0 or fps < 30.0 or queue_depth > 200:
+                quality = 2
+            elif apply_ms > 15.0 or fps < 45.0 or queue_depth > 80:
+                quality = 1
+            if quality < peer.quality:
+                quality = max(quality, peer.quality - 1)
+            peer.quality = quality
+            self._emit("client_stats", {"name": peer.name, **stats, "quality": quality})
             return
 
         if frame.type == MessageType.TRANSFORM:
@@ -1436,10 +1512,67 @@ class SessionService:
             raise Violation("payload must be an object")
         return body
 
+    def _frame_uid(self, frame: Frame) -> str | None:
+        if frame.type in (MessageType.TRANSFORM, MessageType.MESH_DELTA, MessageType.MESH_SNAPSHOT, MessageType.OBJECT_CREATE):
+            if len(frame.payload) < 16:
+                return None
+            try:
+                return str(uuidlib.UUID(bytes=frame.payload[:16]))
+            except ValueError:
+                return None
+        if frame.type in (
+            MessageType.MATERIAL_UPDATE,
+            MessageType.MODIFIER_STACK,
+            MessageType.POSE,
+            MessageType.SHAPE_KEYS,
+            MessageType.ACTION,
+        ):
+            try:
+                body = json.loads(frame.payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return None
+            uid = body.get("uuid") if isinstance(body, dict) else None
+            return uid if isinstance(uid, str) else None
+        return None
+
+    def _peer_accepts(self, peer: Peer, frame: Frame, now: float) -> bool:
+        uid = self._frame_uid(frame)
+        if uid is None:
+            return True
+        if peer.subscriptions.get(uid) == "mute":
+            return False
+        if frame.type in (MessageType.OBJECT_CREATE, MessageType.OBJECT_DELETE, MessageType.SCENE_RESET):
+            return True
+        priority = int(peer.priorities.get(uid, 0))
+        if priority < 0:
+            priority = 0
+        if priority > 2:
+            priority = 2
+        if frame.type == MessageType.TRANSFORM:
+            base = (1.0 / 30.0, 1.0 / 10.0, 1.0 / 2.0)[priority]
+        elif frame.type in (MessageType.MESH_DELTA, MessageType.MESH_SNAPSHOT):
+            base = (1.0 / 20.0, 1.0 / 5.0, 1.0)[priority]
+        else:
+            base = (1.0 / 30.0, 1.0 / 10.0, 1.0 / 2.0)[priority]
+        scale = (1.0, 2.0, 4.0)[peer.quality]
+        key = (uid, int(frame.type))
+        if now - peer.last_sent.get(key, 0.0) < base * scale:
+            return False
+        peer.last_sent[key] = now
+        return True
+
     def _broadcast(self, frame: Frame, exclude: str | None = None, critical: bool = True) -> None:
         data = protocol.encode(frame)
+        now = time.monotonic()
         for peer in list(self._peers.values()):
             if peer.peer_id == exclude or not peer.authenticated:
+                continue
+            if not self._peer_accepts(peer, frame, now):
+                uid = self._frame_uid(frame)
+                if uid is not None and peer.subscriptions.get(uid) != "mute":
+                    key = (uid, int(frame.type))
+                    delay = 0.15 if frame.type in (MessageType.TRANSFORM, MessageType.MESH_DELTA, MessageType.MESH_SNAPSHOT) else 0.5
+                    peer.pending[key] = (data, now + delay, critical)
                 continue
             try:
                 peer.enqueue(data, critical=critical)
@@ -2024,6 +2157,13 @@ class SessionService:
                 for peer in list(self._peers.values()):
                     if now - peer.last_seen > PEER_TIMEOUT:
                         asyncio.create_task(self._drop_peer(peer))
+                    for key, (data, due, critical) in list(peer.pending.items()):
+                        if now >= due:
+                            try:
+                                peer.enqueue(data, critical=critical)
+                            except Violation:
+                                asyncio.create_task(self._drop_peer(peer))
+                            peer.pending.pop(key, None)
                 result = self._leases.sweep(now)
                 expired_tokens = []
                 for token, entry in list(self._recent.items()):
@@ -2086,6 +2226,17 @@ class SessionService:
     def send_resume(self, uids) -> None:
         objects = [str(uid) for uid in list(uids)[:100000]]
         self._enqueue(protocol.json_frame(MessageType.RESUME, {"objects": objects}))
+
+    def send_subscription(self, uids, modes: dict, priorities: dict) -> None:
+        body = {
+            "uids": [str(uid) for uid in list(uids)[:20000]],
+            "modes": {str(key): str(value)[:8] for key, value in list(modes.items())[:20000]},
+            "priorities": {str(key): int(value) for key, value in list(priorities.items())[:20000]},
+        }
+        self._enqueue(protocol.json_frame(MessageType.SUBSCRIPTION, body))
+
+    def send_client_stats(self, stats: dict) -> None:
+        self._enqueue(protocol.json_frame(MessageType.CLIENT_STATS, stats))
 
     def peer_names(self) -> list[str]:
         return [peer.name for peer in self._peers.values() if peer.authenticated]

@@ -9,7 +9,7 @@ const CORS = {
   "Cache-Control": "no-store",
 };
 
-const TTL = 60;
+const TTL = 90;
 const MAX_SERVERS = 500;
 const MAX_BODY = 8 * 1024;
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -169,8 +169,29 @@ async function verifyIdentity(body) {
 
 export default {
   async fetch(request, env) {
-    const id = env.HUB.idFromName("hub");
-    return env.HUB.get(id).fetch(request);
+    const url = new URL(request.url);
+    if (url.pathname.startsWith("/relay/")) {
+      const roomId = url.pathname.slice("/relay/".length).toLowerCase();
+      const role = url.searchParams.get("role");
+      if (role === "host" && /^[0-9a-f]{16}$/.test(roomId)) {
+        const directory = env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));
+        const verify = await directory.fetch(
+          new Request("https://directory/verify", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              room: roomId,
+              token: request.headers.get("x-bmp-host-token") || "",
+            }),
+          }),
+        );
+        if (!verify.ok) return new Response("host token required", { status: 403, headers: CORS });
+      }
+      const room = env.ROOM.get(env.ROOM.idFromName(roomId || "invalid"));
+      return room.fetch(request);
+    }
+    const directory = env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));
+    return directory.fetch(request);
   },
 };
 
@@ -189,6 +210,16 @@ export class Hub {
       if (url.pathname === "/health" && request.method === "GET") {
         const servers = await this.loadServers();
         return json({ ok: true, servers: Object.keys(servers).length });
+      }
+      if (url.pathname === "/verify" && request.method === "POST") {
+        const body = await readJson(request);
+        const room = typeof body.room === "string" ? body.room.toLowerCase() : "";
+        const token = cleanToken(body.token);
+        const record = this.tokens.get(room);
+        if (!record || !token || !timingSafeEqual(record.hash, await hashToken(token))) {
+          return json({ error: "invalid host token" }, 403);
+        }
+        return json({ ok: true });
       }
       if (url.pathname === "/servers" && request.method === "GET") {
         const servers = await this.loadServers();
@@ -404,5 +435,61 @@ export class Hub {
     view.setUint32(5, length, true);
     if (length) new Uint8Array(frame, 9).set(new Uint8Array(payload));
     try { socket.send(frame); } catch { /* ignore */ }
+  }
+}
+
+export class Room extends Hub {
+  async relay(request, url) {
+    const roomId = url.pathname.slice("/relay/".length).toLowerCase();
+    if (!/^[0-9a-f]{16}$/.test(roomId)) return new Response("bad room", { status: 400, headers: CORS });
+    const role = url.searchParams.get("role");
+    if (role !== "host" && role !== "join") return new Response("bad role", { status: 400, headers: CORS });
+    if (request.headers.get("Upgrade") !== "websocket") {
+      return new Response("websocket required", { status: 426, headers: CORS });
+    }
+    let room = this.rooms.get(roomId);
+    if (!room) {
+      room = { host: null, clients: new Map(), next: 1 };
+      this.rooms.set(roomId, room);
+    }
+    if (role === "join" && !room.host) {
+      return new Response("no host", { status: 503, headers: CORS });
+    }
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    server.accept();
+    if (role === "host") {
+      if (room.host) {
+        try { room.host.close(1000, "replaced"); } catch { /* ignore */ }
+        for (const socket of room.clients.values()) {
+          try { socket.close(1000, "host replaced"); } catch { /* ignore */ }
+        }
+        room.clients.clear();
+      }
+      room.host = server;
+      server.addEventListener("message", (event) => {
+        void this.hostMessage(room, event.data);
+      });
+      server.addEventListener("close", () => this.hostClosed(room, server));
+      server.addEventListener("error", () => this.hostClosed(room, server));
+    } else {
+      const stream = room.next++;
+      room.clients.set(stream, server);
+      this.sendFrame(room.host, 1, stream, new ArrayBuffer(0));
+      server.addEventListener("message", (event) => {
+        void (async () => {
+          const buffer = await binaryData(event.data);
+          if (buffer) this.sendFrame(room.host, 2, stream, buffer);
+        })();
+      });
+      const close = () => {
+        room.clients.delete(stream);
+        this.sendFrame(room.host, 3, stream, new ArrayBuffer(0));
+      };
+      server.addEventListener("close", close);
+      server.addEventListener("error", close);
+    }
+    return new Response(null, { status: 101, webSocket: client });
   }
 }

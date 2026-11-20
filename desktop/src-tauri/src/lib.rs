@@ -39,7 +39,10 @@ fn read_text_shared(path: &Path) -> Option<String> {
 
 struct AppState {
     blender_pid: Mutex<Option<u32>>,
+    #[cfg(windows)]
     embedded: Mutex<Option<win_embed::EmbedInfo>>,
+    #[cfg(not(windows))]
+    embedded: Mutex<Option<()>>,
     directory: Option<directory::DirectoryHandle>,
 }
 
@@ -210,54 +213,87 @@ fn newest_blender() -> Option<PathBuf> {
         }
     }
 
-    let mut roots = vec![
-        PathBuf::from(r"C:\Program Files\Blender Foundation"),
-        PathBuf::from(r"C:\Program Files (x86)\Blender Foundation"),
-    ];
-    if let Some(program_files) = std::env::var_os("ProgramFiles") {
-        roots.push(PathBuf::from(program_files).join("Blender Foundation"));
-    }
-    if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)") {
-        roots.push(PathBuf::from(program_files_x86).join("Blender Foundation"));
-    }
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        roots.push(PathBuf::from(local).join("Programs").join("Blender Foundation"));
-    }
-
     let mut candidates: Vec<PathBuf> = Vec::new();
-    for root in roots {
-        let Ok(entries) = fs::read_dir(root) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let exe = entry.path().join("blender.exe");
+    #[cfg(windows)]
+    {
+        let mut roots = vec![
+            PathBuf::from(r"C:\Program Files\Blender Foundation"),
+            PathBuf::from(r"C:\Program Files (x86)\Blender Foundation"),
+        ];
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            roots.push(PathBuf::from(program_files).join("Blender Foundation"));
+        }
+        if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)") {
+            roots.push(PathBuf::from(program_files_x86).join("Blender Foundation"));
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            roots.push(PathBuf::from(local).join("Programs").join("Blender Foundation"));
+        }
+        for root in roots {
+            let Ok(entries) = fs::read_dir(root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let exe = entry.path().join("blender.exe");
+                if exe.is_file() {
+                    candidates.push(exe);
+                }
+            }
+        }
+        // Steam installs Blender as ...\steamapps\common\Blender\blender.exe.
+        for key in ["ProgramFiles(x86)", "ProgramFiles"] {
+            let Some(base) = std::env::var_os(key) else {
+                continue;
+            };
+            let exe = PathBuf::from(base)
+                .join("Steam")
+                .join("steamapps")
+                .join("common")
+                .join("Blender")
+                .join("blender.exe");
             if exe.is_file() {
                 candidates.push(exe);
             }
         }
     }
-
-    // Steam installs Blender as ...\steamapps\common\Blender\blender.exe.
-    for key in ["ProgramFiles(x86)", "ProgramFiles"] {
-        let Some(base) = std::env::var_os(key) else {
-            continue;
-        };
-        let exe = PathBuf::from(base)
-            .join("Steam")
-            .join("steamapps")
-            .join("common")
-            .join("Blender")
-            .join("blender.exe");
-        if exe.is_file() {
-            candidates.push(exe);
+    #[cfg(target_os = "macos")]
+    {
+        candidates.push(PathBuf::from("/Applications/Blender.app/Contents/MacOS/Blender"));
+        if let Ok(entries) = fs::read_dir("/Applications") {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("Blender") {
+                    let exe = entry.path().join("Contents/MacOS/Blender");
+                    if exe.is_file() {
+                        candidates.push(exe);
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        for path in [
+            "/usr/bin/blender",
+            "/usr/local/bin/blender",
+            "/snap/bin/blender",
+            "/var/lib/flatpak/exports/bin/org.blender.Blender",
+        ] {
+            let candidate = PathBuf::from(path);
+            if candidate.is_file() {
+                candidates.push(candidate);
+            }
         }
     }
 
-    // The addon targets Blender 5.x. Keep unknowns (for example Steam, whose
-    // folder has no version) but drop installs that are definitely too old.
+    // The addon targets Blender 4.2 LTS or newer. Keep unknowns (for example
+    // Steam, whose folder has no version) but drop definitely older installs.
     candidates.retain(|path| {
         let version = blender_version(path);
-        version.is_empty() || version.first().copied().unwrap_or(0) >= 5
+        version.is_empty()
+            || version.first().copied().unwrap_or(0) > 4
+            || (version.first().copied().unwrap_or(0) == 4
+                && version.get(1).copied().unwrap_or(0) >= 2)
     });
     candidates.sort_by(|a, b| {
         blender_version(a)
@@ -276,8 +312,20 @@ fn detect_blender() -> Option<String> {
 fn launch_blender(state: State<AppState>, path: String, blend_file: Option<String>) -> Result<u32, String> {
     let exe = PathBuf::from(&path);
     let exe = exe.canonicalize().map_err(|_| "Blender path does not exist".to_string())?;
-    if exe.file_name().and_then(|name| name.to_str()).map(|name| name.eq_ignore_ascii_case("blender.exe")) != Some(true) {
-        return Err("selected file is not blender.exe".into());
+    #[cfg(windows)]
+    let valid_name = exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.eq_ignore_ascii_case("blender.exe"))
+        == Some(true);
+    #[cfg(not(windows))]
+    let valid_name = exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.eq_ignore_ascii_case("blender"))
+        == Some(true);
+    if !valid_name {
+        return Err("selected file is not Blender".into());
     }
     if !exe.is_file() {
         return Err("Blender path is not a file".into());

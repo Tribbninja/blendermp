@@ -94,6 +94,29 @@ The desktop app drives the addon through two JSON files in
 * **No independent security audit.** Do not use this for sensitive production
   work yet.
 
+## Phase 5 hardening
+
+* **Signed host identity.** A persistent Ed25519 key signs
+  `{code, app, addon, protocol, cert_fingerprint, caps, ts, nonce}`. Clients
+  verify the signature before accepting `WELCOME`; the Worker verifies the same
+  descriptor before listing a public server. The private key stays in
+  `%LOCALAPPDATA%\Blendermp\identity.json` with owner-only permissions. The
+  relay host token is separate and never derived from the identity key.
+* **PIN handling.** PINs are scrypt-hashed in memory with a per-IP limit of five
+  attempts per minute. The Worker never receives the PIN.
+* **Decoder hardening.** Image, geometry, delta, object and material decoders
+  cap sizes, reject trailing bytes and are exercised with random/malformed
+  payloads (`tests/test_fuzz.py`). Checkpoint zips enforce a 64 MB scene limit
+  before decompression.
+* **Webview.** The Tauri CSP keeps scripts local, disables remote content and
+  allows only the IPC/HTTP endpoints the app needs. The capability list remains
+  command-by-command.
+* **Platforms.** Docking stays Windows-only. macOS/Linux builds launch Blender
+  as a separate window; CI checks the Rust shell on all three platforms.
+
+Dependency audits are expected before release (`pip-audit`, `cargo audit`,
+`npm audit`); they are advisory in the current CI matrix.
+
 ## Reporting
 
 Open an issue with a minimal reproduction. Do not include private keys, room
@@ -103,7 +126,7 @@ channel will be arranged.
 ## Public directory
 
 The public directory stores a server's display name, host name, room endpoint,
-player count, password flag and version for at most 60 seconds after the last
+player count, password flag and version for at most 90 seconds after the last
 announcement. It never receives the server password, scene data, chat or
 certificates. A listing is announced/removed with a 128-bit server id that is
 not returned by the directory, and a relay host must also present a per-install

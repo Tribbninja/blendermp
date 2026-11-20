@@ -110,6 +110,8 @@ class MessageType(IntEnum):
     POSE = 33
     ACTION = 34
     SHAPE_KEYS = 35
+    SUBSCRIPTION = 36
+    CLIENT_STATS = 37
 
 
 class Channel(IntEnum):

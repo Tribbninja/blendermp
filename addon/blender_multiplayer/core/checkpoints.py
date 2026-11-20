@@ -16,6 +16,7 @@ from pathlib import Path
 
 APP_DIR = "Blendermp"
 MAX_BYTES = 1024 * 1024 * 1024
+MAX_SCENE_BYTES = 64 * 1024 * 1024
 KEEP = 3
 SAFE = re.compile(r"[^A-Za-z0-9_-]")
 
@@ -69,8 +70,11 @@ def read(path: Path) -> dict | None:
             names = set(bundle.namelist())
             if "scene.json" not in names:
                 return None
+            info = bundle.getinfo("scene.json")
+            if info.file_size > MAX_SCENE_BYTES or info.compress_size > MAX_SCENE_BYTES:
+                return None
             body = json.loads(bundle.read("scene.json").decode("utf-8"))
-    except (OSError, zipfile.BadZipFile, json.JSONDecodeError):
+    except (OSError, zipfile.BadZipFile, json.JSONDecodeError, RuntimeError):
         return None
     return body if isinstance(body, dict) else None
 

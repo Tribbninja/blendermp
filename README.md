@@ -105,6 +105,20 @@ surface that cross-process re-parenting causes on some GPUs).
 * **Sculpt streaming**: plain Sculpt Mode writes position deltas at 20 Hz and
   sends a full topology snapshot when dyntopo/counts change. Multires sculpt is
   detected and reported as unsupported instead of silently drifting.
+* **Subscriptions and interest**: per-object full/key/mute modes, per-client
+  camera/AABB priority, 30/10/2 Hz transform tiers and 20/5/1 Hz mesh tiers, a
+  per-peer 8 Mbps byte budget, and final-frame resend after rate drops.
+* **Adaptive quality**: clients report apply p95, FPS, RX/TX and queue depth once
+  per second; the host lowers rates in high/medium/low tiers with hysteresis.
+* **Split relay**: the Worker now uses a Directory Durable Object for listings
+  and a per-room Room Durable Object for WebSockets, with signed announce
+  verification, 90-second listings and room/host token checks.
+* **Cross-platform shell**: Windows NSIS plus macOS/Linux Tauri builds, platform
+  Blender detection, separate-window fallback outside Windows, and CI checks on
+  all three desktop platforms.
+* **Security hardening**: strict webview CSP, command-scoped capabilities,
+  path/zip-bomb limits for checkpoints, and randomized decoder fuzz tests for
+  geometry, images, objects and materials.
 * **Presence, chat and 3D pings** between the addon UI and the desktop app, with
   latency and bandwidth telemetry, pause-sync, follow-host frame, and chat
   commands (`/who`, `/ping`, `/leave`, `/me`).
@@ -125,7 +139,7 @@ surface that cross-process re-parenting causes on some GPUs).
   same animated transition. Blender is hidden while arranging and returns to the
   viewport when you press Done or Escape.
 
-The protocol and engine have **132 passing tests**, including a real TLS
+The protocol and engine have **135 passing tests**, including a real TLS
 host/client session, certificate-mismatch rejection, relay chat, password
 rejection and host kick over a multiplexed tunnel, the public directory API, and
 1,000-vertex delta round-trips under loss/reordering. The Cloudflare Worker hub
@@ -322,7 +336,7 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   `bench/baseline.json`.
 * The production Worker relay was exercised with the host key: no token and a
   wrong token are rejected, a valid host tunnel and client join succeed.
-* `pytest`: 132 passed.
+* `pytest`: 135 passed.
 
 ## Limitations
 
@@ -369,6 +383,14 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
 * PINs are scrypt-hashed (stdlib) rather than Argon2id, and the identity private
   key uses owner-only file permissions rather than DPAPI because Blender owns
   the key file.
+* Interest priority is a distance/frustum approximation, not full occlusion
+  culling. Adaptive quality uses apply p95 and a render-FPS estimate; queue depth
+  is currently reported as zero by the addon.
+* macOS/Linux builds are wired into CI and the shell, but this environment only
+  validates the Windows build. Docking remains Windows-only.
+* The split Worker Directory/Room layout and signed announce verification need
+  a `wrangler deploy`; existing deployments continue to use the old single Hub.
+* Dependency audits are advisory in CI, not yet a release blocker.
 * Windows-only window docking; other platforms run Blender in its own window.
 * Multires is not supported.
 * Alpha software: back up work before a session.

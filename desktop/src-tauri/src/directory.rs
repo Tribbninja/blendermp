@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 const HTTP_PORT: u16 = 7101;
 const DISCOVERY_PORT: u16 = 5598;
 const DISCOVERY_MAGIC: &str = "BMPDIR1";
-const TTL: Duration = Duration::from_secs(60);
+const TTL: Duration = Duration::from_secs(90);
 const MAX_BODY: usize = 8 * 1024;
 const MAX_SERVERS: usize = 500;
 const CROCKFORD: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";

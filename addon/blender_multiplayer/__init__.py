@@ -61,8 +61,8 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 4, 0),
-    "blender": (5, 0, 0),
+    "version": (0, 5, 0),
+    "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
     "category": "Network",
@@ -192,6 +192,15 @@ runtime: dict = {
     "last_action": 0.0,
     "last_sculpt": 0.0,
     "sculpt_warned": set(),
+    "muted": set(),
+    "last_subscription": 0.0,
+    "subscription_sig": None,
+    "last_client_stats": 0.0,
+    "stats_bytes": 0,
+    "stats_in": 0,
+    "stats_out": 0,
+    "stats_time": 0.0,
+    "apply_times": [],
     "last_mesh": 0.0,
     "last_edit": 0.0,
     "mesh_cursor": 0,
@@ -271,6 +280,7 @@ class BMPState(PropertyGroup):
     sync_mesh: BoolProperty(name="Sync active mesh", default=True)
     sync_materials: BoolProperty(name="Sync materials", default=True)
     sync_modifiers: BoolProperty(name="Sync modifiers", default=True)
+    sync_visible_only: BoolProperty(name="Only sync visible objects", default=False)
     use_relay: BoolProperty(name="Use relay", default=False)
     relay_host: StringProperty(name="Relay host", default="")
     relay_port: IntProperty(name="Relay port", default=7100, min=1024, max=65535)
@@ -4551,6 +4561,96 @@ def _unregister_remote_draw() -> None:
     runtime["remote_labels"] = []
 
 
+def _send_subscription(context) -> None:
+    session: SessionService | None = runtime.get("session")
+    settings = context.window_manager.bmp
+    if session is None or settings.is_host:
+        return
+    now = time.monotonic()
+    if now - runtime.get("last_subscription", 0.0) < 0.5:
+        return
+    runtime["last_subscription"] = now
+    view = _viewport_view(context)
+    camera = None
+    inverse = None
+    aspect = 1.6
+    if view is not None:
+        from mathutils import Matrix
+
+        matrix = Matrix((view["matrix"][0:4], view["matrix"][4:8], view["matrix"][8:12], view["matrix"][12:16]))
+        camera = matrix.translation
+        inverse = matrix.inverted()
+        aspect = float(view.get("aspect", 1.6))
+    uids = []
+    modes = {}
+    priorities = {}
+    for obj in context.scene.objects:
+        if obj.get("bmp_ping"):
+            continue
+        uid = obj.get("bmp_uuid")
+        if not uid:
+            continue
+        priority = 2
+        if camera is not None and inverse is not None:
+            point = obj.matrix_world.translation
+            distance = (point - camera).length
+            local = inverse @ point
+            depth = max(0.001, -float(local.z))
+            visible = float(local.z) < 0.0 and abs(float(local.x)) / depth <= aspect and abs(float(local.y)) / depth <= 1.0
+            if visible and distance < 50.0:
+                priority = 0
+            elif distance < 150.0:
+                priority = 1
+        uids.append(uid)
+        priorities[uid] = priority
+        if uid in runtime["muted"]:
+            modes[uid] = "mute"
+        elif settings.sync_visible_only and priority >= 2:
+            modes[uid] = "mute"
+        else:
+            modes[uid] = "full"
+    signature = (tuple(sorted((key, modes[key], priorities[key]) for key in uids)))
+    if signature == runtime.get("subscription_sig"):
+        return
+    runtime["subscription_sig"] = signature
+    session.send_subscription(uids, modes, priorities)
+
+
+def _send_client_stats(context) -> None:
+    session: SessionService | None = runtime.get("session")
+    if session is None or session.is_host:
+        return
+    now = time.monotonic()
+    if now - runtime.get("last_client_stats", 0.0) < 1.0:
+        return
+    runtime["last_client_stats"] = now
+    stats = session.stats()
+    total_in = int(stats.get("bytes_in", 0))
+    total_out = int(stats.get("bytes_out", 0))
+    previous_in = int(runtime.get("stats_in", total_in))
+    previous_out = int(runtime.get("stats_out", total_out))
+    elapsed = max(0.1, now - float(runtime.get("stats_time", now)))
+    runtime["stats_in"] = total_in
+    runtime["stats_out"] = total_out
+    runtime["stats_time"] = now
+    times = sorted(runtime.get("apply_times", [])[-120:])
+    p95 = times[int(len(times) * 0.95)] if times else 0.0
+    fps = 0.0
+    try:
+        fps = float(bpy.context.scene.render.fps)
+    except Exception:  # noqa: BLE001
+        fps = 60.0
+    session.send_client_stats(
+        {
+            "apply_ms_p95": round(float(p95), 2),
+            "fps": round(max(1.0, min(240.0, fps)), 1),
+            "rx_kbps": round(max(0.0, (total_in - previous_in) / 1024.0 / elapsed), 1),
+            "tx_kbps": round(max(0.0, (total_out - previous_out) / 1024.0 / elapsed), 1),
+            "queue_depth": 0,
+        }
+    )
+
+
 def _send_presence(context) -> None:
     session: SessionService | None = runtime.get("session")
     if session is None:
@@ -4932,7 +5032,12 @@ def bmp_tick():
                 kind, body = inbox.get_nowait()
             except queue.Empty:
                 break
+            started = time.monotonic()
             _handle_event(context, kind, body)
+            times = runtime.setdefault("apply_times", [])
+            times.append((time.monotonic() - started) * 1000.0)
+            if len(times) > 240:
+                del times[: len(times) - 240]
         if session is not None:
             _sync_selection(context)
             _sync_transforms(context)
@@ -4945,6 +5050,8 @@ def bmp_tick():
             _sync_actions(context)
             _process_image_queue(context)
             _send_presence(context)
+            _send_subscription(context)
+            _send_client_stats(context)
         _journal_capture(context)
         _maybe_auto_checkpoint(context)
         _pump_scene_bootstrap(context)
@@ -5260,6 +5367,28 @@ class BMP_OT_ping_mark(Operator):
         position = context.scene.cursor.location
         session.send_ping_mark((position.x, position.y, position.z))
         _spawn_ping(context, (position.x, position.y, position.z), context.window_manager.bmp.name, tuple(context.window_manager.bmp.color))
+        return {"FINISHED"}
+
+
+class BMP_OT_toggle_mute(Operator):
+    bl_idname = "bmp.toggle_mute"
+    bl_label = "Mute Object Sync"
+    bl_description = "Stop receiving updates for the active object on this client"
+
+    def execute(self, context):
+        obj = context.active_object
+        uid = obj.get("bmp_uuid") if obj is not None else None
+        if not uid:
+            self.report({"WARNING"}, "Select a synced object first")
+            return {"CANCELLED"}
+        muted = runtime.setdefault("muted", set())
+        if uid in muted:
+            muted.discard(uid)
+            self.report({"INFO"}, f"{obj.name} sync resumed")
+        else:
+            muted.add(uid)
+            self.report({"INFO"}, f"{obj.name} sync muted")
+        runtime["subscription_sig"] = None
         return {"FINISHED"}
 
 
@@ -5653,6 +5782,7 @@ classes = (
     BMP_OT_conflict_keep_mine,
     BMP_OT_conflict_take_host,
     BMP_OT_undo_shared,
+    BMP_OT_toggle_mute,
     BMP_OT_checkpoint_create,
     BMP_OT_checkpoint_restore,
     BMP_OT_restore_journal,
