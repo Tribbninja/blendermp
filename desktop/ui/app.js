@@ -59,13 +59,22 @@ const store = {
   },
 };
 
+const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
+const storedDirectory = store.get("directory", DEFAULT_HUB);
+// Drop the localhost values used while developing the Worker hub; a deployment
+// URL (or a deliberately configured hub) is kept.
+const initialDirectory = /^https?:\/\/(127\.0\.0\.1|localhost):(7101|8787)\/?$/.test(storedDirectory)
+  ? DEFAULT_HUB
+  : storedDirectory;
+if (initialDirectory !== storedDirectory) store.set("directory", initialDirectory);
+
 const settings = {
   name: store.get("name", `user-${Math.random().toString(36).slice(2, 6)}`),
   port: Number(store.get("port", 51999)),
   pin: store.get("pin", ""),
   serverName: store.get("serverName", ""),
   public: store.get("public", "1") === "1",
-  directory: store.get("directory", ""),
+  directory: initialDirectory,
   workerRelay: store.get("workerRelay", "1") === "1",
   relay: store.get("relay", ""),
   useRelay: store.get("useRelay", "0") === "1",
