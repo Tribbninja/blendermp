@@ -342,8 +342,16 @@ body.resizing { user-select: none; }
   white-space: nowrap;
   color: var(--text);
 }
-.verify { display: flex; align-items: center; gap: 6px; margin-top: 5px; font-size: 10px; color: var(--faint); }
-.verify code { font-family: "Cascadia Mono", monospace; letter-spacing: .6px; color: var(--muted); }
+.verify { display: flex; align-items: center; gap: 6px; margin-top: 5px; font-size: 10px; color: var(--faint); min-width: 0; }
+.verify code {
+  font-family: "Cascadia Mono", monospace;
+  letter-spacing: .6px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.verify .icon-btn { flex: 0 0 auto; }
 
 .actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .embed-actions { margin-top: 6px; }

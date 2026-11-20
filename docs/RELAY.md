@@ -1,5 +1,7 @@
 # Cross-network sessions with the relay
 
+> For most users the free Cloudflare Worker hub in [../cloudflare/README.md](../cloudflare/README.md) is simpler: it provides the public directory and the WebSocket relay with no port forwarding. The Python relay and directory below remain the self-hosted alternative.
+
 The relay lets two machines on different networks connect without port
 forwarding. It is a **self-hosted, multiplexed TCP pipe**: the host keeps one
 outbound connection to the relay, clients connect to the relay, and the host's

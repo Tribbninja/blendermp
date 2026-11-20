@@ -2,6 +2,8 @@ fn main() {
     tauri_build::try_build(
         tauri_build::Attributes::new().app_manifest(
             tauri_build::AppManifest::new().commands(&[
+                "local_directory",
+                "discover_directories",
                 "detect_blender",
                 "launch_blender",
                 "find_blender_window",

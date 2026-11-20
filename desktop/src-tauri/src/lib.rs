@@ -1,3 +1,4 @@
+mod directory;
 mod win_embed;
 
 use serde::{Deserialize, Serialize};
@@ -12,10 +13,33 @@ const APP_DIR: &str = "Blendermp";
 const MAX_STATUS_BYTES: u64 = 64 * 1024;
 const CROCKFORD: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-#[derive(Default)]
+fn read_text_shared(path: &Path) -> Option<String> {
+    #[cfg(windows)]
+    {
+        use std::io::Read;
+        use std::os::windows::fs::OpenOptionsExt;
+        // The addon atomically replaces status.json. Allow delete sharing while
+        // this read is in flight, otherwise the replace intermittently fails
+        // with "Access denied" and the app keeps a stale status forever.
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x7)
+            .open(path)
+            .ok()?;
+        let mut body = String::new();
+        file.read_to_string(&mut body).ok()?;
+        Some(body)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::read_to_string(path).ok()
+    }
+}
+
 struct AppState {
     blender_pid: Mutex<Option<u32>>,
     embedded: Mutex<Option<win_embed::EmbedInfo>>,
+    directory: Option<directory::DirectoryHandle>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Copy)]
@@ -40,6 +64,7 @@ struct SessionRequest {
     text: Option<String>,
     target: Option<String>,
     relay: Option<String>,
+    relay_url: Option<String>,
     use_relay: Option<bool>,
 }
 
@@ -221,8 +246,19 @@ fn launch_blender(state: State<AppState>, path: String, blend_file: Option<Strin
         return Err("addon path contains unsupported characters".into());
     }
 
+    // A previously enabled copy (for example a development checkout) can win
+    // over the addon bundled with the app. Disable any loaded copy, drop its
+    // modules, then load the bundled addon from the front of sys.path.
     let expression = format!(
-        "import sys,bpy; sys.path.insert(0,r'{root_text}'); bpy.ops.preferences.addon_enable(module='blender_multiplayer')"
+        "import sys,bpy; sys.path.insert(0,r'{root_text}'); \
+         mod='blender_multiplayer'; \
+         (bpy.ops.preferences.addon_disable(module=mod) if mod in bpy.context.preferences.addons else None); \
+         _old=sys.modules.get(mod); \
+         (_old.unregister() if _old is not None and hasattr(_old, 'unregister') else None); \
+         bpy._blendermp_active=False; \
+         [sys.modules.pop(name) for name in list(sys.modules) if name == mod or name.startswith(mod + '.')]; \
+         bpy.ops.preferences.addon_enable(module=mod); \
+         import blender_multiplayer as _bmp; print('BMP_ADDON=' + str(_bmp.__file__), flush=True)"
     );
 
     let mut command = Command::new(&exe);
@@ -402,7 +438,7 @@ fn read_status(state: State<AppState>) -> Option<serde_json::Value> {
     if metadata.len() > MAX_STATUS_BYTES {
         return None;
     }
-    let body = fs::read_to_string(path).ok()?;
+    let body = read_text_shared(&path)?;
     let value: serde_json::Value = serde_json::from_str(&body).ok()?;
 
     // Ignore a status left behind by a different Blender process. On the first
@@ -502,6 +538,14 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
             return Err("port must be 1024 or higher".into());
         }
     }
+    if let Some(relay_url) = &request.relay_url {
+        if relay_url.len() > 256
+            || !(relay_url.starts_with("ws://") || relay_url.starts_with("wss://"))
+            || relay_url.chars().any(|ch| ch.is_control())
+        {
+            return Err("invalid relay URL".into());
+        }
+    }
     if let Some(relay) = &request.relay {
         let (host, port) = relay
             .rsplit_once(':')
@@ -558,6 +602,7 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
         "text": text,
         "target": target,
         "relay": request.relay,
+        "relay_url": request.relay_url,
         "use_relay": request.use_relay,
         "nonce": format!("{:x}-{:x}", std::process::id(), stamp),
     });
@@ -570,6 +615,21 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
         .map_err(|error| format!("cannot write control file: {error}"))?;
     fs::rename(&temp, &path).map_err(|error| format!("cannot replace control file: {error}"))?;
     Ok(())
+}
+
+#[tauri::command]
+fn local_directory(state: State<AppState>) -> Option<serde_json::Value> {
+    let handle = state.directory.as_ref()?;
+    Some(serde_json::json!({
+        "local": format!("http://127.0.0.1:{}", handle.port),
+        "lan": format!("http://{}:{}", directory::lan_ip(), handle.port),
+        "port": handle.port,
+    }))
+}
+
+#[tauri::command]
+fn discover_directories() -> Vec<serde_json::Value> {
+    directory::discover()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -601,9 +661,16 @@ pub fn run() {
         }
     }
 
+    let directory_server = directory::start();
     tauri::Builder::default()
-        .manage(AppState::default())
+        .manage(AppState {
+            blender_pid: Mutex::new(None),
+            embedded: Mutex::new(None),
+            directory: directory_server,
+        })
         .invoke_handler(tauri::generate_handler![
+            local_directory,
+            discover_directories,
             detect_blender,
             launch_blender,
             find_blender_window,

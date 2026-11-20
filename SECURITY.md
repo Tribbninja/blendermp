@@ -108,3 +108,11 @@ announcement. It never receives the server password, scene data, chat or
 certificates. Announcements are unauthenticated by design, so a directory
 operator can list or remove entries; clients still pin the host certificate and
 the host still validates every connection. Kicks are enforced by the host.
+
+## Cloudflare Worker hub
+
+The optional Worker hub stores the same short-lived directory metadata and
+relays WebSocket messages between the host and clients. Cloudflare sees IP
+addresses, room ids, timing and byte counts, but not TLS plaintext, passwords,
+scene data or host private keys. The host certificate is still pinned and the
+password is still verified by the host.

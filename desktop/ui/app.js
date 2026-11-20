@@ -66,6 +66,7 @@ const settings = {
   serverName: store.get("serverName", ""),
   public: store.get("public", "1") === "1",
   directory: store.get("directory", ""),
+  workerRelay: store.get("workerRelay", "1") === "1",
   relay: store.get("relay", ""),
   useRelay: store.get("useRelay", "0") === "1",
   blender: store.get("blender", ""),
@@ -87,6 +88,10 @@ const state = {
   serverQuery: "",
   serverId: "",
   joinedServerName: "",
+  localDirectory: "",
+  lanDirectory: "",
+  discovered: [],
+  announceTargets: [],
   lastAnnounce: 0,
   directoryError: "",
   wasHosting: false,
@@ -172,6 +177,15 @@ function directoryBase() {
   return value ? value.replace(/\/+$/, "") : "";
 }
 
+function hubRelayUrl() {
+  if (!settings.workerRelay) return "";
+  const base = directoryBase();
+  if (!base) return "";
+  if (base.startsWith("https://")) return "wss://" + base.slice(8);
+  if (base.startsWith("http://")) return "ws://" + base.slice(7);
+  return "";
+}
+
 function makeServerId() {
   const bytes = new Uint8Array(16);
   if (window.crypto?.getRandomValues) {
@@ -195,13 +209,14 @@ function setPanel(name) {
   window.BMPLayout?.refreshRail();
   if (name === "servers") {
     $("serverSearch").value = state.serverQuery;
-    loadServers();
+    refreshServerBrowser();
     setTimeout(() => $("serverSearch").focus(), 30);
   }
   if (name === "settings") {
     $("setName").value = settings.name;
     $("setPort").value = settings.port;
     $("setDirectory").value = settings.directory;
+    $("setWorkerRelay").checked = settings.workerRelay;
     $("setRelay").value = settings.relay;
     $("setUseRelay").checked = settings.useRelay;
     $("setBlender").value = settings.blender;
@@ -326,6 +341,15 @@ function renderState(status) {
   const verify = status?.verify_code || "";
   $("verifyRow").hidden = !verify;
   if (verify) $("verifyCode").textContent = verify;
+
+  const hub = directoryBase();
+  const shareDirectory = hub || state.lanDirectory || state.localDirectory;
+  const showDirectory = hosting && Boolean(shareDirectory);
+  $("directoryRow").hidden = !showDirectory;
+  if (showDirectory) {
+    $("directoryLabel").textContent = hub ? "HUB" : "LAN";
+    $("directoryUrl").textContent = shareDirectory;
+  }
 
   const name = status?.name || settings.name;
   $("meAvatar").textContent = initials(name);
@@ -625,14 +649,16 @@ async function hostRoom() {
   if (settings.public && !directoryBase()) {
     toast("Set a directory URL in Settings to list this server publicly", "error");
   }
+  const workerRelay = settings.public ? hubRelayUrl() : "";
   try {
     await request({
       action: "host",
       name: settings.name,
       port: settings.port,
       pin: settings.pin || null,
-      relay: settings.useRelay ? settings.relay : null,
-      use_relay: settings.useRelay,
+      relay: workerRelay ? null : settings.useRelay ? settings.relay : null,
+      relay_url: workerRelay || null,
+      use_relay: Boolean(workerRelay) || settings.useRelay,
     });
     state.serverId = makeServerId();
     state.joinedServerName = "";
@@ -649,8 +675,16 @@ async function hostRoom() {
 async function joinServer(server, pin = "") {
   if (!server || !server.code) return;
   removeServer();
+  const relayUrl = server.relay_url || (server.relay ? hubRelayUrl() : "");
   try {
-    await request({ action: "join", code: server.code, name: settings.name, pin: pin || null });
+    await request({
+      action: "join",
+      code: server.code,
+      name: settings.name,
+      pin: pin || null,
+      relay_url: relayUrl || null,
+      use_relay: Boolean(relayUrl),
+    });
     state.joinedServerName = server.name || "server";
     state.serverId = "";
     state.pendingServer = null;
@@ -695,28 +729,76 @@ async function kickPlayer(name) {
 }
 
 /* ------------------------------------------------------------------ servers */
+async function discoverDirectories() {
+  if (!isTauri) return;
+  try {
+    const found = await invoke("discover_directories");
+    state.discovered = Array.isArray(found) ? found : [];
+  } catch (error) {
+    state.discovered = [];
+    log(`directory discovery failed: ${error}`);
+  }
+}
+
+async function refreshServerBrowser() {
+  await discoverDirectories();
+  await loadServers();
+}
+
 async function loadServers() {
   const base = directoryBase();
-  if (!base) {
-    renderServers("Set a directory URL in Settings to browse public servers.");
-    $("serverDirectoryNote").textContent = "No directory configured.";
+  const urls = [];
+  if (state.localDirectory) urls.push(state.localDirectory);
+  if (base) urls.push(base);
+  for (const item of state.discovered) {
+    if (item && item.url) urls.push(item.url);
+  }
+  const unique = [...new Set(urls.map((url) => url.replace(/\/+$/, "")).filter(Boolean))];
+
+  const lan = state.lanDirectory || state.localDirectory;
+  const note = [];
+  if (lan) note.push(`LAN ${lan}`);
+  if (base && base !== state.localDirectory) note.push(`extra ${base}`);
+  if (state.discovered.length) note.push(`${state.discovered.length} found`);
+  $("serverDirectoryNote").textContent = note.join(" - ") || "No directory configured.";
+
+  if (!unique.length) {
+    renderServers("No directory is available yet. Start the app-hosted server or set a directory URL in Settings.");
     return;
   }
-  $("serverDirectoryNote").textContent = `Directory: ${base}`;
-  try {
-    const query = encodeURIComponent(state.serverQuery.trim());
-    const response = await fetch(`${base}/servers?q=${query}&limit=100`, { cache: "no-store" });
-    if (!response.ok) throw new Error(`directory returned ${response.status}`);
-    const body = await response.json();
-    state.servers = Array.isArray(body.servers) ? body.servers : [];
-    state.directoryError = "";
-    renderServers("");
-  } catch (error) {
-    state.servers = [];
-    state.directoryError = String(error);
-    renderServers(`Could not reach ${base}. Check the directory URL in Settings.`);
-    log(`directory list failed: ${error}`);
+
+  const query = encodeURIComponent(state.serverQuery.trim());
+  const results = await Promise.allSettled(
+    unique.map(async (url) => {
+      const response = await fetch(`${url}/servers?q=${query}&limit=100`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`directory returned ${response.status}`);
+      const body = await response.json();
+      return Array.isArray(body.servers) ? body.servers : [];
+    }),
+  );
+
+  const merged = new Map();
+  let failures = 0;
+  for (const result of results) {
+    if (result.status !== "fulfilled") {
+      failures += 1;
+      continue;
+    }
+    for (const server of result.value) {
+      if (!server || !server.code) continue;
+      merged.set(server.code, server);
+    }
   }
+  if (failures === unique.length) {
+    state.servers = [];
+    state.directoryError = "all directories unreachable";
+    renderServers(`Could not reach any directory (${unique.join(", ")}).`);
+    log("all directory list requests failed");
+    return;
+  }
+  state.servers = [...merged.values()];
+  state.directoryError = failures ? `${failures} directory unreachable` : "";
+  renderServers("");
 }
 
 function renderServers(message) {
@@ -810,10 +892,13 @@ async function connectServer() {
 }
 
 function announceServer() {
-  if (!isTauri || !settings.public || !directoryBase()) return;
+  if (!isTauri || !settings.public) return;
   const status = state.status;
   if (!status || status.state !== "hosting" || !status.is_host || !status.code) return;
   if (!state.serverId) state.serverId = makeServerId();
+  const targets = [...new Set([state.localDirectory, directoryBase()].filter(Boolean).map((url) => url.replace(/\/+$/, "")))];
+  if (!targets.length) return;
+  state.announceTargets = targets;
   const players = Array.isArray(status.users) ? Math.max(1, status.users.length) : 1;
   const body = {
     id: state.serverId,
@@ -824,38 +909,52 @@ function announceServer() {
     max: 64,
     password: Boolean(settings.pin),
     relay: Boolean(status.relay),
+    relay_url: hubRelayUrl(),
     version: "0.1.0",
   };
-  fetch(`${directoryBase()}/announce`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    cache: "no-store",
-  })
-    .then((response) => {
+  Promise.allSettled(
+    targets.map(async (url) => {
+      const response = await fetch(`${url}/announce`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        cache: "no-store",
+      });
       if (!response.ok) throw new Error(`directory returned ${response.status}`);
-      state.directoryError = "";
+      return url;
+    }),
+  ).then((results) => {
+    const succeeded = results.filter((result) => result.status === "fulfilled").length;
+    if (succeeded) {
       state.lastAnnounce = Date.now();
-    })
-    .catch((error) => {
-      if (state.directoryError !== String(error)) {
-        state.directoryError = String(error);
-        toast(`Directory unreachable: ${directoryBase()}`, "error");
-      }
-      log(`directory announce failed: ${error}`);
-    });
+      state.directoryError = "";
+      return;
+    }
+    const message = `Directory unreachable: ${targets.join(", ")}`;
+    if (state.directoryError !== message) {
+      state.directoryError = message;
+      toast(message, "error");
+    }
+    log("all directory announce requests failed");
+  });
 }
 
 function removeServer() {
   const id = state.serverId;
   state.serverId = "";
-  if (!isTauri || !id || !directoryBase()) return;
-  fetch(`${directoryBase()}/remove`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id }),
-    cache: "no-store",
-  }).catch(() => {});
+  if (!isTauri || !id) return;
+  const targets = state.announceTargets.length
+    ? state.announceTargets
+    : [...new Set([state.localDirectory, directoryBase()].filter(Boolean))];
+  state.announceTargets = [];
+  for (const url of targets) {
+    fetch(`${url.replace(/\/+$/, "")}/remove`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+      cache: "no-store",
+    }).catch(() => {});
+  }
 }
 
 async function embedNow() {
@@ -954,7 +1053,17 @@ function wire() {
   $("hostBtn").addEventListener("click", hostRoom);
   $("joinBtn").addEventListener("click", () => setPanel("servers"));
   $("joinClose").addEventListener("click", () => setPanel("session"));
-  $("serverRefresh").addEventListener("click", loadServers);
+  $("serverRefresh").addEventListener("click", refreshServerBrowser);
+  $("directoryCopy").addEventListener("click", async () => {
+    const url = state.lanDirectory || state.localDirectory;
+    if (!url) return;
+    try {
+      await navigator.clipboard.writeText(url);
+      toast("Directory link copied", "ok");
+    } catch {
+      toast(url);
+    }
+  });
   $("serverConnect").addEventListener("click", connectServer);
   $("serverCancel").addEventListener("click", () => {
     state.pendingServer = null;
@@ -995,12 +1104,14 @@ function wire() {
     settings.name = $("setName").value.trim() || settings.name;
     settings.port = Math.max(1024, Math.min(65535, Number($("setPort").value) || 51999));
     settings.directory = $("setDirectory").value.trim();
+    settings.workerRelay = $("setWorkerRelay").checked;
     settings.relay = $("setRelay").value.trim();
     settings.useRelay = $("setUseRelay").checked;
     settings.blender = $("setBlender").value.trim();
     store.set("name", settings.name);
     store.set("port", settings.port);
     store.set("directory", settings.directory);
+    store.set("workerRelay", settings.workerRelay ? "1" : "0");
     store.set("relay", settings.relay);
     store.set("useRelay", settings.useRelay ? "1" : "0");
     store.set("blender", settings.blender);
@@ -1038,6 +1149,7 @@ async function boot() {
   $("setName").value = settings.name;
   $("setPort").value = settings.port;
   $("setDirectory").value = settings.directory;
+  $("setWorkerRelay").checked = settings.workerRelay;
   $("setRelay").value = settings.relay;
   $("setUseRelay").checked = settings.useRelay;
   $("setBlender").value = settings.blender;
@@ -1046,6 +1158,17 @@ async function boot() {
     applyStatus(demoStatus);
     renderEmbed();
     return;
+  }
+
+  try {
+    const directory = await invoke("local_directory");
+    if (directory) {
+      state.localDirectory = directory.local || "";
+      state.lanDirectory = directory.lan || "";
+      log(`app directory: ${state.localDirectory} / ${state.lanDirectory}`);
+    }
+  } catch (error) {
+    log(`local directory unavailable: ${error}`);
   }
 
   await detectBlender();

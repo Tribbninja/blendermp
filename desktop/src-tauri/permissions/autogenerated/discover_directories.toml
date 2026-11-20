@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-discover-directories"
+description = "Enables the discover_directories command without any pre-configured scope."
+commands.allow = ["discover_directories"]
+
+[[permission]]
+identifier = "deny-discover-directories"
+description = "Denies the discover_directories command without any pre-configured scope."
+commands.deny = ["discover_directories"]

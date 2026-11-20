@@ -16,6 +16,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -136,6 +137,17 @@ def read_session() -> dict[str, Any] | None:
     if isinstance(use_relay, bool):
         result["use_relay"] = use_relay
 
+    relay_url = body.get("relay_url")
+    if relay_url is not None:
+        if (
+            not isinstance(relay_url, str)
+            or len(relay_url) > 256
+            or not relay_url.startswith(("ws://", "wss://"))
+            or any(ord(ch) < 32 for ch in relay_url)
+        ):
+            return None
+        result["relay_url"] = relay_url
+
     if action == "chat":
         text = body.get("text")
         if not isinstance(text, str) or not text.strip() or len(text) > 2000:
@@ -168,7 +180,7 @@ def write_status(data: dict[str, Any]) -> None:
         value = data.get(key)
         if isinstance(value, str):
             safe[key] = value[:256]
-    for key in ("is_host",):
+    for key in ("is_host", "relay"):
         value = data.get(key)
         if isinstance(value, bool):
             safe[key] = value
@@ -212,7 +224,19 @@ def write_status(data: dict[str, Any]) -> None:
             os.chmod(temp, 0o600)
         except OSError:
             pass
-        os.replace(temp, path)
+        # The desktop app polls this file. A short-lived reader handle must not
+        # make the atomic replace fail on Windows.
+        last_error: OSError | None = None
+        for _ in range(10):
+            try:
+                os.replace(temp, path)
+                last_error = None
+                break
+            except PermissionError as exc:
+                last_error = exc
+                time.sleep(0.03)
+        if last_error is not None:
+            raise last_error
     finally:
         if os.path.exists(temp):
             try:

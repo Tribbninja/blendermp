@@ -7,8 +7,9 @@ video capture, so it keeps full GPU performance).
 > **Status: alpha vertical slice.** Hosting, the public server browser, TLS
 > pinning, presence, chat, object transforms, mesh streaming and window
 > embedding work.
-> Cross-network NAT traversal, edit-mode topology sync and the long feature list
-> in the plan are not implemented yet.
+> Cross-network sessions use the self-hosted relay or the Cloudflare Worker hub.
+> Edit-mode topology sync and the long feature list in the plan are not
+> implemented yet.
 
 ![Blendermp UI](docs/ui-preview.jpeg)
 
@@ -18,10 +19,11 @@ video capture, so it keeps full GPU performance).
   and optionally add a password. Everyone can search by name and click to join;
   room codes stay internal. Hosts can kick players from the member list. The
   directory is a small self-hosted JSON service; entries expire after 60 seconds.
-* **Self-hosted and cross-network.** The host's machine is the server. A
-  self-hosted relay (`docs/RELAY.md`) carries sessions between networks while
-  TLS stays end-to-end, so the relay only forwards ciphertext. Hosts and clients
-  point at the same self-hosted directory to browse each other.
+* **Cross-network without port forwarding.** A free Cloudflare Worker
+  (`cloudflare/`) provides the public directory **and** the WebSocket relay. The
+  host ticks Public and clients anywhere find it in the browser. TLS stays
+  end-to-end; the Worker only forwards ciphertext. A self-hosted Python
+  relay/directory (`docs/RELAY.md`) is the fallback.
 * **TLS 1.3 everywhere**, self-signed host certificate, SHA-256 fingerprint
   pinning and a short verification code (no custom crypto).
 * **Host-authoritative protocol**: validated message types, size/rate limits,
@@ -64,9 +66,30 @@ video capture, so it keeps full GPU performance).
 The protocol and engine have **103 passing tests**, including a real TLS
 host/client session, certificate-mismatch rejection, relay chat, password
 rejection and host kick over a multiplexed tunnel, the public directory API, and
-1,000-vertex delta round-trips under loss/reordering.
+1,000-vertex delta round-trips under loss/reordering. The Cloudflare Worker hub
+was also exercised locally with `wrangler dev`: announce/list, host and client
+through the WebSocket relay, and kick.
 
 ## Cross-network
+
+### Cloudflare Worker hub (recommended, no port forwarding)
+
+Deploy the Worker once:
+
+```powershell
+cd cloudflare
+npx wrangler login
+npx wrangler deploy
+```
+
+Wrangler prints a URL like
+`https://blendermp-hub.<your-subdomain>.workers.dev`. Put it in **Settings ->
+Hub URL** on the host and every friend, with **Use the hub as the WebSocket
+relay** checked. That is the only setup. The host ticks **Public**, the server
+appears in everyone's browser, and connecting goes through the Worker relay.
+See [cloudflare/README.md](cloudflare/README.md).
+
+### Self-hosted Python relay and directory
 
 ```bash
 # on a VPS or spare machine
@@ -74,10 +97,10 @@ python -m server.relay --host 0.0.0.0 --port 7100
 python -m server.directory --host 0.0.0.0 --port 7101
 ```
 
-Set **Relay** to `your-host:7100` in Settings and enable **Host through the
-relay**. Set **Directory URL** to `http://your-host:7101` on the host and every
-client. Published entries point at the relay; joining from the browser is
-unchanged and the TLS certificate is still pinned to the host. See
+Set **Hub URL** to `http://your-host:7101`, uncheck the Worker relay, and use
+the advanced **Relay** field (`your-host:7100`) with **Host through the
+advanced relay**. Published entries point at the relay; joining from the browser
+is unchanged and the TLS certificate is still pinned to the host. See
 [docs/RELAY.md](docs/RELAY.md).
 
 ## Quick start (Windows)
@@ -92,9 +115,9 @@ powershell -ExecutionPolicy Bypass -File scripts/dev.ps1
 
 `dev.ps1` builds with the GNU Rust toolchain and starts the app. Set a server
 name and password, then click **Host server**; the app launches Blender, the
-addon starts hosting, and the window docks into the stage. With a directory URL
+addon starts hosting, and the window docks into the stage. With a **Hub URL**
 configured and **List in the public server browser** enabled, the server appears
-for everyone using that directory.
+for everyone using that hub.
 
 To start in a room immediately:
 
@@ -173,6 +196,8 @@ desktop/ui/                    static UI (no bundler)
 desktop/src-tauri/             Tauri 2 shell + Win32 embedding
 server/relay.py                self-hosted cross-network relay
 server/directory.py            self-hosted public server directory
+cloudflare/                    free Worker hub: public directory + WS relay
+
 tests/                         protocol, chunker, leases, TLS, relay, live session
 tools/                         icon generator, mesh round-trip, smoke client
 scripts/                       bootstrap, dev launcher, packaging
@@ -215,8 +240,8 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
 
 ## Limitations
 
-* **No NAT hole punching.** Cross-network sessions need the relay (or a VPN).
-  Direct LAN connections still bypass it.
+* **No direct NAT hole punching.** Cross-network sessions use the Cloudflare
+  Worker hub or the self-hosted relay. Direct LAN connections still bypass it.
 * Multiple tracked meshes share one 12 Hz polling budget, so many large meshes
   update more slowly.
 * Geometry-node graphs, images, animation and full node graphs are not replicated yet.

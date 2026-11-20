@@ -78,6 +78,7 @@ runtime: dict = {
     "last_presence": 0.0,
     "control_checked": 0.0,
     "started": 0.0,
+    "relay_bridge": None,
 }
 
 
@@ -177,26 +178,41 @@ def _local_ip() -> str:
 
 
 # --------------------------------------------------------------------------- session control
-def start_host(context, code: str | None = None, port: int | None = None) -> None:
+def start_host(
+    context,
+    code: str | None = None,
+    port: int | None = None,
+    relay_url: str | None = None,
+) -> None:
     stop_session(context)
     settings = context.window_manager.bmp
-    from .core.roomcode import FLAG_PIN, FLAG_RELAY, encode_room
+    from .core.roomcode import FLAG_PIN, FLAG_RELAY, encode_room, room_id
 
     flags = FLAG_PIN if settings.pin else 0
     relay: tuple[str, int] | None = None
+    bridge = None
     if code is None and settings.use_relay:
-        host = settings.relay_host.strip()
-        if not host:
-            raise ValueError("Relay host is not set")
-        try:
-            import ipaddress
+        if relay_url:
+            endpoint_port = port or settings.port
+            code = encode_room(_local_ip(), endpoint_port, flags | FLAG_RELAY)
+            from .net.worker_relay import WorkerBridge
 
-            ipaddress.IPv4Address(host)
-        except ValueError as exc:
-            raise ValueError("Relay host must be an IPv4 address") from exc
-        relay = (host, settings.relay_port)
-        code = encode_room(host, settings.relay_port, flags | FLAG_RELAY)
-        port = 0
+            bridge = WorkerBridge("host", relay_url, room_id(code))
+            relay = ("127.0.0.1", bridge.start())
+            port = 0
+        else:
+            host = settings.relay_host.strip()
+            if not host:
+                raise ValueError("Relay host is not set")
+            try:
+                import ipaddress
+
+                ipaddress.IPv4Address(host)
+            except ValueError as exc:
+                raise ValueError("Relay host must be an IPv4 address") from exc
+            relay = (host, settings.relay_port)
+            code = encode_room(host, settings.relay_port, flags | FLAG_RELAY)
+            port = 0
     else:
         port = port or settings.port
         if not code:
@@ -207,17 +223,23 @@ def start_host(context, code: str | None = None, port: int | None = None) -> Non
     settings.last_error = ""
     name = settings.name or f"user-{uuid.uuid4().hex[:4]}"
     settings.name = name
-    session = SessionService(
-        inbox=runtime["inbox"],
-        host=True,
-        code=code,
-        name=name,
-        color=tuple(settings.color),
-        port=port,
-        pin=settings.pin,
-        relay=relay,
-    )
-    session.start()
+    try:
+        session = SessionService(
+            inbox=runtime["inbox"],
+            host=True,
+            code=code,
+            name=name,
+            color=tuple(settings.color),
+            port=port,
+            pin=settings.pin,
+            relay=relay,
+        )
+        session.start()
+    except Exception:
+        if bridge is not None:
+            bridge.stop()
+        raise
+    runtime["relay_bridge"] = bridge
     runtime["session"] = session
     runtime["mirrors"].clear()
     runtime["object_shadow"].clear()
@@ -227,7 +249,7 @@ def start_host(context, code: str | None = None, port: int | None = None) -> Non
     bpy.app.timers.register(bmp_tick, first_interval=0.05, persistent=True)
 
 
-def start_join(context, code: str) -> None:
+def start_join(context, code: str, relay_url: str | None = None) -> None:
     stop_session(context)
     settings = context.window_manager.bmp
     name = settings.name or f"user-{uuid.uuid4().hex[:4]}"
@@ -236,17 +258,32 @@ def start_join(context, code: str) -> None:
     settings.is_host = False
     settings.state = "joining"
     settings.last_error = ""
-    session = SessionService(
-        inbox=runtime["inbox"],
-        host=False,
-        code=settings.code,
-        name=name,
-        color=tuple(settings.color),
-        port=settings.port,
-        fingerprint=settings.fingerprint or None,
-        pin=settings.pin,
-    )
-    session.start()
+    bridge = None
+    relay: tuple[str, int] | None = None
+    if relay_url:
+        from .core.roomcode import room_id
+        from .net.worker_relay import WorkerBridge
+
+        bridge = WorkerBridge("join", relay_url, room_id(settings.code))
+        relay = ("127.0.0.1", bridge.start())
+    try:
+        session = SessionService(
+            inbox=runtime["inbox"],
+            host=False,
+            code=settings.code,
+            name=name,
+            color=tuple(settings.color),
+            port=settings.port,
+            fingerprint=settings.fingerprint or None,
+            pin=settings.pin,
+            relay=relay,
+        )
+        session.start()
+    except Exception:
+        if bridge is not None:
+            bridge.stop()
+        raise
+    runtime["relay_bridge"] = bridge
     runtime["session"] = session
     runtime["mirrors"].clear()
     runtime["object_shadow"].clear()
@@ -264,6 +301,12 @@ def stop_session(context) -> None:
         except Exception:  # noqa: BLE001
             traceback.print_exc()
     runtime["session"] = None
+    bridge = runtime.pop("relay_bridge", None)
+    if bridge is not None:
+        try:
+            bridge.stop()
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
     runtime["mirrors"].clear()
     runtime["object_shadow"].clear()
     settings = context.window_manager.bmp
@@ -870,11 +913,16 @@ def _poll_control(context) -> None:
     action = request.get("action")
     try:
         if action == "host":
-            start_host(context, request.get("code") or None, request.get("port"))
+            start_host(
+                context,
+                request.get("code") or None,
+                request.get("port"),
+                request.get("relay_url"),
+            )
         elif action == "join":
             code = request.get("code", "")
             if code:
-                start_join(context, code)
+                start_join(context, code, request.get("relay_url"))
         elif action == "chat":
             text = request.get("text", "")
             session = runtime.get("session")

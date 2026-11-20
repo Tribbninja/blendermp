@@ -5,6 +5,8 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "allow-local-directory",
+    "allow-discover-directories",
     "allow-detect-blender",
     "allow-launch-blender",
     "allow-find-blender-window",

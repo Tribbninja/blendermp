@@ -93,6 +93,13 @@
               <span>verify</span>
               <code id="verifyCode"></code>
             </div>
+            <div class="verify" id="directoryRow" hidden>
+              <span id="directoryLabel">LAN</span>
+              <code id="directoryUrl"></code>
+              <button class="icon-btn" id="directoryCopy" title="Copy directory link">
+                <svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15V6a2 2 0 0 1 2-2h9" /></svg>
+              </button>
+            </div>
           </div>
 
           <div class="actions" id="hostActions">
@@ -194,16 +201,20 @@
             <input id="setPort" type="number" min="1024" max="65535" />
           </label>
           <label class="field">
-            <span>Directory URL <em>optional</em></span>
-            <input id="setDirectory" placeholder="http://203.0.113.5:7101" spellcheck="false" />
+            <span>Hub URL <em>worker or directory</em></span>
+            <input id="setDirectory" placeholder="https://blendermp-hub.you.workers.dev" spellcheck="false" />
+          </label>
+          <label class="check">
+            <input type="checkbox" id="setWorkerRelay" />
+            <span>Use the hub as the WebSocket relay</span>
           </label>
           <label class="field">
-            <span>Relay <em>optional, IPv4:port</em></span>
+            <span>Relay <em>advanced, IPv4:port</em></span>
             <input id="setRelay" placeholder="203.0.113.5:7100" spellcheck="false" />
           </label>
           <label class="check">
             <input type="checkbox" id="setUseRelay" />
-            <span>Host through the relay</span>
+            <span>Host through the advanced relay</span>
           </label>
           <label class="field">
             <span>Blender executable</span>
