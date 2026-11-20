@@ -74,6 +74,7 @@ pub(crate) struct SessionRequest {
     use_relay: Option<bool>,
     prefer_direct: Option<bool>,
     direct_code: Option<String>,
+    direct_codes: Option<Vec<String>>,
     role: Option<String>,
 }
 
@@ -1300,6 +1301,7 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
         "use_relay": request.use_relay,
         "prefer_direct": request.prefer_direct,
         "direct_code": request.direct_code,
+        "direct_codes": request.direct_codes,
         "role": role,
         "nonce": format!("{:x}-{:x}", std::process::id(), stamp),
     });

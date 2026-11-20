@@ -66,7 +66,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 8, 7),
+    "version": (0, 8, 8),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -329,6 +329,7 @@ class BMPState(PropertyGroup):
     role: StringProperty(default="editor")
     overlay_info: StringProperty()
     direct_code: StringProperty()
+    direct_codes: StringProperty()
     crash_notice: StringProperty()
     recovery_available: BoolProperty(default=False)
     conflict_count: IntProperty(default=0, min=0)
@@ -529,6 +530,7 @@ def start_join(
     fingerprint: str | None = None,
     prefer_direct: bool = False,
     direct_code: str | None = None,
+    direct_codes: list[str] | None = None,
 ) -> None:
     settings = context.window_manager.bmp
     stop_session(context, publish=False)
@@ -552,18 +554,24 @@ def start_join(
         "fingerprint": fingerprint or "",
         "prefer_direct": bool(prefer_direct),
         "direct_code": direct_code or "",
+        "direct_codes": [code for code in (direct_codes or []) if isinstance(code, str)][:4],
     }
-    direct_first = False
-    if prefer_direct and relay_url and direct_code:
-        # Only attempt direct when the host looks like it is on this /24;
-        # a remote client should go straight to the relay instead of waiting
-        # out a direct-connect timeout.
-        try:
-            from .core.roomcode import decode_room
+    candidates = [code for code in (direct_codes or []) if isinstance(code, str)][:4]
+    if not candidates and direct_code:
+        candidates = [direct_code]
+    chosen = ""
+    if prefer_direct:
+        from .core.roomcode import decode_room
 
-            direct_first = _same_lan(decode_room(direct_code).ip)
-        except Exception:  # noqa: BLE001
-            direct_first = False
+        for candidate in candidates:
+            try:
+                info = decode_room(candidate)
+            except Exception:  # noqa: BLE001
+                continue
+            if _same_lan(info.ip):
+                chosen = candidate
+                break
+    direct_first = bool(prefer_direct and chosen)
     runtime["session_started"] = time.monotonic()
     runtime["bootstrapping"] = True
     runtime["bootstrap_deadline"] = time.monotonic() + 20.0
@@ -588,8 +596,8 @@ def start_join(
             fingerprint=fingerprint or None,
             pin=settings.pin,
             relay=relay,
-            direct_code=direct_code or None,
-            direct_first=bool(direct_first and relay is not None),
+            direct_code=chosen or None,
+            direct_first=bool(direct_first),
         )
         session.start()
     except Exception:
@@ -715,6 +723,12 @@ def _handle_event(context, kind: str, body: dict) -> None:
     elif kind == "host_ready":
         settings.code = body.get("code", settings.code)
         settings.direct_code = body.get("direct_code", "")
+        codes = body.get("direct_codes")
+        settings.direct_codes = (
+            ",".join(str(code) for code in codes if isinstance(code, str))[:200]
+            if isinstance(codes, list)
+            else settings.direct_code
+        )
         settings.fingerprint = body.get("fingerprint", "")
         settings.verify_code = body.get("short", "")
         _push_message(context, "system", f"Room {settings.code} ready")
@@ -2763,6 +2777,7 @@ def _poll_control(context) -> None:
                     request.get("fingerprint"),
                     bool(request.get("prefer_direct")),
                     request.get("direct_code"),
+                    request.get("direct_codes"),
                 )
         elif action == "chat":
             text = request.get("text", "")
@@ -5862,6 +5877,9 @@ def _write_status(context, force: bool = False) -> None:
             "role": "owner" if is_host else settings.role,
             "overlay_info": settings.overlay_info,
             "direct_code": settings.direct_code,
+            "direct_codes": [
+                code for code in settings.direct_codes.split(",") if code
+            ][:4],
             "uptime": max(0, int(time.monotonic() - runtime.get("session_started", runtime["started"]))),
             "total_bytes": int(stats.get("bytes_in", 0)) + int(stats.get("bytes_out", 0)),
             "fast_mode": bool(runtime.get("fast_mode", True)),
@@ -6544,6 +6562,7 @@ class BMP_OT_trust_host(Operator):
             pending,
             bool(last.get("prefer_direct")),
             last.get("direct_code") or None,
+            last.get("direct_codes"),
         )
         self.report({"INFO"}, "Trusted the new host certificate; rejoining")
         return {"FINISHED"}

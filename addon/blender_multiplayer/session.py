@@ -148,6 +148,27 @@ def _local_ip() -> str:
         probe.close()
 
 
+def _local_ips() -> list[str]:
+    """Every usable IPv4 address, default-route address first.
+
+    A host can be multi-homed (for example Wi-Fi plus a Windows ICS Ethernet
+    link to the other PC). Advertising only the default-route address makes the
+    client try an unreachable subnet, so publish all of them.
+    """
+    addresses: list[str] = []
+    try:
+        _name, _aliases, resolved = socket.gethostbyname_ex(socket.gethostname())
+        for value in resolved:
+            if value and not value.startswith(("127.", "169.254.")) and value not in addresses:
+                addresses.append(value)
+    except OSError:
+        pass
+    default = _local_ip()
+    if default and not default.startswith(("127.", "169.254.")) and default not in addresses:
+        addresses.insert(0, default)
+    return addresses[:4]
+
+
 def clean_color(value: Any) -> tuple[float, float, float, float]:
     if not isinstance(value, (list, tuple)) or len(value) < 3:
         return (0.4, 0.8, 1.0, 1.0)
@@ -322,6 +343,7 @@ class SessionService:
         compression.set_enabled(self.compress_enabled)
         self.direct_first = bool(direct_first)
         self.direct_code = (direct_code or "").strip().upper()
+        self.direct_codes: list[str] = []
         self._direct_failed = False
         self._using_relay = bool(self.relay_mode)
         self._relay_host: RelayHostAgent | None = None
@@ -542,10 +564,14 @@ class SessionService:
 
         sockets = self._server.sockets or []
         self.bound_port = sockets[0].getsockname()[1] if sockets else port
-        try:
-            self.direct_code = encode_room(_local_ip(), self.bound_port)
-        except Exception:  # noqa: BLE001
-            self.direct_code = ""
+        codes: list[str] = []
+        for address in _local_ips():
+            try:
+                codes.append(encode_room(address, self.bound_port))
+            except Exception:  # noqa: BLE001
+                continue
+        self.direct_codes = codes[:4]
+        self.direct_code = codes[0] if codes else ""
         if self.relay_mode and self.relay_addr:
             self._relay_host = RelayHostAgent(
                 self.relay_addr,
@@ -562,6 +588,7 @@ class SessionService:
                 "code": self.code,
                 "port": self.bound_port,
                 "direct_code": self.direct_code,
+                "direct_codes": self.direct_codes,
                 "fingerprint": fingerprint,
                 "short": tls.short_fingerprint(fingerprint),
                 "relay": self._using_relay,

@@ -140,7 +140,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.8.7";
+const APP_VERSION = "0.8.8";
 const PROTOCOL_VERSION = 3;
 const CAPABILITIES = 1 | (1 << 10) | (1 << 11) | (1 << 12); // presence, bookmarks, bundles, chunks
 const settings = {
@@ -507,6 +507,9 @@ function loadRoomHistory() {
         favorite: Boolean(item.favorite),
         relay_url: String(item.relay_url || "").slice(0, 256),
         direct_code: String(item.direct_code || "").slice(0, 32),
+        direct_codes: Array.isArray(item.direct_codes)
+          ? item.direct_codes.filter((value) => typeof value === "string").slice(0, 4)
+          : [],
         lan: Boolean(item.lan),
         stamp: Number(item.stamp) || 0,
       }));
@@ -1226,9 +1229,13 @@ async function joinServer(server, pin = "") {
   removeServer();
   // Prefer the direct LAN path for latency, but keep the relay as a fallback:
   // the host's random direct port is often blocked by Windows Firewall.
-  const directCode = String(server.direct_code || "").trim();
+  const directCodes = (Array.isArray(server.direct_codes) ? server.direct_codes : [])
+    .filter((value) => typeof value === "string" && value)
+    .slice(0, 4);
+  const directCode = String(server.direct_code || directCodes[0] || "").trim();
+  if (directCode && !directCodes.includes(directCode)) directCodes.unshift(directCode);
   const relayUrl = server.relay_url || (server.relay ? hubRelayUrl() : "");
-  const preferDirect = Boolean(directCode);
+  const preferDirect = directCodes.length > 0;
   const code = server.code;
   try {
     await request({
@@ -1240,6 +1247,7 @@ async function joinServer(server, pin = "") {
       use_relay: Boolean(relayUrl),
       prefer_direct: preferDirect,
       direct_code: directCode || null,
+      direct_codes: directCodes,
     });
     state.joinedServerName = server.name || "server";
     state.serverId = "";
@@ -1251,6 +1259,7 @@ async function joinServer(server, pin = "") {
       password: Boolean(pin || server.password),
       relay_url: relayUrl || "",
       direct_code: directCode || "",
+      direct_codes: directCodes,
       lan: Boolean(server.lan),
     });
     $("serverJoinBox").hidden = true;
@@ -1531,6 +1540,7 @@ function announceServer() {
     identity_signature: status.identity_signature || "",
     identity_descriptor: parseIdentityDescriptor(status.identity_descriptor),
     direct_code: status.direct_code || "",
+    direct_codes: Array.isArray(status.direct_codes) ? status.direct_codes.slice(0, 4) : [],
   };
   const lanBody = body;
   Promise.allSettled(

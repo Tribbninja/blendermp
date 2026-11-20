@@ -275,6 +275,16 @@ export class Hub {
             directCode = "";
           }
         }
+        const directCodes = [];
+        if (Array.isArray(body.direct_codes)) {
+          for (const candidate of body.direct_codes.slice(0, 4)) {
+            try {
+              directCodes.push(cleanCode(candidate));
+            } catch {
+              /* skip a malformed alternate address */
+            }
+          }
+        }
         const entry = {
           id: body.id,
           name: cleanText(body.name, 48, true),
@@ -290,6 +300,7 @@ export class Hub {
           min_app: cleanText(body.min_app, 16, false),
           relay_url: cleanText(body.relay_url, 256, false),
           direct_code: directCode,
+          direct_codes: directCodes,
           identity_public: identity.publicKey,
           identity_signature: identity.signature,
           identity_descriptor: identity.descriptor,

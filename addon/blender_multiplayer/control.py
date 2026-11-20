@@ -215,6 +215,20 @@ def read_session() -> dict[str, Any] | None:
             return None
         result["direct_code"] = direct_code.strip().upper()[:32]
 
+    direct_codes = body.get("direct_codes")
+    if isinstance(direct_codes, list):
+        cleaned: list[str] = []
+        for item in direct_codes[:4]:
+            if not isinstance(item, str):
+                continue
+            try:
+                decode_room(normalize(item))
+            except Exception:  # noqa: BLE001
+                continue
+            cleaned.append(item.strip().upper()[:32])
+        if cleaned:
+            result["direct_codes"] = cleaned
+
     relay_token = body.get("relay_token")
     if relay_token is not None:
         if (
@@ -275,9 +289,14 @@ def write_status(data: dict[str, Any]) -> None:
         value = data.get(key)
         if isinstance(value, str):
             safe[key] = value[:512]
+    codes = data.get("direct_codes")
+    if isinstance(codes, list):
+        safe["direct_codes"] = [
+            str(code)[:32] for code in codes[:4] if isinstance(code, str)
+        ]
+
     scene = data.get("scene")
-    if isinstance(scene, dict):
-        safe["scene"] = {
+    if isinstance(scene, dict):        safe["scene"] = {
             key: max(0, min(int(scene.get(key, 0)), 1 << 40))
             for key in ("objects", "meshes", "vertices", "materials", "images", "collections")
             if isinstance(scene.get(key, 0), int) and not isinstance(scene.get(key, 0), bool)

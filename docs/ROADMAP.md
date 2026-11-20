@@ -14,6 +14,7 @@ Progress log:
 - [x] 2026-11-20: Phase 1 lock reliability: lease sweep broadcasts `expiring`/`released`, snapshot-driven owner cleanup, expiry auto-renew, request queue, host-side grant/deny, lock status in the N-panel.
 - [x] 2026-11-20: Phase 1 presence 2.0: edit-mode vertex selection relay/points, 3D cursor, follow-user camera, overlay toggles. Laser pointer removed after poor reliability.
 - [x] 2026-11-20: Phase 1 roles: host assigns viewer/commenter/editor/admin, server-enforced mutating-frame guard, downgrade releases leases, role UI in the desktop member list.
+- [x] 2026-11-21: 0.8.8: hosts advertise a direct code for every local IPv4 (Wi-Fi + Windows ICS Ethernet); the client picks the code on its own /24, so ICS-connected PCs get LAN latency instead of the relay.
 - [x] 2026-11-21: 0.8.7: fix the client constructor overwriting direct_code, so LAN direct-first actually connects; verified relay=False on a direct join.
 - [x] 2026-11-21: 0.8.6: LAN joins try direct first (same /24) and fall back to the relay, restoring ~LAN ping; public listings carry direct_code; the host takes the lease when it moves a client-leased object so its drag is not overwritten.
 - [x] 2026-11-21: 0.8.5: lossless model sync: vertex deltas are float32 (no i16 quantisation); direct LAN sends raw payloads, relay uses lossless zlib for geometry, deltas, bundles, images and rig data.
