@@ -47,10 +47,12 @@ from bpy_extras.io_utils import ExportHelper
 from . import control, ui
 from .core import chunker
 from .core import accessibility
+from .core import ai
 from .core import compression
 from .core import asset_bundle
 from .core import bookmarks
 from .core import checkpoints
+from .core import cross_engine
 from .core import eventlog
 from .core import heartbeat
 from .core import image_payload
@@ -58,6 +60,8 @@ from .core import journal
 from .core import undo as undo_log
 from .core import material as material_payload
 from .core import object_payload
+from .core import perf
+from .core import recording
 from .core.version import ADDON_VERSION
 from .session import MAX_MESH, SessionService
 from .sync import objects as obj_sync
@@ -66,7 +70,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 8, 11),
+    "version": (0, 8, 13),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -154,6 +158,10 @@ runtime: dict = {
     "remote_points": [],
     "lasers": {},
     "laser_active": False,
+    "recording": None,
+    "ai_session": None,
+    "ai_queue": queue.Queue(),
+    "ai_pending_edits": [],
     "overlay_scale": 1.0,
     "last_transform": 0.0,
     "fast_mode": True,
@@ -319,6 +327,12 @@ class BMPState(PropertyGroup):
     overlay_opacity: FloatProperty(name="Overlay opacity", default=0.85, min=0.2, max=1.0)
     overlay_scale: FloatProperty(name="Overlay scale", default=1.0, min=0.5, max=2.0)
     colorblind_safe: BoolProperty(name="Colour-blind-safe colours", default=False)
+    ai_enabled: BoolProperty(name="Enable AI copilot", default=False)
+    ai_url: StringProperty(name="Ollama URL", default="http://127.0.0.1:11434")
+    ai_model: StringProperty(name="Ollama model", default="qwen2.5:7b")
+    ai_prompt: StringProperty(name="Ask the copilot", default="")
+    ai_status: StringProperty(name="AI status", default="idle")
+    ai_pending_text: StringProperty(name="AI pending edits", default="")
     host_name: StringProperty()
     sync_transforms: BoolProperty(name="Sync object transforms", default=True)
     users: CollectionProperty(type=BMPUser)
@@ -4269,6 +4283,28 @@ def _lease_request(session: SessionService, uid: str, action: str) -> bool:
     return True
 
 
+def _drain_ai_queue(context) -> None:
+    settings = context.window_manager.bmp
+    while True:
+        try:
+            result = runtime["ai_queue"].get_nowait()
+        except queue.Empty:
+            break
+        session = runtime.get("ai_session")
+        if session is None:
+            continue
+        settings.ai_status = session.status
+        if session.status == "done":
+            runtime["ai_pending_edits"] = list(session.pending)
+            settings.ai_pending_count = len(session.pending)
+            settings.ai_pending_text = "\\n".join(edit.summary for edit in session.pending)
+            if session.pending:
+                _push_message(context, "system", f"AI proposed {len(session.pending)} edit(s). Confirm to apply.")
+        elif session.status == "error":
+            settings.last_error = session.error
+            settings.last_error_code = "AI_ERROR"
+
+
 def _sync_selection(context) -> None:
     """Claim selected objects so only one person can select/edit them."""
     session: SessionService | None = runtime.get("session")
@@ -4428,8 +4464,233 @@ def _sync_transforms(context) -> None:
             runtime["undo"].push(uid, "transform", previous, current)
             _note_rev(uid)
             session.send_transform(uid, current)
+            recorder = runtime.get("recording")
+            if recorder is not None:
+                try:
+                    recorder.record("transform", {"uuid": uid, "matrix": list(current)})
+                except Exception:  # noqa: BLE001
+                    pass
     for stale in list(shadow.keys() - seen):
         del shadow[stale]
+
+
+def _sync_ai_pending(settings) -> None:
+    """Mirror the AI session's pending edits into the settings UI."""
+    session = runtime.get("ai_session")
+    if session is None:
+        settings.ai_pending_text = ""
+        settings.ai_pending_count = 0
+        runtime["ai_pending_edits"] = []
+        return
+    runtime["ai_pending_edits"] = list(session.pending)
+    settings.ai_pending_count = len(session.pending)
+    settings.ai_pending_text = "\\n".join(edit.summary for edit in session.pending)
+
+
+def _ai_callback(result: dict) -> None:
+    runtime["ai_queue"].put(result)
+
+
+def _ai_handlers() -> dict:
+    import bpy
+    from math import radians
+
+    from . import obj_sync
+
+    def get_scene_info(args, ctx):
+        objs = []
+        for obj in bpy.context.scene.objects:
+            objs.append(
+                {"name": obj.name, "type": obj.type, "location": [round(float(v), 3) for v in obj.location]}
+            )
+        return {"count": len(objs), "objects": objs[:80]}
+
+    def get_selected_objects(args, ctx):
+        return {
+            "objects": [
+                {"name": o.name, "type": o.type, "location": [round(float(v), 3) for v in o.location]}
+                for o in bpy.context.selected_objects
+            ]
+        }
+
+    def get_object_info(args, ctx):
+        obj = bpy.data.objects.get(str(args.get("name", "")))
+        if obj is None:
+            return {"error": "object not found"}
+        return {
+            "name": obj.name,
+            "type": obj.type,
+            "location": [round(float(v), 3) for v in obj.location],
+            "rotation": [round(float(v), 3) for v in obj.rotation_euler],
+            "scale": [round(float(v), 3) for v in obj.scale],
+            "dimensions": [round(float(v), 3) for v in obj.dimensions],
+        }
+
+    def get_materials(args, ctx):
+        return {"materials": [m.name for m in bpy.data.materials][:80]}
+
+    def move_object(args, ctx):
+        obj = bpy.data.objects.get(str(args.get("name", "")))
+        if obj is None:
+            return {"error": "object not found"}
+        loc = args.get("location")
+        if not (isinstance(loc, (list, tuple)) and len(loc) == 3):
+            return {"error": "location must be [x, y, z]"}
+        try:
+            obj.location = tuple(float(v) for v in loc)
+        except (TypeError, ValueError):
+            return {"error": "invalid location"}
+        sess = runtime.get("session")
+        if sess is not None:
+            uid = obj.get("bmp_uuid")
+            if uid:
+                _note_rev(uid)
+                sess.send_transform(uid, tuple(round(float(v), 6) for row in obj.matrix_world for v in row))
+        return {"ok": True, "name": obj.name, "location": [round(float(v), 3) for v in obj.location]}
+
+    def rotate_object(args, ctx):
+        obj = bpy.data.objects.get(str(args.get("name", "")))
+        if obj is None:
+            return {"error": "object not found"}
+        rot = args.get("rotation")
+        if not (isinstance(rot, (list, tuple)) and len(rot) == 3):
+            return {"error": "rotation must be [x, y, z] degrees"}
+        try:
+            obj.rotation_euler = tuple(radians(float(v)) for v in rot)
+        except (TypeError, ValueError):
+            return {"error": "invalid rotation"}
+        sess = runtime.get("session")
+        if sess is not None:
+            uid = obj.get("bmp_uuid")
+            if uid:
+                _note_rev(uid)
+                sess.send_transform(uid, tuple(round(float(v), 6) for row in obj.matrix_world for v in row))
+        return {"ok": True}
+
+    def scale_object(args, ctx):
+        obj = bpy.data.objects.get(str(args.get("name", "")))
+        if obj is None:
+            return {"error": "object not found"}
+        sc = args.get("scale")
+        if not (isinstance(sc, (list, tuple)) and len(sc) in (1, 3)):
+            return {"error": "scale must be a number or [x, y, z]"}
+        try:
+            if len(sc) == 1:
+                value = float(sc[0])
+                obj.scale = (value, value, value)
+            else:
+                obj.scale = tuple(float(v) for v in sc)
+        except (TypeError, ValueError):
+            return {"error": "invalid scale"}
+        sess = runtime.get("session")
+        if sess is not None:
+            uid = obj.get("bmp_uuid")
+            if uid:
+                _note_rev(uid)
+                sess.send_transform(uid, tuple(round(float(v), 6) for row in obj.matrix_world for v in row))
+        return {"ok": True}
+
+    def create_primitive(args, ctx):
+        ptype = str(args.get("type", "cube")).lower()
+        name = str(args.get("name", "")).strip() or ptype
+        loc = args.get("location", [0.0, 0.0, 0.0])
+        size = float(args.get("size", 1.0) or 1.0)
+        if not (isinstance(loc, (list, tuple)) and len(loc) == 3):
+            return {"error": "location must be [x, y, z]"}
+        try:
+            bpy.ops.object.select_all(action="DESELECT")
+            if ptype == "cube":
+                bpy.ops.mesh.primitive_cube_add(size=size, location=tuple(float(v) for v in loc))
+            elif ptype == "sphere":
+                bpy.ops.mesh.primitive_uv_sphere_add(radius=size, location=tuple(float(v) for v in loc))
+            elif ptype == "plane":
+                bpy.ops.mesh.primitive_plane_add(size=size, location=tuple(float(v) for v in loc))
+            elif ptype == "cylinder":
+                bpy.ops.mesh.primitive_cylinder_add(radius=size, depth=size, location=tuple(float(v) for v in loc))
+            elif ptype == "cone":
+                bpy.ops.mesh.primitive_cone_add(radius1=size, depth=size, location=tuple(float(v) for v in loc))
+            else:
+                return {"error": f"unknown primitive {ptype}"}
+            obj = bpy.context.active_object
+            if obj is None:
+                return {"error": "creation failed"}
+            obj.name = name
+            uid = str(uuid.uuid4())
+            obj["bmp_uuid"] = uid
+            runtime["tracked"].add(obj.name)
+            sess = runtime.get("session")
+            if sess is not None:
+                _send_object_create(sess, obj)
+            return {"ok": True, "name": obj.name, "uid": uid}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)[:200]}
+
+    def delete_object(args, ctx):
+        obj = bpy.data.objects.get(str(args.get("name", "")))
+        if obj is None:
+            return {"error": "object not found"}
+        uid = obj.get("bmp_uuid")
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if uid:
+            runtime["tracked"].discard(obj.name)
+            runtime["object_shadow"].pop(uid, None)
+            runtime["mirrors"].pop(uid, None)
+            sess = runtime.get("session")
+            if sess is not None:
+                sess.send_object_delete(uid)
+        return {"ok": True}
+
+    def duplicate_object(args, ctx):
+        obj = bpy.data.objects.get(str(args.get("name", "")))
+        if obj is None:
+            return {"error": "object not found"}
+        new_name = str(args.get("new_name", "")).strip() or f"{obj.name} copy"
+        copy = obj.copy()
+        if obj.data is not None:
+            copy.data = obj.data.copy()
+        bpy.context.scene.collection.objects.link(copy)
+        copy.name = new_name
+        uid = str(uuid.uuid4())
+        copy["bmp_uuid"] = uid
+        runtime["tracked"].add(copy.name)
+        sess = runtime.get("session")
+        if sess is not None:
+            _send_object_create(sess, copy)
+        return {"ok": True, "name": copy.name, "uid": uid}
+
+    def set_material_color(args, ctx):
+        mat = bpy.data.materials.get(str(args.get("material", "")))
+        if mat is None:
+            return {"error": "material not found"}
+        color = args.get("color")
+        if not (isinstance(color, (list, tuple)) and len(color) in (3, 4)):
+            return {"error": "color must be [r, g, b] or [r, g, b, a]"}
+        try:
+            values = [max(0.0, min(1.0, float(v))) for v in color]
+        except (TypeError, ValueError):
+            return {"error": "invalid color"}
+        if len(values) == 3:
+            values.append(1.0)
+        mat.diffuse_color = tuple(values)
+        bsdf = mat.node_tree.nodes.get("Principled BSDF") if mat.node_tree else None
+        if bsdf is not None and "Base Color" in bsdf.inputs:
+            bsdf.inputs["Base Color"].default_value = tuple(values)
+        return {"ok": True, "material": mat.name}
+
+    return {
+        "get_scene_info": get_scene_info,
+        "get_selected_objects": get_selected_objects,
+        "get_object_info": get_object_info,
+        "get_materials": get_materials,
+        "move_object": move_object,
+        "rotate_object": rotate_object,
+        "scale_object": scale_object,
+        "create_primitive": create_primitive,
+        "delete_object": delete_object,
+        "duplicate_object": duplicate_object,
+        "rename_object": lambda args, ctx: {"error": "not implemented"},
+        "set_material_color": set_material_color,
+    }
 
 
 def _sync_edit_topology(context, session: SessionService, obj, bm) -> None:
@@ -6145,12 +6406,19 @@ def bmp_tick():
             except queue.Empty:
                 break
             started = time.monotonic()
+            recorder = runtime.get("recording")
+            if recorder is not None:
+                try:
+                    recorder.record(kind, body)
+                except Exception:  # noqa: BLE001
+                    pass
             _handle_event(context, kind, body)
             times = runtime.setdefault("apply_times", [])
             times.append((time.monotonic() - started) * 1000.0)
             if len(times) > 240:
                 del times[: len(times) - 240]
         if session is not None:
+            _drain_ai_queue(context)
             _sync_selection(context)
             _sync_transforms(context)
             _sync_mesh(context)
@@ -6576,6 +6844,151 @@ class BMP_OT_trust_host(Operator):
             last.get("direct_codes"),
         )
         self.report({"INFO"}, "Trusted the new host certificate; rejoining")
+        return {"FINISHED"}
+
+
+class BMP_OT_ai_ask(Operator):
+    bl_idname = "bmp.ai_ask"
+    bl_label = "Ask"
+    bl_description = "Ask the copilot to propose edits to this scene"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        if not settings.ai_enabled:
+            self.report({"ERROR"}, "Enable the AI copilot first")
+            return {"CANCELLED"}
+        from .core import ai as ai_core
+
+        if runtime.get("ai_session") is None:
+            handlers = _ai_handlers()
+            tools = ai_core.build_default_tools(context, handlers)
+            client = ai_core.OllamaClient(settings.ai_url, settings.ai_model)
+            runtime["ai_session"] = ai_core.AISession(client, tools)
+        else:
+            runtime["ai_session"].client = ai_core.OllamaClient(settings.ai_url, settings.ai_model)
+        prompt = settings.ai_prompt.strip()
+        if not prompt:
+            self.report({"ERROR"}, "Type a prompt first")
+            return {"CANCELLED"}
+        settings.ai_status = "thinking"
+        settings.ai_pending_text = ""
+        settings.ai_pending_count = 0
+        runtime["ai_pending_edits"] = []
+        runtime["ai_session"].ask(prompt, callback=_ai_callback)
+        self.report({"INFO"}, "Thinking...")
+        return {"FINISHED"}
+
+
+class BMP_OT_ai_apply_all(Operator):
+    bl_idname = "bmp.ai_apply_all"
+    bl_label = "Apply all"
+    bl_description = "Apply every proposed edit"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        session = runtime.get("ai_session")
+        settings = context.window_manager.bmp
+        if session is None or not session.pending:
+            self.report({"INFO"}, "No pending edits")
+            return {"CANCELLED"}
+        applied = session.apply_all(context)
+        settings.ai_pending_text = ""
+        settings.ai_pending_count = 0
+        runtime["ai_pending_edits"] = []
+        settings.ai_status = "idle"
+        self.report({"INFO"}, f"Applied {applied} edit(s)")
+        return {"FINISHED"}
+
+
+class BMP_OT_ai_clear(Operator):
+    bl_idname = "bmp.ai_clear"
+    bl_label = "Clear"
+    bl_description = "Discard pending edits and the conversation"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        session = runtime.get("ai_session")
+        settings = context.window_manager.bmp
+        if session is not None:
+            session.clear()
+        settings.ai_pending_text = ""
+        settings.ai_pending_count = 0
+        settings.ai_status = "idle"
+        runtime["ai_pending_edits"] = []
+        self.report({"INFO"}, "Cleared")
+        return {"FINISHED"}
+
+
+class BMP_OT_record_start(Operator):
+    bl_idname = "bmp.record_start"
+    bl_label = "Start recording"
+    bl_description = "Record this session's events to a JSONL file for replay and debugging"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        recorder = recording.Recorder(str(control.data_dir() / "recordings" / f"session-{int(time.time())}.jsonl"))
+        try:
+            recorder.start()
+        except Exception as exc:  # noqa: BLE001
+            self.report({"ERROR"}, f"Could not start recording: {exc}")
+            return {"CANCELLED"}
+        runtime["recording"] = recorder
+        _push_message(context, "system", f"Recording to {recorder.path.name}")
+        self.report({"INFO"}, f"Recording to {recorder.path.name}")
+        return {"FINISHED"}
+
+
+class BMP_OT_record_stop(Operator):
+    bl_idname = "bmp.record_stop"
+    bl_label = "Stop recording"
+    bl_description = "Stop the active recording"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        recorder = runtime.get("recording")
+        if recorder is None:
+            self.report({"INFO"}, "No recording active")
+            return {"CANCELLED"}
+        count = recorder.event_count
+        recorder.stop()
+        runtime["recording"] = None
+        _push_message(context, "system", f"Recording stopped ({count} events)")
+        self.report({"INFO"}, f"Recording stopped ({count} events)")
+        return {"FINISHED"}
+
+
+class BMP_OT_replay(Operator):
+    bl_idname = "bmp.replay"
+    bl_label = "Replay latest"
+    bl_description = "Replay the most recent recording into this session"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        if runtime.get("recording") is not None:
+            self.report({"ERROR"}, "Stop the active recording first")
+            return {"CANCELLED"}
+        directory = control.data_dir() / "recordings"
+        files = sorted(directory.glob("*.jsonl"), key=lambda path: path.stat().st_mtime, reverse=True) if directory.exists() else []
+        if not files:
+            self.report({"ERROR"}, "No recording found")
+            return {"CANCELLED"}
+        replay = recording.Replay(str(files[0]))
+
+        def sink(kind, body):
+            runtime["inbox"].put((kind, body))
+
+        def worker():
+            try:
+                replay.play(sink, speed=1.0)
+            except Exception:  # noqa: BLE001
+                pass
+
+        import threading
+
+        threading.Thread(target=worker, name="bmp-replay", daemon=True).start()
+        _push_message(context, "system", f"Replaying {files[0].name}")
+        self.report({"INFO"}, f"Replaying {files[0].name}")
         return {"FINISHED"}
 
 
@@ -7248,6 +7661,12 @@ classes = (
     BMP_OT_ping,
     BMP_OT_laser,
     BMP_OT_trust_host,
+    BMP_OT_ai_ask,
+    BMP_OT_ai_apply_all,
+    BMP_OT_ai_clear,
+    BMP_OT_record_start,
+    BMP_OT_record_stop,
+    BMP_OT_replay,
     BMP_OT_ping_mark,
     BMP_OT_follow_user,
     BMP_OT_share_images,

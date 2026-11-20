@@ -63,6 +63,32 @@ class BMP_PT_main(bpy.types.Panel):
             row.operator("bmp.laser", text="Laser", icon="CURSOR")
             row.operator("bmp.undo_shared", text="Undo my edit", icon="LOOP_BACK")
 
+        ai_box = layout.box()
+        ai_box.label(text="AI Copilot", icon="LIGHT")
+        ai_box.prop(settings, "ai_enabled")
+        if settings.ai_enabled:
+            ai_box.prop(settings, "ai_url")
+            ai_box.prop(settings, "ai_model")
+            row = ai_box.row(align=True)
+            row.prop(settings, "ai_prompt", text="")
+            row.operator("bmp.ai_ask", text="", icon="PLAY")
+            if settings.ai_status == "thinking":
+                ai_box.label(text="Thinking...", icon="SORTTIME")
+            if settings.ai_pending_count:
+                for line in settings.ai_pending_text.splitlines():
+                    ai_box.label(text=line[:100])
+                ai_box.operator("bmp.ai_apply_all", text="Apply all", icon="CHECKMARK")
+                ai_box.operator("bmp.ai_clear", text="Clear", icon="X")
+            if settings.last_error_code == "AI_ERROR" and settings.last_error:
+                ai_box.label(text=settings.last_error[:120], icon="ERROR")
+
+        recording_box = layout.box()
+        recording_box.label(text="Recording", icon="RECORD")
+        row = recording_box.row(align=True)
+        row.operator("bmp.record_start", text="Start", icon="PLAY")
+        row.operator("bmp.record_stop", text="Stop", icon="PAUSE")
+        row.operator("bmp.replay", text="Replay", icon="PREVIEW_RANGE")
+
         if settings.last_error:
             error = layout.box()
             error.alert = True
