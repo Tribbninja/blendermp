@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - allows importing the module standalone
 APP_DIR = "Blendermp"
 MAX_CONTROL_BYTES = 4096
 MAX_STATUS_BYTES = 32 * 1024
-ALLOWED_ACTIONS = {"host", "join", "leave", "chat", "kick"}
+ALLOWED_ACTIONS = {"host", "join", "leave", "chat", "kick", "role"}
 NAME_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,48}$")
 HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
@@ -217,6 +217,16 @@ def read_session() -> dict[str, Any] | None:
             return None
         result["target"] = target
 
+    if action == "role":
+        target = body.get("target")
+        if not isinstance(target, str) or not NAME_RE.match(target):
+            return None
+        role = body.get("role")
+        if role not in {"viewer", "commenter", "editor", "admin"}:
+            return None
+        result["target"] = target
+        result["role"] = role
+
     if action == "host" and body.get("code") is not None:
         code = body.get("code")
         if not isinstance(code, str):
@@ -233,7 +243,7 @@ def read_session() -> dict[str, Any] | None:
 def write_status(data: dict[str, Any]) -> None:
     """Write a bounded, sanitised status document atomically."""
     safe: dict[str, Any] = {}
-    for key in ("state", "code", "name", "addon", "blender", "fingerprint", "verify_code", "last_error"):
+    for key in ("state", "code", "name", "addon", "blender", "fingerprint", "verify_code", "last_error", "role"):
         value = data.get(key)
         if isinstance(value, str):
             safe[key] = value[:256]
@@ -254,6 +264,7 @@ def write_status(data: dict[str, Any]) -> None:
                 "color": [float(c) for c in item.get("color", [])][:4],
                 "ping_ms": int(item.get("ping_ms", 0)),
                 "host": bool(item.get("host", False)),
+                "role": str(item.get("role", "editor"))[:16],
             }
             for item in users[:64]
             if isinstance(item, dict)

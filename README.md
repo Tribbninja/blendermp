@@ -42,6 +42,12 @@ surface that cross-process re-parenting causes on some GPUs).
   orthographic zoom cannot distort the widget. Name tags use a DPI-scaled
   outlined font so they stay crisp. Each user gets a stable color derived from
   their name if they have not chosen one.
+* **Presence 2.0**: remote Edit Mode vertex selections as colored points, a
+  remote 3D cursor crosshair, a fading laser pointer (`Alt+L`), follow a user's
+  viewport, and per-overlay visibility toggles.
+* **Server-enforced roles**: the host assigns viewer, commenter, editor or admin
+  from the member list. Mutating frames and lease acquisition are rejected for
+  viewers/commenters; downgrading releases their leases.
 * **Authenticated relay hosting**: each installation has a random host key; the
   Worker stores only its hash and requires it for the host WebSocket. A public
   room cannot be taken over by another host, and the key is never listed.

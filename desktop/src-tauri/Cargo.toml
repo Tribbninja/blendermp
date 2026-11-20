@@ -1,5 +1,8 @@
 [package]
 name = "blendermp"
+# User-facing version lives in tauri.conf.json / version.json. The crate version
+# is tracked separately as crate_version in version.json because the offline
+# registry lock resolves at this version.
 version = "0.1.6"
 description = "Blendermp desktop shell"
 authors = ["Blendermp"]

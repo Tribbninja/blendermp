@@ -29,6 +29,7 @@ class BMP_PT_main(bpy.types.Panel):
         header.label(text=settings.state.title(), icon=_state_icon(settings.state))
         if settings.is_host:
             header.label(text="host", icon="HOME")
+        header.label(text=settings.role.title() if settings.role else "")
         header.label(text=f"{settings.rtt_ms} ms" if settings.rtt_ms else "")
 
         if settings.state in {"hosting", "connected"}:
@@ -47,6 +48,7 @@ class BMP_PT_main(bpy.types.Panel):
             if settings.state == "connected":
                 row.operator("bmp.ping", text="Ping", icon="SORTTIME")
             row.operator("bmp.ping_mark", text="Ping cursor", icon="CURSOR")
+            row.operator("bmp.laser", text="Laser", icon="STYLUS_PRESSURE")
 
         if settings.last_error:
             error = layout.box()
@@ -62,6 +64,11 @@ class BMP_PT_main(bpy.types.Panel):
                 if user.host:
                     row.label(text="host", icon="HOME")
                 row.label(text=f"{user.ping_ms} ms" if user.ping_ms else "")
+                if user.name != settings.name and user.has_view:
+                    follow = row.operator("bmp.follow_user", text="", icon="CAMERA_DATA")
+                    follow.name = user.name
+                    if settings.follow_user == user.name:
+                        row.label(text="following", icon="CHECKMARK")
 
         layout.separator()
         box = layout.box()
@@ -72,6 +79,10 @@ class BMP_PT_main(bpy.types.Panel):
         box.prop(settings, "sync_modifiers")
         box.prop(settings, "paused")
         box.prop(settings, "follow_host")
+        box.prop(settings, "show_cameras")
+        box.prop(settings, "show_selections")
+        box.prop(settings, "show_labels")
+        box.prop(settings, "show_laser")
         row = box.row(align=True)
         row.operator("bmp.track_mesh", text="Track selected", icon="MESH_DATA")
         row.operator("bmp.untrack_mesh", text="", icon="X")

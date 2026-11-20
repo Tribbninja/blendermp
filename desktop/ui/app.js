@@ -134,7 +134,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.1.8";
+const APP_VERSION = "0.1.9";
 const PROTOCOL_VERSION = 2;
 const CAPABILITIES = 1; // core presence view; keep in sync with core/protocol.py
 const settings = {
@@ -596,6 +596,34 @@ function renderMembers(status) {
       const badge = document.createElement("span");
       badge.className = "host-badge";
       badge.textContent = "host";
+      item.append(badge);
+    }
+
+    const role = String(user.role || "editor");
+    if (status?.is_host && !user.host && user.name !== settings.name) {
+      const select = document.createElement("select");
+      select.className = "role-select";
+      select.title = `Role for ${user.name}`;
+      for (const value of ["viewer", "commenter", "editor", "admin"]) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = value;
+        if (value === role) option.selected = true;
+        select.append(option);
+      }
+      select.addEventListener("change", async () => {
+        try {
+          await request({ action: "role", target: user.name, role: select.value });
+          toast(`${user.name} is now ${select.value}`, "ok");
+        } catch (error) {
+          toast(String(error), "error");
+        }
+      });
+      item.append(select);
+    } else {
+      const badge = document.createElement("span");
+      badge.className = "ms";
+      badge.textContent = role === "owner" ? "owner" : role;
       item.append(badge);
     }
 

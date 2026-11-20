@@ -5,6 +5,7 @@ import time
 
 import session as session_mod
 from core.roomcode import encode_room
+from sync.leases import Role
 
 
 def free_port():
@@ -122,6 +123,97 @@ def test_lease_expiry_is_broadcast(tmp_path, monkeypatch):
         client.stop()
         host.stop()
         client_events.stop()
+        host_events.stop()
+
+
+def test_role_guard_and_downgrade(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    port = free_port()
+    code = encode_room("127.0.0.1", port)
+    host_inbox = queue.Queue()
+    client_inbox = queue.Queue()
+    host_events = Events(host_inbox)
+    client_events = Events(client_inbox)
+    host = session_mod.SessionService(host_inbox, host=True, code=code, name="host", color=(1, 1, 1, 1), port=port)
+    host.start()
+    assert wait_for(lambda: host.state == "hosting")
+    client = session_mod.SessionService(client_inbox, host=False, code=code, name="alice", color=(1, 1, 1, 1))
+    client.start()
+    try:
+        assert wait_for(lambda: client.state == "connected")
+        key = "55555555-5555-5555-5555-555555555555"
+        client.send_lease(key, "acquire")
+        assert wait_for(lambda: client_events.has("lease", action="acquire", owner="alice"))
+
+        host.set_role("alice", int(Role.VIEWER))
+        assert wait_for(lambda: client_events.has("role", name="alice", role=int(Role.VIEWER)))
+        # Downgrading releases the viewer's leases.
+        assert wait_for(lambda: client_events.has("lease", action="release"), timeout=4)
+        assert host._leases.owner_of(key, time.monotonic()) is None
+
+        client.send_lease(key, "acquire")
+        assert wait_for(
+            lambda: client_events.has("error", message="your role does not allow editing"),
+            timeout=4,
+        )
+
+        host.set_role("alice", int(Role.EDITOR))
+        assert wait_for(lambda: client_events.has("role", name="alice", role=int(Role.EDITOR)))
+        client.send_lease(key, "acquire")
+        assert wait_for(lambda: client_events.has("lease", action="acquire", owner="alice"))
+    finally:
+        client.stop()
+        host.stop()
+        client_events.stop()
+        host_events.stop()
+
+
+def test_selection_and_cursor_relay(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    port = free_port()
+    code = encode_room("127.0.0.1", port)
+    host_inbox = queue.Queue()
+    a_inbox = queue.Queue()
+    b_inbox = queue.Queue()
+    host_events = Events(host_inbox)
+    a_events = Events(a_inbox)
+    b_events = Events(b_inbox)
+    host = session_mod.SessionService(host_inbox, host=True, code=code, name="host", color=(1, 1, 1, 1), port=port)
+    host.start()
+    assert wait_for(lambda: host.state == "hosting")
+    a = session_mod.SessionService(a_inbox, host=False, code=code, name="alice", color=(1, 1, 1, 1))
+    b = session_mod.SessionService(b_inbox, host=False, code=code, name="bob", color=(1, 1, 1, 1))
+    a.start()
+    b.start()
+    try:
+        assert wait_for(lambda: a.state == "connected" and b.state == "connected")
+        uid = "66666666-6666-6666-6666-666666666666"
+        a.send_selection(uid, bytes([0b00000101]), 3)
+        assert wait_for(
+            lambda: b_events.has(
+                "selection", name="alice", uuid=uid, count=3, mask=bytes([0b00000101])
+            )
+        )
+
+        a.send_presence({"cursor": [1.0, 2.0, 3.0], "scene": "Scene", "frame": 1, "mode": "EDIT_MESH"})
+        assert wait_for(
+            lambda: b_events.has("presence", name="alice", cursor=[1.0, 2.0, 3.0])
+        )
+
+        a.send_laser([(1.0, 2.0, 3.0), (4.0, 5.0, 6.0)])
+        assert wait_for(
+            lambda: b_events.has(
+                "laser", name="alice", points=[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+            )
+        )
+    finally:
+        a.stop()
+        b.stop()
+        host.stop()
+        a_events.stop()
+        b_events.stop()
         host_events.stop()
 
 

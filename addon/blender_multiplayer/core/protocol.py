@@ -47,7 +47,7 @@ class Capability(IntFlag):
     INTEREST = 1 << 9
 
 
-DEFAULT_CAPABILITIES = int(Capability.PRESENCE_VIEW)
+DEFAULT_CAPABILITIES = int(Capability.PRESENCE_VIEW | Capability.SELECTION | Capability.ROLES)
 
 
 class MessageType(IntEnum):
@@ -76,6 +76,9 @@ class MessageType(IntEnum):
     KICK = 23
     SCENE_RESET = 24
     SCENE_READY = 25
+    SELECTION = 26
+    LASER = 27
+    ROLE = 38
 
 
 class Channel(IntEnum):

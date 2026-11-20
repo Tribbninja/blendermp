@@ -48,7 +48,7 @@ from .sync.mesh import EditMirror, MeshMirror
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 1, 8),
+    "version": (0, 1, 9),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -80,6 +80,19 @@ USER_PALETTE = (
 )
 
 
+ROLE_NAMES = {0: "viewer", 1: "commenter", 2: "editor", 3: "admin", 4: "owner"}
+ROLE_VALUES = {name: value for value, name in ROLE_NAMES.items()}
+
+
+def _role_name(value) -> str:
+    if isinstance(value, str) and value in ROLE_VALUES:
+        return value
+    try:
+        return ROLE_NAMES.get(int(value), "editor")
+    except (TypeError, ValueError):
+        return "editor"
+
+
 def effective_color(name: str, color) -> tuple:
     try:
         values = tuple(float(value) for value in color)[:4]
@@ -107,11 +120,19 @@ runtime: dict = {
     "owned_leases": set(),
     "last_selection": 0.0,
     "remote_batches": [],
+    "remote_point_batches": [],
     "remote_labels": [],
     "remote_shader": None,
     "last_remote": 0.0,
     "view_smoothers": {},
     "remote_debug": {},
+    "remote_selections": {},
+    "remote_points": [],
+    "lasers": {},
+    "selection_digest": {},
+    "last_edit_sel": 0.0,
+    "last_selection_uid": "",
+    "last_selection_count": 0,
     "draw_lines": None,
     "draw_labels": None,
     "transform_smoothers": {},
@@ -141,6 +162,8 @@ runtime: dict = {
     "relay_bridge": None,
 }
 
+addon_keymaps: list = []
+
 
 # --------------------------------------------------------------------------- props
 class BMPUser(PropertyGroup):
@@ -158,6 +181,9 @@ class BMPUser(PropertyGroup):
     view_distance: FloatProperty(default=7.0)
     selected: StringProperty()
     host: BoolProperty()
+    role: StringProperty(default="editor")
+    cursor: FloatVectorProperty(size=3)
+    has_cursor: BoolProperty()
 
 
 class BMPMessage(PropertyGroup):
@@ -190,6 +216,11 @@ class BMPState(PropertyGroup):
     relay_port: IntProperty(name="Relay port", default=7100, min=1024, max=65535)
     paused: BoolProperty(name="Pause sync", default=False)
     follow_host: BoolProperty(name="Follow host frame", default=False)
+    follow_user: StringProperty()
+    show_cameras: BoolProperty(name="Show cameras", default=True)
+    show_selections: BoolProperty(name="Show selections", default=True)
+    show_labels: BoolProperty(name="Show name tags", default=True)
+    show_laser: BoolProperty(name="Show laser pointers", default=True)
     host_name: StringProperty()
     sync_transforms: BoolProperty(name="Sync object transforms", default=True)
     users: CollectionProperty(type=BMPUser)
@@ -198,6 +229,7 @@ class BMPState(PropertyGroup):
     show_chat: BoolProperty(default=True)
     lease_info: StringProperty()
     lease_requester: StringProperty()
+    role: StringProperty(default="editor")
 
 
 def state(context) -> BMPState:
@@ -214,21 +246,26 @@ def _push_message(context, author: str, text: str) -> None:
         messages.remove(0)
 
 
-def _upsert_user(context, name: str, color, host: bool = False) -> None:
+def _upsert_user(context, name: str, color, host: bool = False, role: str | None = None) -> None:
     users = context.window_manager.bmp.users
     for user in users:
         if user.name == name:
             user.color = color
             user.host = host
+            if role:
+                user.role = role
             return
     user = users.add()
     user.name = name
     user.color = color
     user.host = host
+    user.role = role or "editor"
 
 
 def _remove_user(context, name: str) -> None:
     runtime["view_smoothers"].pop(name, None)
+    runtime["remote_selections"].pop(name, None)
+    runtime["lasers"].pop(name, None)
     users = context.window_manager.bmp.users
     for index, user in enumerate(users):
         if user.name == name:
@@ -285,6 +322,7 @@ def start_host(
             settings.code = code
             settings.is_host = True
             settings.state = "hosting"
+            settings.role = "owner"
             settings.last_error = ""
             bridge = WorkerBridge("host", relay_url, room_id(code), relay_token)
             relay = ("127.0.0.1", bridge.start())
@@ -309,6 +347,7 @@ def start_host(
     settings.code = code
     settings.is_host = True
     settings.state = "hosting"
+    settings.role = "owner"
     settings.last_error = ""
     runtime["bootstrapping"] = False
     runtime["bootstraps"] = {}
@@ -353,6 +392,7 @@ def start_join(context, code: str, relay_url: str | None = None) -> None:
     settings.code = code.strip().upper()
     settings.is_host = False
     settings.state = "joining"
+    settings.role = "editor"
     settings.last_error = ""
     runtime["bootstrapping"] = True
     runtime["bootstrap_deadline"] = time.monotonic() + 20.0
@@ -430,6 +470,10 @@ def stop_session(context, publish: bool = True) -> None:
     runtime["mesh_smoothers"].clear()
     runtime["view_smoothers"].clear()
     runtime["remote_debug"] = {}
+    runtime["remote_selections"].clear()
+    runtime["remote_points"] = []
+    runtime["selection_digest"].clear()
+    runtime["last_edit_sel"] = 0.0
     runtime["selection"].clear()
     runtime["hidden_objects"].clear()
     runtime["deselected"].clear()
@@ -527,17 +571,33 @@ def _handle_event(context, kind: str, body: dict) -> None:
     elif kind == "peer_leave":
         _remove_user(context, body.get("name", "?"))
         _push_message(context, "system", f"{body.get('name', 'someone')} left")
+    elif kind == "role":
+        name = str(body.get("name", ""))[:48]
+        role = _role_name(body.get("role"))
+        for user in settings.users:
+            if user.name == name:
+                user.role = role
+                break
+        if name == settings.name:
+            settings.role = role
+        if name:
+            _push_message(context, "system", f"{name} is now {role}")
     elif kind == "kicked":
         settings.last_error = str(body.get("message", "Kicked by host"))[:180]
         _push_message(context, "system", settings.last_error)
     elif kind == "presence":
-        _upsert_user(context, body.get("name", "?"), body.get("color", (1, 1, 1, 1)))
+        role = _role_name(body.get("role")) if "role" in body else None
+        _upsert_user(context, body.get("name", "?"), body.get("color", (1, 1, 1, 1)), role=role)
         for user in settings.users:
             if user.name == body.get("name"):
                 user.scene = body.get("scene", "")
                 user.frame = int(body.get("frame", 0))
                 user.mode = body.get("mode", "")
                 user.active = str(body.get("active", ""))[:64]
+                if role:
+                    user.role = role
+                    if body.get("name") == settings.name:
+                        settings.role = role
                 view = body.get("view")
                 if isinstance(view, list) and len(view) == 16:
                     try:
@@ -558,6 +618,19 @@ def _handle_event(context, kind: str, body: dict) -> None:
                 distance = body.get("dist")
                 if isinstance(distance, (int, float)) and not isinstance(distance, bool):
                     user.view_distance = max(0.05, min(100000.0, float(distance)))
+                cursor = body.get("cursor")
+                if isinstance(cursor, list) and len(cursor) == 3:
+                    try:
+                        values = [float(value) for value in cursor]
+                    except (TypeError, ValueError):
+                        values = []
+                    if len(values) == 3:
+                        user.cursor = values
+                        user.has_cursor = True
+                    else:
+                        user.has_cursor = False
+                else:
+                    user.has_cursor = False
                 user.selected = str(body.get("selected", ""))[:512]
                 if body.get("name") == settings.name:
                     user.ping_ms = settings.rtt_ms
@@ -637,6 +710,42 @@ def _handle_event(context, kind: str, body: dict) -> None:
                 if session is not None:
                     for item in mine:
                         _lease_request(session, item, "acquire")
+    elif kind == "laser":
+        name = str(body.get("name", ""))[:48]
+        points = body.get("points")
+        if name and isinstance(points, list):
+            clean = []
+            for item in points[:64]:
+                if isinstance(item, (list, tuple)) and len(item) == 3:
+                    try:
+                        clean.append([float(item[0]), float(item[1]), float(item[2])])
+                    except (TypeError, ValueError):
+                        continue
+            if clean:
+                runtime["lasers"][name] = {"points": clean, "stamp": time.monotonic()}
+    elif kind == "selection":
+        name = str(body.get("name", ""))[:48]
+        uid = body.get("uuid")
+        count = body.get("count")
+        mask = body.get("mask")
+        if name and isinstance(uid, str) and isinstance(count, int) and isinstance(mask, (bytes, bytearray)):
+            entry = runtime["remote_selections"].setdefault(name, {})
+            if count == 0:
+                entry.pop(uid, None)
+            else:
+                indices = []
+                for index in range(min(count, 200_000)):
+                    if mask[index >> 3] & (1 << (index & 7)):
+                        indices.append(index)
+                        if len(indices) >= 3000:
+                            break
+                entry[uid] = {
+                    "mask": bytes(mask),
+                    "count": count,
+                    "kind": int(body.get("kind", 0)),
+                    "rev": int(body.get("rev", 0)),
+                    "indices": indices,
+                }
     elif kind == "image_asset":
         _apply_image(context, body)
     elif kind == "modifier_stack":
@@ -1291,6 +1400,14 @@ def _poll_control(context) -> None:
                 settings.last_error = "Only the host can kick players"
             elif target:
                 session.kick(target)
+        elif action == "role":
+            target = request.get("target")
+            role = request.get("role")
+            session = runtime.get("session")
+            if session is None or not settings.is_host:
+                settings.last_error = "Only the host can change roles"
+            elif target and role:
+                session.set_role(target, ROLE_VALUES[role])
         elif action == "leave":
             settings.last_error = ""
             stop_session(context)
@@ -1528,6 +1645,9 @@ def _clear_scene(context, body: dict | None = None) -> None:
     runtime["transform_smoothers"].clear()
     runtime["mesh_smoothers"].clear()
     runtime["view_smoothers"].clear()
+    runtime["remote_selections"].clear()
+    runtime["remote_points"] = []
+    runtime["selection_digest"].clear()
     runtime["last_selection"] = 0.0
     runtime["lease_renew"] = 0.0
 
@@ -2238,6 +2358,35 @@ def _build_remote_batches(lines: list) -> list:
     return batches
 
 
+def _build_remote_point_batches(points: list) -> list:
+    try:
+        import gpu
+        from gpu_extras.batch import batch_for_shader
+    except ImportError:  # pragma: no cover - background Blender
+        return []
+    shader = runtime.get("remote_shader")
+    if shader is None:
+        try:
+            shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        except Exception:  # noqa: BLE001
+            try:
+                shader = gpu.shader.from_builtin("3D_UNIFORM_COLOR")
+            except Exception:  # noqa: BLE001
+                return []
+        runtime["remote_shader"] = shader
+    batches = []
+    for color, coords in points:
+        if not coords:
+            continue
+        flat = [(point.x, point.y, point.z) for point in coords]
+        try:
+            batch = batch_for_shader(shader, "POINTS", {"pos": flat})
+        except Exception:  # noqa: BLE001
+            continue
+        batches.append((color, batch))
+    return batches
+
+
 def _smooth_view(name: str, values, now: float):
     """Interpolate a remote camera between 20 Hz presence updates."""
     from mathutils import Matrix
@@ -2291,6 +2440,8 @@ def _sync_remote_visuals(context) -> None:
     if session is None:
         runtime["remote_batches"] = []
         runtime["remote_labels"] = []
+        runtime["remote_points"] = []
+        runtime["remote_point_batches"] = []
         runtime["view_smoothers"].clear()
         runtime["remote_debug"] = {}
         return
@@ -2299,7 +2450,9 @@ def _sync_remote_visuals(context) -> None:
 
     lines = []
     labels = []
+    points = []
     total = 0
+    point_total = 0
     max_segment = 0.0
     seen_users = set()
     for user in settings.users:
@@ -2307,7 +2460,7 @@ def _sync_remote_visuals(context) -> None:
             continue
         seen_users.add(user.name)
         color = effective_color(user.name, user.color)
-        if user.has_view:
+        if settings.show_cameras and user.has_view:
             matrix = _smooth_view(user.name, list(user.view), now)
             if matrix is not None:
                 segments = _camera_segments(matrix, user.view_aspect, user.view_distance)
@@ -2320,6 +2473,35 @@ def _sync_remote_visuals(context) -> None:
                 labels.append(
                     (origin + Vector((0.0, 0.0, widget * 0.5)), user.name, color)
                 )
+        if settings.show_cameras and user.has_cursor:
+            try:
+                cursor = Vector((float(user.cursor[0]), float(user.cursor[1]), float(user.cursor[2])))
+            except (TypeError, ValueError, IndexError):
+                cursor = None
+            if cursor is not None:
+                size = max(0.05, min(0.6, float(user.view_distance or 7.0) * 0.01))
+                lines.append(
+                    (
+                        color,
+                        [
+                            (cursor - Vector((size, 0.0, 0.0)), cursor + Vector((size, 0.0, 0.0))),
+                            (cursor - Vector((0.0, size, 0.0)), cursor + Vector((0.0, size, 0.0))),
+                            (cursor - Vector((0.0, 0.0, size)), cursor + Vector((0.0, 0.0, size))),
+                        ],
+                    )
+                )
+                total += 3
+        if settings.show_laser:
+            laser = runtime["lasers"].get(user.name)
+            if laser and now - float(laser.get("stamp", 0.0)) < 1.5:
+                points = [Vector(tuple(point)) for point in laser.get("points", [])]
+                segments = [
+                    (points[index], points[index + 1])
+                    for index in range(len(points) - 1)
+                ]
+                if segments:
+                    lines.append((color, segments))
+                    total += len(segments)
         uids = [uid for uid in str(user.selected or "").split(",") if uid]
         for uid in uids[:6]:
             obj = obj_sync.find(uid)
@@ -2335,16 +2517,40 @@ def _sync_remote_visuals(context) -> None:
                 max_segment = max(max_segment, float((second - first).length))
             if total > 30000:
                 break
-        if total > 30000:
+        if settings.show_selections:
+            selections = runtime["remote_selections"].get(user.name) or {}
+            for uid, entry in list(selections.items())[:4]:
+                obj = obj_sync.find(uid)
+                if obj is None or obj.type != "MESH":
+                    continue
+                count = int(entry.get("count") or 0)
+                indices = entry.get("indices") or []
+                if count != len(obj.data.vertices) or not indices:
+                    continue
+                matrix = obj.matrix_world
+                selected = [
+                    matrix @ obj.data.vertices[index].co
+                    for index in indices
+                    if 0 <= index < len(obj.data.vertices)
+                ]
+                if selected:
+                    points.append((color, selected))
+                    point_total += len(selected)
+                if point_total > 20000:
+                    break
+        if total > 30000 or point_total > 20000:
             break
     for name in list(runtime["view_smoothers"]):
         if name not in seen_users:
             runtime["view_smoothers"].pop(name, None)
     runtime["remote_labels"] = labels[:24]
     runtime["remote_batches"] = _build_remote_batches(lines)
+    runtime["remote_points"] = points
+    runtime["remote_point_batches"] = _build_remote_point_batches(points)
     runtime["remote_debug"] = {
         "max_segment": round(max_segment, 3),
         "segments": total,
+        "points": point_total,
         "labels": len(labels),
         "users": sorted(seen_users),
     }
@@ -2355,7 +2561,8 @@ def _draw_remote_lines() -> None:
         import gpu
         shader = runtime.get("remote_shader")
         batches = runtime.get("remote_batches") or []
-        if shader is None or not batches:
+        point_batches = runtime.get("remote_point_batches") or []
+        if shader is None or (not batches and not point_batches):
             return
         gpu.state.blend_set("ALPHA")
         gpu.state.depth_test_set("NONE")
@@ -2370,6 +2577,18 @@ def _draw_remote_lines() -> None:
             gpu.state.line_width_set(1.0)
         except Exception:  # noqa: BLE001
             pass
+        if point_batches:
+            try:
+                gpu.state.point_size_set(4.0)
+            except Exception:  # noqa: BLE001
+                pass
+            for color, batch in point_batches:
+                shader.uniform_float("color", color)
+                batch.draw(shader)
+            try:
+                gpu.state.point_size_set(1.0)
+            except Exception:  # noqa: BLE001
+                pass
         gpu.state.depth_test_set("LESS_EQUAL")
         gpu.state.blend_set("NONE")
     except Exception:  # noqa: BLE001
@@ -2383,6 +2602,11 @@ def _draw_remote_labels() -> None:
     except ImportError:
         return
     context = bpy.context
+    try:
+        if not context.window_manager.bmp.show_labels:
+            return
+    except Exception:  # noqa: BLE001
+        pass
     region = getattr(context, "region", None)
     region_data = getattr(context, "region_data", None)
     if region is None or region_data is None:
@@ -2465,6 +2689,8 @@ def _unregister_remote_draw() -> None:
         except Exception:  # noqa: BLE001
             pass
     runtime["remote_batches"] = []
+    runtime["remote_point_batches"] = []
+    runtime["remote_points"] = []
     runtime["remote_labels"] = []
 
 
@@ -2482,6 +2708,7 @@ def _send_presence(context) -> None:
         "mode": context.mode,
         "active": context.active_object.name if context.active_object is not None else "",
         "selected": ",".join(_selected_uids(context)),
+        "cursor": [float(value) for value in context.scene.cursor.location],
     }
     view = _viewport_view(context)
     if view:
@@ -2526,6 +2753,7 @@ def _write_status(context, force: bool = False) -> None:
             "ping_ms": user.ping_ms,
             "host": user.host,
             "active": user.active,
+            "role": "owner" if (is_host and user.name == name) else user.role,
         }
         for user in settings.users
     ]
@@ -2539,6 +2767,7 @@ def _write_status(context, force: bool = False) -> None:
             "code": code,
             "is_host": is_host,
             "name": name,
+            "role": "owner" if is_host else settings.role,
             "fingerprint": settings.fingerprint,
             "verify_code": settings.verify_code,
             "last_error": settings.last_error,
@@ -2666,6 +2895,78 @@ def bmp_smooth_tick():
     return 1.0 / 60.0
 
 
+def _sync_edit_selection(context) -> None:
+    """Send the active Edit Mode vertex selection at up to ~8 Hz."""
+    session: SessionService | None = runtime.get("session")
+    if session is None:
+        return
+    now = time.monotonic()
+    if now - runtime["last_edit_sel"] < 0.12:
+        return
+    runtime["last_edit_sel"] = now
+    active = context.active_object
+    editing = active is not None and active.type == "MESH" and context.mode == "EDIT_MESH"
+    if not editing:
+        uid = runtime.get("last_selection_uid")
+        count = runtime.get("last_selection_count") or 0
+        if uid and count:
+            session.send_selection(uid, bytes((count + 7) // 8), count)
+            runtime["last_selection_uid"] = ""
+            runtime["last_selection_count"] = 0
+            runtime["selection_digest"].pop(uid, None)
+        return
+    uid = active.get("bmp_uuid")
+    count = len(active.data.vertices)
+    if not uid or count <= 0 or count > 200_000:
+        return
+    try:
+        import bmesh
+
+        bm = bmesh.from_edit_mesh(active.data)
+        bm.verts.ensure_lookup_table()
+    except Exception:  # noqa: BLE001
+        return
+    mask = bytearray((count + 7) // 8)
+    for vert in bm.verts:
+        if vert.select:
+            index = vert.index
+            if 0 <= index < count:
+                mask[index >> 3] |= 1 << (index & 7)
+    digest = hashlib.blake2b(bytes(mask), digest_size=8).digest()
+    if runtime["selection_digest"].get(uid) == digest:
+        return
+    runtime["selection_digest"][uid] = digest
+    runtime["last_selection_uid"] = uid
+    runtime["last_selection_count"] = count
+    session.send_selection(uid, bytes(mask), count)
+
+
+def _apply_follow(context) -> None:
+    settings = context.window_manager.bmp
+    name = settings.follow_user
+    if not name or context.screen is None:
+        return
+    user = next((item for item in settings.users if item.name == name), None)
+    if user is None or not user.has_view:
+        settings.follow_user = ""
+        return
+    matrix = _smooth_view(name, list(user.view), time.monotonic())
+    if matrix is None:
+        return
+    area = next((item for item in context.screen.areas if item.type == "VIEW_3D"), None)
+    if area is None or area.spaces.active is None:
+        return
+    region = area.spaces.active.region_3d
+    if region is None:
+        return
+    try:
+        region.view_matrix = matrix.inverted()
+        region.view_perspective = "PERSP"
+        region.view_distance = max(0.1, float(user.view_distance))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def bmp_tick():
     context = bpy.context
     if context is None or context.window_manager is None:
@@ -2685,11 +2986,13 @@ def bmp_tick():
             _sync_selection(context)
             _sync_transforms(context)
             _sync_mesh(context)
+            _sync_edit_selection(context)
             _sync_materials(context)
             _sync_modifiers(context)
             _send_presence(context)
         _pump_scene_bootstrap(context)
         _sync_remote_visuals(context)
+        _apply_follow(context)
         if (
             runtime.get("bootstrapping")
             and runtime.get("bootstrap_deadline")
@@ -2956,6 +3259,78 @@ class BMP_OT_deny_edit(Operator):
         return {"FINISHED"}
 
 
+class BMP_OT_follow_user(Operator):
+    bl_idname = "bmp.follow_user"
+    bl_label = "Follow User"
+    bl_description = "Follow a user's viewport, or stop following them"
+
+    name: StringProperty()
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        target = self.name.strip()
+        if not target:
+            return {"CANCELLED"}
+        settings.follow_user = "" if settings.follow_user == target else target
+        return {"FINISHED"}
+
+
+class BMP_OT_laser(Operator):
+    bl_idname = "bmp.laser"
+    bl_label = "Laser Pointer"
+    bl_description = "Drag in the viewport to draw a temporary laser for others"
+
+    _points: list = []
+    _last: float = 0.0
+
+    def invoke(self, context, event):
+        session: SessionService | None = runtime.get("session")
+        if session is None:
+            self.report({"ERROR"}, "Not connected")
+            return {"CANCELLED"}
+        self._points = []
+        self._last = 0.0
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def _send(self) -> None:
+        session: SessionService | None = runtime.get("session")
+        if session is not None and self._points:
+            session.send_laser(self._points)
+        self._last = time.monotonic()
+
+    def modal(self, context, event):
+        if event.type in {"ESC", "RIGHTMOUSE"}:
+            return {"CANCELLED"}
+        if event.type == "LEFTMOUSE" and event.value == "RELEASE":
+            self._send()
+            return {"FINISHED"}
+        if event.type == "MOUSEMOVE":
+            region = getattr(context, "region", None)
+            region_data = getattr(context, "region_data", None)
+            if region is not None and region_data is not None and region.type == "WINDOW":
+                try:
+                    from bpy_extras.view3d_utils import (
+                        region_2d_to_origin_3d,
+                        region_2d_to_vector_3d,
+                    )
+
+                    position = (event.mouse_region_x, event.mouse_region_y)
+                    origin = region_2d_to_origin_3d(region, region_data, position)
+                    direction = region_2d_to_vector_3d(region, region_data, position)
+                    distance = max(1.0, float(region_data.view_distance or 7.0) * 0.5)
+                    point = origin + direction * distance
+                    self._points.append((float(point.x), float(point.y), float(point.z)))
+                    if len(self._points) > 64:
+                        self._points.pop(0)
+                    now = time.monotonic()
+                    if now - self._last > 0.05:
+                        self._send()
+                except Exception:  # noqa: BLE001
+                    pass
+        return {"RUNNING_MODAL"}
+
+
 class BMP_OT_ping(Operator):
     bl_idname = "bmp.ping"
     bl_label = "Ping"
@@ -3023,6 +3398,8 @@ classes = (
     BMP_OT_untrack_mesh,
     BMP_OT_ping,
     BMP_OT_ping_mark,
+    BMP_OT_laser,
+    BMP_OT_follow_user,
     BMP_OT_share_images,
     BMP_OT_request_edit,
     BMP_OT_grant_edit,
@@ -3040,6 +3417,14 @@ def register() -> None:
         bpy.utils.register_class(cls)
     bpy.types.WindowManager.bmp = bpy.props.PointerProperty(type=BMPState)
     ui.register()
+    try:
+        keyconfig = bpy.context.window_manager.keyconfigs.addon
+        if keyconfig is not None and not addon_keymaps:
+            keymap = keyconfig.keymaps.new(name="3D View", space_type="VIEW_3D")
+            item = keymap.keymap_items.new("bmp.laser", "L", "PRESS", alt=True)
+            addon_keymaps.append((keymap, item))
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
     runtime["started"] = time.monotonic()
     bpy.app.timers.register(bmp_tick, first_interval=0.5, persistent=True)
     if not bpy.app.timers.is_registered(bmp_smooth_tick):
@@ -3074,6 +3459,12 @@ def unregister() -> None:
     except Exception:  # noqa: BLE001
         traceback.print_exc()
     ui.unregister()
+    for keymap, item in addon_keymaps:
+        try:
+            keymap.keymap_items.remove(item)
+        except Exception:  # noqa: BLE001
+            pass
+    addon_keymaps.clear()
     del bpy.types.WindowManager.bmp
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

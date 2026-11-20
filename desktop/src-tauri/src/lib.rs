@@ -51,6 +51,7 @@ enum Action {
     Leave,
     Chat,
     Kick,
+    Role,
 }
 
 #[derive(Deserialize)]
@@ -68,6 +69,7 @@ struct SessionRequest {
     relay_url: Option<String>,
     relay_token: Option<String>,
     use_relay: Option<bool>,
+    role: Option<String>,
 }
 
 fn data_dir() -> PathBuf {
@@ -655,7 +657,7 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
     }
 
     let code = match request.action {
-        Action::Leave | Action::Chat | Action::Kick => None,
+        Action::Leave | Action::Chat | Action::Kick | Action::Role => None,
         Action::Join => Some(normalize_code(request.code.as_deref().ok_or("a room code is required to join")?)?),
         Action::Host => match request.code.as_deref() {
             Some(value) => Some(normalize_code(value)?),
@@ -675,13 +677,24 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
     };
 
     let target = match request.action {
-        Action::Kick => Some(
+        Action::Kick | Action::Role => Some(
             request
                 .target
                 .as_deref()
-                .ok_or("a player name is required to kick")?
+                .ok_or("a player name is required")?
                 .to_string(),
         ),
+        _ => None,
+    };
+
+    let role = match request.action {
+        Action::Role => {
+            let value = request.role.as_deref().ok_or("a role is required")?;
+            if !matches!(value, "viewer" | "commenter" | "editor" | "admin") {
+                return Err("invalid role".into());
+            }
+            Some(value.to_string())
+        }
         _ => None,
     };
 
@@ -702,6 +715,7 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
         "relay_url": request.relay_url,
         "relay_token": request.relay_token,
         "use_relay": request.use_relay,
+        "role": role,
         "nonce": format!("{:x}-{:x}", std::process::id(), stamp),
     });
 

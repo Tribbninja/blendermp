@@ -41,7 +41,7 @@ if __package__:
     from .core.roomcode import FLAG_RELAY, decode_room, room_id
     from .core.version import ADDON_VERSION, compatible
     from .net.relay import RelayClientAgent, RelayHostAgent
-    from .sync.leases import LeaseManager
+    from .sync.leases import LeaseManager, Role, can_edit
 else:  # pragma: no cover - allows importing the module standalone (tests)
     import control
     from core import image_payload
@@ -51,7 +51,7 @@ else:  # pragma: no cover - allows importing the module standalone (tests)
     from core.roomcode import FLAG_RELAY, decode_room, room_id
     from core.version import ADDON_VERSION, compatible
     from net.relay import RelayClientAgent, RelayHostAgent
-    from sync.leases import LeaseManager
+    from sync.leases import LeaseManager, Role, can_edit
 
 MAX_CONTROL = 64 * 1024
 MAX_MESH = 24 * 1024 * 1024
@@ -63,6 +63,16 @@ PING_INTERVAL = 2.0
 PEER_TIMEOUT = 12.0
 DISCONNECT_STRIKES = 6
 CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+MUTATING_TYPES = {
+    MessageType.TRANSFORM,
+    MessageType.MESH_DELTA,
+    MessageType.MESH_SNAPSHOT,
+    MessageType.OBJECT_CREATE,
+    MessageType.OBJECT_DELETE,
+    MessageType.MATERIAL_UPDATE,
+    MessageType.MODIFIER_STACK,
+    MessageType.IMAGE_ASSET,
+}
 
 
 class Violation(Exception):
@@ -159,6 +169,7 @@ class Peer:
     addon: str = ""
     protocol: int = 0
     caps: int = 0
+    role: int = int(Role.EDITOR)
     authenticated: bool = False
     last_seen: float = field(default_factory=time.monotonic)
     strikes: int = 0
@@ -215,6 +226,7 @@ class SessionService:
         self.version = clean_text(version or ADDON_VERSION, 32) or ADDON_VERSION
         self.remote_app = ""
         self.remote_caps = 0
+        self.role = int(Role.OWNER if host else Role.EDITOR)
         self.port = int(port or 0)
         self.expected_fingerprint = fingerprint
         self.pin = pin[:64]
@@ -483,6 +495,18 @@ class SessionService:
         if not peer.authenticated:
             raise Violation("frame before authentication")
 
+        if frame.type in MUTATING_TYPES and not can_edit(peer.role):
+            peer.enqueue(
+                protocol.encode(
+                    protocol.json_frame(
+                        MessageType.ERROR,
+                        {"message": "your role does not allow edits", "code": "role_denied"},
+                    )
+                ),
+                critical=True,
+            )
+            return
+
         if frame.type == MessageType.PING:
             if len(frame.payload) > 64:
                 raise Violation("ping payload too large")
@@ -502,7 +526,16 @@ class SessionService:
                 "mode": clean_text(body.get("mode"), 32),
                 "active": clean_text(body.get("active"), 64),
                 "selected": clean_text(body.get("selected"), 512),
+                "role": int(peer.role),
             }
+            cursor = body.get("cursor")
+            if isinstance(cursor, list) and len(cursor) == 3:
+                try:
+                    values = [float(value) for value in cursor]
+                except (TypeError, ValueError):
+                    values = []
+                if len(values) == 3 and all(math.isfinite(value) and abs(value) < 1e7 for value in values):
+                    presence["cursor"] = values
             view = body.get("view")
             if isinstance(view, list) and len(view) == 16:
                 try:
@@ -553,6 +586,74 @@ class SessionService:
 
         if frame.type == MessageType.LEASE:
             self._handle_lease(peer, frame, now)
+            return
+
+        if frame.type == MessageType.LASER:
+            payload = frame.payload
+            if len(payload) < 11:
+                raise Violation("laser frame is truncated")
+            name_len = payload[0]
+            if name_len == 0 or name_len > MAX_NAME:
+                raise Violation("invalid laser name")
+            offset = 1 + name_len
+            if len(payload) < offset + 2:
+                raise Violation("laser frame is truncated")
+            (count,) = struct.unpack_from("<H", payload, offset)
+            if count == 0 or count > 64 or len(payload) != offset + 2 + count * 12:
+                raise Violation("invalid laser point count")
+            points = []
+            for index in range(count):
+                values = list(struct.unpack_from("<3f", payload, offset + 2 + index * 12))
+                if not all(math.isfinite(value) and abs(value) < 1e7 for value in values):
+                    raise Violation("laser point is not finite")
+                points.append(values)
+            name = peer.name.encode("utf-8")[:MAX_NAME]
+            forwarded = bytes([len(name)]) + name + payload[offset:]
+            self._broadcast(
+                Frame(type=MessageType.LASER, channel=Channel.PRESENCE, payload=forwarded),
+                exclude=peer.peer_id,
+                critical=False,
+            )
+            self._emit("laser", {"name": peer.name, "points": points})
+            return
+
+        if frame.type == MessageType.SELECTION:
+            payload = frame.payload
+            if len(payload) < 27:
+                raise Violation("selection frame is truncated")
+            name_len = payload[0]
+            if name_len == 0 or name_len > MAX_NAME:
+                raise Violation("invalid selection name")
+            offset = 1 + name_len
+            if len(payload) < offset + 26:
+                raise Violation("selection frame is truncated")
+            uid = str(uuidlib.UUID(bytes=payload[offset : offset + 16]))
+            kind = payload[offset + 16]
+            rev, count = struct.unpack_from("<II", payload, offset + 18)
+            if kind > 2 or count > 200_000:
+                raise Violation("invalid selection")
+            expected = (count + 7) // 8
+            mask = payload[offset + 26 :]
+            if len(mask) != expected:
+                raise Violation("selection mask length mismatch")
+            name = peer.name.encode("utf-8")[:MAX_NAME]
+            forwarded = bytes([len(name)]) + name + payload[offset:]
+            self._broadcast(
+                Frame(type=MessageType.SELECTION, channel=Channel.PRESENCE, payload=forwarded),
+                exclude=peer.peer_id,
+                critical=False,
+            )
+            self._emit(
+                "selection",
+                {
+                    "name": peer.name,
+                    "uuid": uid,
+                    "kind": kind,
+                    "rev": rev,
+                    "count": count,
+                    "mask": mask,
+                },
+            )
             return
 
         if frame.type == MessageType.PING_MARK:
@@ -710,7 +811,7 @@ class SessionService:
         self._peers[peer.peer_id] = peer
 
         peers = [
-            {"name": other.name, "color": list(other.color)}
+            {"name": other.name, "color": list(other.color), "role": int(other.role)}
             for other in self._peers.values()
             if other.authenticated and other.peer_id != peer.peer_id
         ]
@@ -719,6 +820,7 @@ class SessionService:
             "name": self.name,
             "you": peer.name,
             "color": list(self.color),
+            "role": int(peer.role),
             "peers": peers,
             "fingerprint": self.fingerprint,
             "code": self.code,
@@ -732,7 +834,7 @@ class SessionService:
         self._broadcast(
             protocol.json_frame(
                 MessageType.PRESENCE,
-                {"name": peer.name, "color": list(peer.color), "joined": True, "scene": "", "frame": 0, "mode": ""},
+                {"name": peer.name, "color": list(peer.color), "joined": True, "role": int(peer.role), "scene": "", "frame": 0, "mode": ""},
             ),
             exclude=peer.peer_id,
         )
@@ -742,6 +844,17 @@ class SessionService:
         body = self._json(frame, 4096)
         key = body.get("key")
         action = body.get("action")
+        if action in {"acquire", "grant", "deny"} and not can_edit(peer.role):
+            peer.enqueue(
+                protocol.encode(
+                    protocol.json_frame(
+                        MessageType.ERROR,
+                        {"message": "your role does not allow editing", "code": "role_denied"},
+                    )
+                ),
+                critical=True,
+            )
+            return
         if not isinstance(key, str):
             raise Violation("lease without an object key")
         try:
@@ -942,6 +1055,47 @@ class SessionService:
             except Violation:
                 asyncio.create_task(self._drop_peer(peer))
 
+    def set_role(self, name: str, role: int) -> None:
+        """Ask the host loop to set a peer's role."""
+        loop = self._loop
+        if self.is_host and loop and loop.is_running():
+            loop.call_soon_threadsafe(lambda: asyncio.create_task(self._set_role(name, int(role))))
+
+    async def _set_role(self, name: str, role: int) -> None:
+        allowed = {
+            int(Role.VIEWER),
+            int(Role.COMMENTER),
+            int(Role.EDITOR),
+            int(Role.ADMIN),
+        }
+        if role not in allowed:
+            return
+        target = next(
+            (peer for peer in self._peers.values() if peer.authenticated and peer.name == name),
+            None,
+        )
+        if target is None:
+            return
+        target.role = role
+        if not can_edit(role):
+            now = time.monotonic()
+            released = False
+            for key in self._leases.held_by(name, now):
+                if self._leases.release(key, name):
+                    self._expiry_notified.discard(key)
+                    released = True
+            if released:
+                self._broadcast(
+                    protocol.json_frame(
+                        MessageType.LEASE,
+                        {"action": "release", "leases": self._leases.snapshot(now)},
+                    )
+                )
+        self._broadcast(
+            protocol.json_frame(MessageType.ROLE, {"name": name, "role": role})
+        )
+        self._emit("role", {"name": name, "role": role})
+
     def kick(self, name: str) -> None:
         """Ask the host loop to disconnect a peer by its assigned name."""
         loop = self._loop
@@ -1104,6 +1258,10 @@ class SessionService:
         caps_value = body.get("caps")
         if isinstance(caps_value, int) and not isinstance(caps_value, bool):
             self.remote_caps = max(0, caps_value)
+        role_value = body.get("role")
+        if isinstance(role_value, int) and not isinstance(role_value, bool) and 0 <= role_value <= 4:
+            self.role = role_value
+            self._emit("role", {"name": self.name, "role": role_value})
         self._peer_id = str(body.get("peer_id", ""))[:32]
         self._set_state("connected")
         self._emit("welcome", body)
@@ -1155,6 +1313,17 @@ class SessionService:
                 "active": clean_text(body.get("active"), 64),
                 "selected": clean_text(body.get("selected"), 512),
             }
+            role_value = body.get("role")
+            if isinstance(role_value, int) and not isinstance(role_value, bool) and 0 <= role_value <= 4:
+                presence["role"] = role_value
+            cursor = body.get("cursor")
+            if isinstance(cursor, list) and len(cursor) == 3:
+                try:
+                    values = [float(value) for value in cursor]
+                except (TypeError, ValueError):
+                    values = []
+                if len(values) == 3 and all(math.isfinite(value) and abs(value) < 1e7 for value in values):
+                    presence["cursor"] = values
             view = body.get("view")
             if isinstance(view, list) and len(view) == 16:
                 try:
@@ -1202,6 +1371,79 @@ class SessionService:
             uid, rev, payload = decode_mesh(frame.payload)
             kind = "mesh_delta" if frame.type == MessageType.MESH_DELTA else "mesh_snapshot"
             self._emit(kind, {"uuid": uid, "rev": rev, "payload": payload})
+            return
+
+        if frame.type == MessageType.ROLE:
+            body = self._json(frame, 1024)
+            role = body.get("role")
+            if isinstance(role, int) and not isinstance(role, bool) and 0 <= role <= 4:
+                self._emit(
+                    "role",
+                    {
+                        "name": clean_text(body.get("name"), MAX_NAME),
+                        "role": role,
+                    },
+                )
+            return
+
+        if frame.type == MessageType.LASER:
+            payload = frame.payload
+            if len(payload) < 11:
+                return
+            name_len = payload[0]
+            if name_len == 0 or name_len > MAX_NAME:
+                return
+            offset = 1 + name_len
+            if len(payload) < offset + 2:
+                return
+            (count,) = struct.unpack_from("<H", payload, offset)
+            if count == 0 or count > 64 or len(payload) != offset + 2 + count * 12:
+                return
+            points = []
+            for index in range(count):
+                values = list(struct.unpack_from("<3f", payload, offset + 2 + index * 12))
+                if not all(math.isfinite(value) and abs(value) < 1e7 for value in values):
+                    return
+                points.append(values)
+            self._emit(
+                "laser",
+                {
+                    "name": clean_text(payload[1:offset].decode("utf-8", "ignore"), MAX_NAME),
+                    "points": points,
+                },
+            )
+            return
+
+        if frame.type == MessageType.SELECTION:
+            payload = frame.payload
+            if len(payload) < 27:
+                return
+            name_len = payload[0]
+            if name_len == 0 or name_len > MAX_NAME:
+                return
+            offset = 1 + name_len
+            if len(payload) < offset + 26:
+                return
+            try:
+                uid = str(uuidlib.UUID(bytes=payload[offset : offset + 16]))
+            except ValueError:
+                return
+            kind = payload[offset + 16]
+            rev, count = struct.unpack_from("<II", payload, offset + 18)
+            mask = payload[offset + 26 :]
+            if kind > 2 or count > 200_000 or len(mask) != (count + 7) // 8:
+                return
+            self._emit(
+                "selection",
+                {
+                    "name": clean_text(payload[1:offset].decode("utf-8", "ignore"), MAX_NAME),
+                    "uuid": uid,
+                    "kind": kind,
+                    "rev": rev,
+                    "count": count,
+                    "mask": mask,
+                },
+            )
             return
 
         if frame.type == MessageType.LEASE:
@@ -1366,12 +1608,64 @@ class SessionService:
         persp = clean_text(body.get("persp"), 16)
         if persp:
             payload["persp"] = persp
+        cursor = body.get("cursor")
+        if isinstance(cursor, list) and len(cursor) == 3:
+            try:
+                values = [float(value) for value in cursor]
+            except (TypeError, ValueError):
+                values = []
+            if len(values) == 3 and all(math.isfinite(value) and abs(value) < 1e7 for value in values):
+                payload["cursor"] = values
         distance = body.get("dist")
         if isinstance(distance, (int, float)) and not isinstance(distance, bool):
             payload["dist"] = max(0.01, min(100000.0, float(distance)))
         if self.is_host:
-            payload.update({"name": self.name, "color": list(self.color)})
+            payload.update(
+                {
+                    "name": self.name,
+                    "color": list(self.color),
+                    "role": int(self.role),
+                }
+            )
         self._enqueue(protocol.json_frame(MessageType.PRESENCE, payload))
+
+    def send_selection(self, uid: str, mask: bytes, count: int, kind: int = 0) -> None:
+        if not isinstance(mask, (bytes, bytearray)) or not 0 <= count <= 200_000:
+            return
+        if len(mask) != (count + 7) // 8 or kind not in (0, 1, 2):
+            return
+        name = self.name.encode("utf-8")[:MAX_NAME]
+        payload = (
+            bytes([len(name)])
+            + name
+            + uuidlib.UUID(str(uid)).bytes
+            + struct.pack("<BBII", kind, 0, 0, count)
+            + bytes(mask)
+        )
+        self._enqueue(Frame(type=MessageType.SELECTION, channel=Channel.PRESENCE, payload=payload))
+
+    def send_laser(self, points) -> None:
+        if not points:
+            return
+        clean = []
+        for point in list(points)[:64]:
+            try:
+                values = [float(point[0]), float(point[1]), float(point[2])]
+            except (TypeError, ValueError, IndexError):
+                continue
+            if all(math.isfinite(value) and abs(value) < 1e7 for value in values):
+                clean.append(values)
+        if not clean:
+            return
+        name = self.name.encode("utf-8")[:MAX_NAME]
+        flat = [value for point in clean for value in point]
+        payload = (
+            bytes([len(name)])
+            + name
+            + struct.pack("<H", len(clean))
+            + struct.pack("<%df" % len(flat), *flat)
+        )
+        self._enqueue(Frame(type=MessageType.LASER, channel=Channel.PRESENCE, payload=payload))
 
     def send_chat(self, text: str) -> None:
         text = clean_text(text, MAX_CHAT)
@@ -1537,13 +1831,14 @@ class SessionService:
                     "addon": peer.addon,
                     "protocol": peer.protocol,
                     "caps": peer.caps,
+                    "role": int(peer.role),
                 }
                 for peer in self._peers.values()
                 if peer.authenticated
             ]
             bytes_out += sum(peer.sent for peer in self._peers.values())
         else:
-            peers = [{"name": "host", "address": self.code, "app": self.remote_app, "caps": self.remote_caps}]
+            peers = [{"name": "host", "address": self.code, "app": self.remote_app, "caps": self.remote_caps, "role": int(Role.OWNER)}]
         return {
             "state": self.state,
             "rtt_ms": round(self._rtt_ms, 1),
