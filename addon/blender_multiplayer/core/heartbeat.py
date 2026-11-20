@@ -16,6 +16,9 @@ from pathlib import Path
 APP_DIR = "Blendermp"
 STALE_SECONDS = 7 * 24 * 60 * 60
 MAX_ENTRIES = 32
+# Only a crash during an active session can lose unsynced work. A forced kill
+# while offline (for example the installer closing Blender) is not a crash.
+ACTIVE_STATES = {"hosting", "connected", "joining", "reconnecting"}
 
 
 def data_dir() -> Path:
@@ -120,6 +123,14 @@ def unclean_exits() -> list[dict]:
         except OSError:
             pass
         if process_alive(pid):
+            continue
+        if str(body.get("state", "")) not in ACTIVE_STATES:
+            # An offline/starting process has no unsynced session work; Blender's
+            # own autosave covers that case. Drop the marker silently.
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
             continue
         result.append(body)
         try:
