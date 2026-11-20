@@ -53,7 +53,7 @@ bl_info = {
     "category": "Network",
 }
 
-ADDON_VERSION = "0.1.4"
+ADDON_VERSION = "0.1.5"
 TICK = 1.0 / 30.0
 CONTROL_POLL = 0.5
 STATUS_WRITE = 0.5
@@ -63,6 +63,8 @@ SELECTION_POLL = 0.2
 LEASE_RENEW = 30.0
 PRESENCE_POLL = 0.2
 REMOTE_POLL = 0.2
+TRANSFORM_SMOOTH = 0.035
+MESH_SMOOTH = 0.045
 DEFAULT_COLOR = (0.35, 0.8, 0.95, 1.0)
 USER_PALETTE = (
     (0.35, 0.8, 0.95, 1.0),
@@ -108,6 +110,8 @@ runtime: dict = {
     "last_remote": 0.0,
     "draw_lines": None,
     "draw_labels": None,
+    "transform_smoothers": {},
+    "mesh_smoothers": {},
     "lease_renew": 0.0,
     "bootstrapping": False,
     "bootstrap_deadline": 0.0,
@@ -411,6 +415,8 @@ def stop_session(context, publish: bool = True) -> None:
     runtime["lease_owners"].clear()
     runtime["owned_leases"].clear()
     runtime["local_transform"].clear()
+    runtime["transform_smoothers"].clear()
+    runtime["mesh_smoothers"].clear()
     runtime["selection"].clear()
     runtime["hidden_objects"].clear()
     runtime["deselected"].clear()
@@ -598,12 +604,22 @@ def _handle_event(context, kind: str, body: dict) -> None:
         settings.rtt_ms = int(body.get("ms", 0))
     elif kind == "transform":
         uid = body.get("uuid")
-        values = body.get("matrix", [])
-        if not _should_ignore_remote_transform(context, uid):
-            if obj_sync.apply(uid, values):
-                # Remember the applied matrix so the next local sync does not
-                # treat the remote move as a local change and echo it back.
-                runtime["object_shadow"][uid] = tuple(round(float(v), 6) for v in values)
+        values = obj_sync.normalize(body.get("matrix", []))
+        if values is None or _should_ignore_remote_transform(context, uid):
+            return
+        obj = obj_sync.find(uid)
+        if obj is None:
+            return
+        current = tuple(round(float(value), 6) for row in obj.matrix_world for value in row)
+        runtime["transform_smoothers"][uid] = {
+            "obj": obj,
+            "start": current,
+            "target": tuple(values),
+            "t0": time.monotonic(),
+            "duration": TRANSFORM_SMOOTH,
+        }
+        # Remember the final target so the next local sync does not echo it.
+        runtime["object_shadow"][uid] = tuple(round(float(value), 6) for value in values)
     elif kind == "mesh_delta":
         _apply_mesh_delta(context, body)
     elif kind == "mesh_snapshot":
@@ -646,11 +662,45 @@ def _apply_mesh_delta(context, body: dict) -> None:
         return
     if context.active_object == obj and context.mode == "SCULPT":
         return  # sculpt data is not a BMesh; leave the local sculpt alone
-    mirror = runtime["mirrors"].setdefault(uid, MeshMirror())
     try:
-        mirror.apply_delta(obj.data, bytes(payload))
+        rev, indices, values = chunker.decode_delta(bytes(payload))
     except Exception:  # noqa: BLE001
         traceback.print_exc()
+        return
+    if indices.size == 0:
+        return
+    mirror = runtime["mirrors"].get(uid)
+    if mirror is None or not mirror.matches(obj.data):
+        return
+    if indices.size > 2000:
+        try:
+            mirror.apply_delta(obj.data, bytes(payload))
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        runtime["mesh_smoothers"].pop(uid, None)
+        return
+    try:
+        chunker.apply_positions(mirror.shadow, indices, values)
+        mirror.hashes = chunker.chunk_hashes(mirror.shadow)
+        mirror.rev = rev
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return
+    smoother = runtime["mesh_smoothers"].get(uid)
+    if smoother is None or smoother.get("obj") is not obj:
+        smoother = {"obj": obj, "entries": {}, "duration": MESH_SMOOTH}
+        runtime["mesh_smoothers"][uid] = smoother
+    mesh = obj.data
+    now = time.monotonic()
+    for index, value in zip(indices, values):
+        vertex_index = int(index)
+        if 0 <= vertex_index < len(mesh.vertices):
+            current = mesh.vertices[vertex_index].co
+            smoother["entries"][vertex_index] = (
+                (float(current.x), float(current.y), float(current.z)),
+                (float(value[0]), float(value[1]), float(value[2])),
+                now,
+            )
 
 
 def _apply_edit_delta(context, obj, uid: str, payload: bytes) -> None:
@@ -689,6 +739,7 @@ def _apply_mesh_snapshot(context, body: dict) -> None:
         return
     if context.active_object == obj and context.mode in {"EDIT_MESH", "SCULPT"}:
         return  # never rebuild the mesh the user is editing
+    runtime["mesh_smoothers"].pop(uid, None)
     mirror = runtime["mirrors"].setdefault(uid, MeshMirror())
     try:
         mirror.apply_snapshot(obj.data, bytes(payload))
@@ -1416,6 +1467,8 @@ def _clear_scene(context, body: dict | None = None) -> None:
     runtime["hidden_objects"].clear()
     runtime["deselected"].clear()
     runtime["owned_leases"].clear()
+    runtime["transform_smoothers"].clear()
+    runtime["mesh_smoothers"].clear()
     runtime["last_selection"] = 0.0
     runtime["lease_renew"] = 0.0
 
@@ -1642,6 +1695,8 @@ def _apply_object_delete(context, body: dict) -> None:
     runtime["edit_mirrors"].pop(uid, None)
     runtime["object_shadow"].pop(uid, None)
     runtime["lease_owners"].pop(uid, None)
+    runtime["transform_smoothers"].pop(uid, None)
+    runtime["mesh_smoothers"].pop(uid, None)
     if obj is not None:
         runtime["tracked"].discard(obj.name)
     if obj is None:
@@ -1776,6 +1831,8 @@ def _sync_transforms(context) -> None:
         owner = runtime["lease_owners"].get(uid)
         if owner is not None and owner != settings.name:
             continue
+        if uid in runtime["transform_smoothers"]:
+            continue
         matrix = obj.matrix_world
         current = tuple(round(v, 6) for row in matrix for v in row)
         previous = shadow.get(uid)
@@ -1784,6 +1841,7 @@ def _sync_transforms(context) -> None:
             continue
         if current != previous:
             shadow[uid] = current
+            runtime["transform_smoothers"].pop(uid, None)
             runtime["local_transform"][uid] = time.monotonic()
             session.send_transform(uid, current)
     for stale in list(shadow.keys() - seen):
@@ -1810,6 +1868,7 @@ def _sync_edit_mesh(context, session: SessionService, obj) -> None:
     uid = obj.get("bmp_uuid") or str(uuid.uuid4())
     obj["bmp_uuid"] = uid
     runtime["tracked"].add(obj.name)
+    _flush_mesh_smoother(uid)
     owner = runtime["lease_owners"].get(uid)
     if owner is not None and owner != settings.name:
         if runtime.get("edit_lease_uid") != uid:
@@ -1884,12 +1943,14 @@ def _sync_mesh(context) -> None:
     if obj is None or obj.type != "MESH":
         runtime["tracked"].discard(names[cursor])
         return
-    owner = runtime["lease_owners"].get(obj.get("bmp_uuid"))
+    uid = obj.get("bmp_uuid") or str(uuid.uuid4())
+    obj["bmp_uuid"] = uid
+    if uid in runtime["mesh_smoothers"]:
+        return
+    owner = runtime["lease_owners"].get(uid)
     if owner is not None and owner != settings.name:
         return
 
-    uid = obj.get("bmp_uuid") or str(uuid.uuid4())
-    obj["bmp_uuid"] = uid
     mirror = runtime["mirrors"].get(uid)
     if mirror is None or not mirror.matches(obj.data):
         mirror = MeshMirror()
@@ -2275,6 +2336,116 @@ def _write_status(context, force: bool = False) -> None:
     )
 
 
+def _object_alive(obj) -> bool:
+    try:
+        return obj is not None and obj.name in bpy.data.objects
+    except ReferenceError:
+        return False
+
+
+def _smooth_transforms(context) -> None:
+    from mathutils import Matrix
+
+    now = time.monotonic()
+    for uid, item in list(runtime["transform_smoothers"].items()):
+        obj = item.get("obj")
+        if not _object_alive(obj):
+            runtime["transform_smoothers"].pop(uid, None)
+            continue
+        duration = float(item.get("duration") or TRANSFORM_SMOOTH)
+        t = min(1.0, max(0.0, (now - item["t0"]) / max(0.001, duration)))
+        start = item["start"]
+        target = item["target"]
+        values = [start[index] + (target[index] - start[index]) * t for index in range(16)]
+        try:
+            obj.matrix_world = Matrix(
+                (values[0:4], values[4:8], values[8:12], values[12:16])
+            )
+            for child in obj.children_recursive:
+                child_uid = child.get("bmp_uuid")
+                if child_uid:
+                    runtime["object_shadow"][child_uid] = tuple(
+                        round(float(value), 6) for row in child.matrix_world for value in row
+                    )
+        except Exception:  # noqa: BLE001
+            runtime["transform_smoothers"].pop(uid, None)
+            continue
+        if t >= 1.0:
+            runtime["transform_smoothers"].pop(uid, None)
+
+
+def _flush_mesh_smoother(uid: str) -> None:
+    item = runtime["mesh_smoothers"].pop(uid, None)
+    if not item:
+        return
+    obj = item.get("obj")
+    if not _object_alive(obj):
+        return
+    mesh = obj.data
+    for index, (_start, target, _t0) in item.get("entries", {}).items():
+        if 0 <= index < len(mesh.vertices):
+            try:
+                mesh.vertices[index].co = target
+            except Exception:  # noqa: BLE001
+                pass
+    try:
+        mesh.update()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _smooth_meshes(context) -> None:
+    now = time.monotonic()
+    for uid, item in list(runtime["mesh_smoothers"].items()):
+        obj = item.get("obj")
+        if not _object_alive(obj) or obj.type != "MESH":
+            runtime["mesh_smoothers"].pop(uid, None)
+            continue
+        if obj.mode != "OBJECT":
+            _flush_mesh_smoother(uid)
+            continue
+        mesh = obj.data
+        entries = item.get("entries") or {}
+        duration = float(item.get("duration") or MESH_SMOOTH)
+        changed = False
+        for index, (start, target, t0) in list(entries.items()):
+            t = min(1.0, max(0.0, (now - t0) / max(0.001, duration)))
+            if index < 0 or index >= len(mesh.vertices):
+                del entries[index]
+                continue
+            try:
+                mesh.vertices[index].co = (
+                    start[0] + (target[0] - start[0]) * t,
+                    start[1] + (target[1] - start[1]) * t,
+                    start[2] + (target[2] - start[2]) * t,
+                )
+            except Exception:  # noqa: BLE001
+                del entries[index]
+                continue
+            changed = True
+            if t >= 1.0:
+                del entries[index]
+        if changed:
+            try:
+                mesh.update()
+            except Exception:  # noqa: BLE001
+                pass
+        if not entries:
+            runtime["mesh_smoothers"].pop(uid, None)
+
+
+def bmp_smooth_tick():
+    context = bpy.context
+    if context is None:
+        return 1.0 / 60.0
+    try:
+        _smooth_transforms(context)
+        _smooth_meshes(context)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+    return 1.0 / 60.0
+
+
 def bmp_tick():
     context = bpy.context
     if context is None or context.window_manager is None:
@@ -2627,6 +2798,8 @@ def register() -> None:
     ui.register()
     runtime["started"] = time.monotonic()
     bpy.app.timers.register(bmp_tick, first_interval=0.5, persistent=True)
+    if not bpy.app.timers.is_registered(bmp_smooth_tick):
+        bpy.app.timers.register(bmp_smooth_tick, first_interval=1.0 / 60.0, persistent=True)
     _register_remote_draw()
     bpy.app.handlers.frame_change_post.append(on_frame_change)
 
@@ -2638,6 +2811,10 @@ def unregister() -> None:
     _unregister_remote_draw()
     try:
         bpy.app.timers.unregister(bmp_tick)
+    except ValueError:
+        pass
+    try:
+        bpy.app.timers.unregister(bmp_smooth_tick)
     except ValueError:
         pass
     session = runtime.get("session")

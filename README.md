@@ -55,6 +55,10 @@ surface that cross-process re-parenting causes on some GPUs).
   respecting the source collection name when it exists; deleting sends a UUID
   tombstone. Transforms stream at 30 Hz and multiple tracked meshes round-robin
   at 12 Hz.
+* **Smooth remote motion**: received transforms and vertex deltas are linearly
+  eased to their exact target over ~35-45 ms at 60 Hz on the receiving side.
+  Network state stays exact; only the local display interpolates, so remote
+  drags slide instead of stepping and the sender keeps zero added latency.
 * **Basic material sync**: Principled BSDF base colour, metallic, roughness and
   emission, plus the viewport colour, for the active object. Node graphs and
   textures are not replicated yet.

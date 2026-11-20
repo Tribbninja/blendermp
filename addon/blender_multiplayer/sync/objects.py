@@ -12,6 +12,18 @@ import math
 MAX_MAGNITUDE = 1e12
 
 
+def normalize(values) -> list[float] | None:
+    if not isinstance(values, (list, tuple)) or len(values) != 16:
+        return None
+    try:
+        numbers = [float(v) for v in values]
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) and abs(v) <= MAX_MAGNITUDE for v in numbers):
+        return None
+    return numbers
+
+
 def find(uid: str):
     import bpy
 
@@ -22,13 +34,8 @@ def find(uid: str):
 
 
 def apply(uid: str, values) -> bool:
-    if not isinstance(values, (list, tuple)) or len(values) != 16:
-        return False
-    try:
-        numbers = [float(v) for v in values]
-    except (TypeError, ValueError):
-        return False
-    if not all(math.isfinite(v) and abs(v) <= MAX_MAGNITUDE for v in numbers):
+    numbers = normalize(values)
+    if numbers is None:
         return False
 
     import bpy

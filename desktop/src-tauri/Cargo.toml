@@ -1,6 +1,6 @@
 [package]
 name = "blendermp"
-version = "0.1.4"
+version = "0.1.5"
 description = "Blendermp desktop shell"
 authors = ["Blendermp"]
 edition = "2021"
