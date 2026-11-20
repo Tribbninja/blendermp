@@ -12,6 +12,8 @@ result and exits non-zero on mismatch.
 | `run_resume.ps1` | forced socket drop, resume without scene reset, restored leases and offline transform replay |
 | `run_checkpoint.ps1` | checkpoint save, live restore, peer scene reset and restored transform |
 | `run_undo.ps1` | scoped undo of a local transform, verified on both sides |
+| `run_animation.ps1` | armature bones, vertex weights, armature modifier, shape keys, action curves and live pose |
+| `run_sculpt.ps1` | Sculpt Mode vertex deltas streamed to the client |
 
 Requirements:
 

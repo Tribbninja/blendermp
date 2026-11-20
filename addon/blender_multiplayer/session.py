@@ -72,6 +72,9 @@ DISCONNECT_STRIKES = 6
 CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 MUTATING_TYPES = {
     MessageType.TRANSFORM,
+    MessageType.POSE,
+    MessageType.ACTION,
+    MessageType.SHAPE_KEYS,
     MessageType.MESH_DELTA,
     MessageType.MESH_SNAPSHOT,
     MessageType.OBJECT_CREATE,
@@ -84,6 +87,7 @@ BULK_TYPES = {
     MessageType.OBJECT_CREATE,
     MessageType.MESH_SNAPSHOT,
     MessageType.IMAGE_ASSET,
+    MessageType.ACTION,
     MessageType.BULK,
 }
 
@@ -647,6 +651,8 @@ class SessionService:
                 "color": list(peer.color),
                 "scene": clean_text(body.get("scene"), 64),
                 "frame": int(body.get("frame", 0)) if isinstance(body.get("frame"), (int, float)) else 0,
+                "playing": bool(body.get("playing", False)),
+                "fps": max(1, min(240, int(body.get("fps", 24)))) if isinstance(body.get("fps"), (int, float)) else 24,
                 "mode": clean_text(body.get("mode"), 32),
                 "active": clean_text(body.get("active"), 64),
                 "selected": clean_text(body.get("selected"), 512),
@@ -702,6 +708,81 @@ class SessionService:
             self.bump_rev(uid)
             self._broadcast(frame, exclude=peer.peer_id, critical=False)
             self._emit("transform", {"uuid": uid, "matrix": values})
+            return
+
+        if frame.type == MessageType.POSE:
+            body = self._json(frame, 512 * 1024)
+            try:
+                uid = str(uuidlib.UUID(str(body.get("uuid"))))
+            except ValueError as exc:
+                raise Violation("invalid armature id") from exc
+            bones = body.get("bones")
+            if not isinstance(bones, list) or len(bones) > 256:
+                raise Violation("invalid pose payload")
+            clean = []
+            for item in bones:
+                if not isinstance(item, dict):
+                    raise Violation("invalid pose bone")
+                name = clean_text(item.get("name"), 64)
+                loc = item.get("l")
+                quat = item.get("q")
+                scale = item.get("s")
+                if not name or not isinstance(loc, list) or not isinstance(quat, list) or not isinstance(scale, list):
+                    raise Violation("invalid pose bone")
+                if len(loc) != 3 or len(quat) != 4 or len(scale) != 3:
+                    raise Violation("invalid pose bone")
+                values = [float(v) for v in (*loc, *quat, *scale)]
+                if not all(math.isfinite(v) and abs(v) < 1e6 for v in values):
+                    raise Violation("pose value is invalid")
+                clean.append({"name": name, "l": values[:3], "q": values[3:7], "s": values[7:10]})
+            if not self._may_edit(peer, uid, now):
+                return
+            self.bump_rev(uid)
+            message = {"uuid": uid, "bones": clean}
+            self._broadcast(protocol.json_frame(MessageType.POSE, message), exclude=peer.peer_id, critical=False)
+            self._emit("pose", message)
+            return
+
+        if frame.type == MessageType.SHAPE_KEYS:
+            body = self._json(frame, 128 * 1024)
+            try:
+                uid = str(uuidlib.UUID(str(body.get("uuid"))))
+            except ValueError as exc:
+                raise Violation("invalid shape-key object id") from exc
+            values = body.get("values")
+            if not isinstance(values, dict) or len(values) > 128:
+                raise Violation("invalid shape-key values")
+            clean = {}
+            for key, value in values.items():
+                if not isinstance(key, str) or not isinstance(value, (int, float)) or isinstance(value, bool):
+                    raise Violation("invalid shape-key value")
+                number = float(value)
+                if not math.isfinite(number) or not -1000.0 <= number <= 1000.0:
+                    raise Violation("shape-key value is out of range")
+                clean[key[:64]] = number
+            if not self._may_edit(peer, uid, now):
+                return
+            self.bump_rev(uid)
+            message = {"uuid": uid, "values": clean}
+            self._broadcast(protocol.json_frame(MessageType.SHAPE_KEYS, message), exclude=peer.peer_id)
+            self._emit("shape_keys", message)
+            return
+
+        if frame.type == MessageType.ACTION:
+            body = self._json(frame, 1024 * 1024)
+            try:
+                uid = str(uuidlib.UUID(str(body.get("uuid"))))
+            except ValueError as exc:
+                raise Violation("invalid action object id") from exc
+            action = body.get("action")
+            if action is not None and not isinstance(action, dict):
+                raise Violation("invalid action payload")
+            if not self._may_edit(peer, uid, now):
+                return
+            self.bump_rev(uid)
+            message = {"uuid": uid, "action": action}
+            self._broadcast(protocol.json_frame(MessageType.ACTION, message), exclude=peer.peer_id)
+            self._emit("action", message)
             return
 
         if frame.type in (MessageType.MESH_DELTA, MessageType.MESH_SNAPSHOT):
@@ -1250,6 +1331,35 @@ class SessionService:
                     }
                 )
             details["collections"] = items
+        constraints = value.get("constraints")
+        if constraints is not None:
+            if not isinstance(constraints, list) or len(constraints) > 32:
+                return None
+            items = []
+            for item in constraints:
+                if not isinstance(item, dict):
+                    return None
+                type_ = clean_text(item.get("type"), 32)
+                name = clean_text(item.get("name"), 64)
+                if not type_ or not name:
+                    return None
+                entry = {
+                    "type": type_,
+                    "name": name,
+                    "influence": max(0.0, min(1.0, float(item.get("influence", 1.0)))),
+                    "mute": bool(item.get("mute", False)),
+                }
+                target = item.get("target")
+                if target is not None:
+                    try:
+                        entry["target"] = str(uuidlib.UUID(str(target)))
+                    except ValueError:
+                        return None
+                subtarget = clean_text(item.get("subtarget"), 64)
+                if subtarget:
+                    entry["subtarget"] = subtarget
+                items.append(entry)
+            details["constraints"] = items
         return details
 
     def _sanitize_modifiers(self, body: dict) -> dict[str, Any] | None:
@@ -1646,6 +1756,8 @@ class SessionService:
                 "color": clean_color(body.get("color")),
                 "scene": clean_text(body.get("scene"), 64),
                 "frame": int(body.get("frame", 0)) if isinstance(body.get("frame"), (int, float)) else 0,
+                "playing": bool(body.get("playing", False)),
+                "fps": max(1, min(240, int(body.get("fps", 24)))) if isinstance(body.get("fps"), (int, float)) else 24,
                 "mode": clean_text(body.get("mode"), 32),
                 "active": clean_text(body.get("active"), 64),
                 "selected": clean_text(body.get("selected"), 512),
@@ -1705,6 +1817,21 @@ class SessionService:
         if frame.type == MessageType.TRANSFORM:
             uid, values = decode_transform(frame.payload)
             self._emit("transform", {"uuid": uid, "matrix": values})
+            return
+
+        if frame.type == MessageType.POSE:
+            body = self._json(frame, 512 * 1024)
+            self._emit("pose", body)
+            return
+
+        if frame.type == MessageType.SHAPE_KEYS:
+            body = self._json(frame, 128 * 1024)
+            self._emit("shape_keys", body)
+            return
+
+        if frame.type == MessageType.ACTION:
+            body = self._json(frame, 1024 * 1024)
+            self._emit("action", body)
             return
 
         if frame.type in (MessageType.MESH_DELTA, MessageType.MESH_SNAPSHOT):
@@ -1986,6 +2113,8 @@ class SessionService:
         payload = {
             "scene": clean_text(body.get("scene"), 64),
             "frame": int(body.get("frame", 0)) if isinstance(body.get("frame"), (int, float)) else 0,
+            "playing": bool(body.get("playing", False)),
+            "fps": max(1, min(240, int(body.get("fps", 24)))) if isinstance(body.get("fps"), (int, float)) else 24,
             "mode": clean_text(body.get("mode"), 32),
             "active": clean_text(body.get("active"), 64),
             "selected": clean_text(body.get("selected"), 512),
@@ -2076,6 +2205,29 @@ class SessionService:
         except Exception:  # noqa: BLE001
             return
         self._enqueue(Frame(type=MessageType.TRANSFORM, channel=Channel.TRANSFORM, payload=payload))
+
+    def send_pose(self, uid: str, bones: list) -> None:
+        try:
+            body = protocol.json_frame(MessageType.POSE, {"uuid": uid, "bones": bones})
+        except Exception:  # noqa: BLE001
+            return
+        self._enqueue(Frame(type=MessageType.POSE, channel=Channel.TRANSFORM, payload=body.payload))
+
+    def send_shape_keys(self, uid: str, values: dict) -> None:
+        try:
+            frame = protocol.json_frame(MessageType.SHAPE_KEYS, {"uuid": uid, "values": values})
+        except Exception:  # noqa: BLE001
+            return
+        self._enqueue(frame)
+
+    def send_action(self, uid: str, action: dict | None) -> None:
+        try:
+            frame = protocol.json_frame(MessageType.ACTION, {"uuid": uid, "action": action})
+        except Exception:  # noqa: BLE001
+            return
+        if len(frame.payload) > 1024 * 1024:
+            return
+        self._enqueue(Frame(type=MessageType.ACTION, channel=Channel.BULK, payload=frame.payload))
 
     def send_mesh(self, obj, kind: str, payload: bytes, rev: int = 0) -> None:
         uid = obj.get("bmp_uuid")

@@ -32,6 +32,9 @@ import time
 import traceback
 import uuid
 import zipfile
+import zlib
+
+import numpy as np
 from pathlib import Path
 
 import bpy
@@ -58,7 +61,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 3, 0),
+    "version": (0, 4, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -181,6 +184,14 @@ runtime: dict = {
     "last_journal_capture": 0.0,
     "undo": undo_log.UndoLog(),
     "last_checkpoint": 0.0,
+    "pose_shadow": {},
+    "shape_shadow": {},
+    "action_shadow": {},
+    "last_pose": 0.0,
+    "last_shape": 0.0,
+    "last_action": 0.0,
+    "last_sculpt": 0.0,
+    "sculpt_warned": set(),
     "last_mesh": 0.0,
     "last_edit": 0.0,
     "mesh_cursor": 0,
@@ -230,6 +241,8 @@ class BMPUser(PropertyGroup):
     role: StringProperty(default="editor")
     cursor: FloatVectorProperty(size=3)
     has_cursor: BoolProperty()
+    playing: BoolProperty()
+    fps: IntProperty(default=24)
 
 
 class BMPMessage(PropertyGroup):
@@ -708,6 +721,8 @@ def _handle_event(context, kind: str, body: dict) -> None:
             if user.name == body.get("name"):
                 user.scene = body.get("scene", "")
                 user.frame = int(body.get("frame", 0))
+                user.playing = bool(body.get("playing", False))
+                user.fps = int(body.get("fps", 24) or 24)
                 user.mode = body.get("mode", "")
                 user.active = str(body.get("active", ""))[:64]
                 if role:
@@ -873,6 +888,12 @@ def _handle_event(context, kind: str, body: dict) -> None:
         _apply_modifier_stack(context, body)
     elif kind == "material_update":
         _apply_material(context, body)
+    elif kind == "pose":
+        _apply_pose(context, body)
+    elif kind == "shape_keys":
+        _apply_shape_keys(context, body)
+    elif kind == "action":
+        _apply_action(context, body)
     elif kind == "object_create":
         _apply_object_create(context, body)
     elif kind == "object_delete":
@@ -1435,6 +1456,300 @@ def _apply_material_graph(material, data: dict) -> bool:
     return True
 
 
+def _action_fcurves(action) -> list:
+    try:
+        if hasattr(action, "fcurves"):
+            return list(action.fcurves)
+    except (AttributeError, RuntimeError):
+        pass
+    curves = []
+    try:
+        for layer in action.layers:
+            for strip in layer.strips:
+                if getattr(strip, "type", "") != "KEYFRAME":
+                    continue
+                for channelbag in strip.channelbags:
+                    curves.extend(list(channelbag.fcurves))
+    except (AttributeError, RuntimeError):
+        pass
+    return curves
+
+
+def _action_channelbag(action, obj):
+    """Return a channelbag for Blender 5's layered actions, or None."""
+    if not hasattr(action, "slots") or not hasattr(action, "layers"):
+        return None
+    try:
+        slot = action.slots[0] if len(action.slots) else action.slots.new(id_type="OBJECT", name=obj.name[:64])
+        layer = action.layers[0] if len(action.layers) else action.layers.new("Layer")
+        strip = next((item for item in layer.strips if getattr(item, "type", "") == "KEYFRAME"), None)
+        if strip is None:
+            strip = layer.strips.new(type="KEYFRAME")
+        return strip.channelbag(slot, ensure=True)
+    except (AttributeError, TypeError, RuntimeError):
+        return None
+
+
+def _clear_action_curves(action, obj) -> None:
+    channelbag = _action_channelbag(action, obj)
+    if channelbag is not None:
+        for curve in list(channelbag.fcurves):
+            channelbag.fcurves.remove(curve)
+        return
+    try:
+        for curve in list(action.fcurves):
+            action.fcurves.remove(curve)
+    except (AttributeError, RuntimeError):
+        pass
+
+
+def _action_snapshot(obj) -> dict | None:
+    animation = getattr(obj, "animation_data", None)
+    action = getattr(animation, "action", None) if animation is not None else None
+    if action is None:
+        return None
+    curves = []
+    try:
+        for curve in _action_fcurves(action)[:128]:
+            points = []
+            for point in list(curve.keyframe_points)[:512]:
+                points.append(
+                    [
+                        float(point.co[0]),
+                        float(point.co[1]),
+                        float(point.handle_left[0]),
+                        float(point.handle_left[1]),
+                        float(point.handle_right[0]),
+                        float(point.handle_right[1]),
+                        str(point.interpolation)[:16],
+                    ]
+                )
+            curves.append(
+                {
+                    "path": curve.data_path[:256],
+                    "index": int(curve.array_index),
+                    "extrapolation": str(curve.extrapolation)[:16],
+                    "points": points,
+                }
+            )
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        return None
+    return {
+        "name": action.name[:64],
+        "range": [float(value) for value in action.frame_range],
+        "curves": curves,
+    }
+
+
+def _sync_pose(context) -> None:
+    session: SessionService | None = runtime.get("session")
+    settings = context.window_manager.bmp
+    if session is None or settings.paused or runtime.get("bootstrapping"):
+        return
+    if not settings.is_host and session.state != "connected":
+        return
+    now = time.monotonic()
+    if now - runtime.get("last_pose", 0.0) < 1.0 / 30.0:
+        return
+    runtime["last_pose"] = now
+    for obj in context.scene.objects:
+        if obj.type != "ARMATURE" or not (uid := obj.get("bmp_uuid")):
+            continue
+        owner = runtime["lease_owners"].get(uid)
+        if owner is not None and owner != settings.name:
+            continue
+        shadow = runtime["pose_shadow"].setdefault(uid, {})
+        changes = []
+        for bone in list(obj.pose.bones)[:256]:
+            state = (
+                tuple(round(float(value), 5) for value in bone.location),
+                tuple(round(float(value), 5) for value in bone.rotation_quaternion),
+                tuple(round(float(value), 5) for value in bone.scale),
+                str(bone.rotation_mode)[:16],
+            )
+            if shadow.get(bone.name) == state:
+                continue
+            shadow[bone.name] = state
+            changes.append(
+                {
+                    "name": bone.name[:64],
+                    "l": list(state[0]),
+                    "q": list(state[1]),
+                    "s": list(state[2]),
+                    "m": state[3],
+                }
+            )
+        if changes:
+            _note_rev(uid)
+            session.send_pose(uid, changes)
+
+
+def _apply_pose(context, body: dict) -> None:
+    obj = obj_sync.find(body.get("uuid"))
+    bones = body.get("bones")
+    if obj is None or obj.type != "ARMATURE" or not isinstance(bones, list):
+        return
+    uid = obj.get("bmp_uuid")
+    shadow = runtime["pose_shadow"].setdefault(uid, {}) if uid else {}
+    for item in bones[:256]:
+        if not isinstance(item, dict):
+            continue
+        bone = obj.pose.bones.get(str(item.get("name", "")))
+        if bone is None:
+            continue
+        try:
+            mode = str(item.get("m", "QUATERNION"))[:16]
+            bone.rotation_mode = mode
+            bone.location = [float(value) for value in item.get("l", ())][:3]
+            quaternion = [float(value) for value in item.get("q", ())][:4]
+            if mode == "QUATERNION":
+                bone.rotation_quaternion = quaternion
+            else:
+                from mathutils import Quaternion
+
+                bone.rotation_euler = Quaternion(quaternion).to_euler(mode)
+            bone.scale = [float(value) for value in item.get("s", ())][:3]
+            shadow[bone.name] = (
+                tuple(round(float(value), 5) for value in bone.location),
+                tuple(round(float(value), 5) for value in bone.rotation_quaternion),
+                tuple(round(float(value), 5) for value in bone.scale),
+                mode,
+            )
+        except (TypeError, ValueError, RuntimeError):
+            pass
+
+
+def _sync_shape_keys(context) -> None:
+    session: SessionService | None = runtime.get("session")
+    settings = context.window_manager.bmp
+    if session is None or settings.paused or runtime.get("bootstrapping"):
+        return
+    if not settings.is_host and session.state != "connected":
+        return
+    now = time.monotonic()
+    if now - runtime.get("last_shape", 0.0) < 1.0 / 30.0:
+        return
+    runtime["last_shape"] = now
+    for obj in context.scene.objects:
+        if obj.type != "MESH" or not (uid := obj.get("bmp_uuid")):
+            continue
+        mesh = obj.data
+        if mesh.shape_keys is None:
+            continue
+        owner = runtime["lease_owners"].get(uid)
+        if owner is not None and owner != settings.name:
+            continue
+        shadow = runtime["shape_shadow"].setdefault(uid, {})
+        changes = {}
+        for key in list(mesh.shape_keys.key_blocks)[:128]:
+            value = round(float(key.value), 4)
+            if shadow.get(key.name) == value:
+                continue
+            shadow[key.name] = value
+            changes[key.name[:64]] = value
+        if changes:
+            _note_rev(uid)
+            session.send_shape_keys(uid, changes)
+
+
+def _apply_shape_keys(context, body: dict) -> None:
+    obj = obj_sync.find(body.get("uuid"))
+    values = body.get("values")
+    if obj is None or obj.type != "MESH" or obj.data.shape_keys is None or not isinstance(values, dict):
+        return
+    uid = obj.get("bmp_uuid")
+    shadow = runtime["shape_shadow"].setdefault(uid, {}) if uid else {}
+    for name, value in list(values.items())[:128]:
+        key = obj.data.shape_keys.key_blocks.get(str(name))
+        if key is None or not isinstance(value, (int, float)):
+            continue
+        key.value = max(float(key.slider_min), min(float(key.slider_max), float(value)))
+        shadow[key.name] = round(float(key.value), 4)
+
+
+def _sync_actions(context) -> None:
+    session: SessionService | None = runtime.get("session")
+    settings = context.window_manager.bmp
+    if session is None or settings.paused or runtime.get("bootstrapping"):
+        return
+    if not settings.is_host and session.state != "connected":
+        return
+    now = time.monotonic()
+    if now - runtime.get("last_action", 0.0) < 0.5:
+        return
+    runtime["last_action"] = now
+    for obj in context.scene.objects:
+        if obj.type != "ARMATURE" or not (uid := obj.get("bmp_uuid")):
+            continue
+        owner = runtime["lease_owners"].get(uid)
+        if owner is not None and owner != settings.name:
+            continue
+        snapshot = _action_snapshot(obj)
+        signature = json.dumps(snapshot, sort_keys=True, default=str)
+        if runtime["action_shadow"].get(uid) == signature:
+            continue
+        runtime["action_shadow"][uid] = signature
+        _note_rev(uid)
+        session.send_action(uid, snapshot)
+
+
+def _apply_action(context, body: dict) -> None:
+    obj = obj_sync.find(body.get("uuid"))
+    snapshot = body.get("action")
+    if obj is None or obj.type != "ARMATURE":
+        return
+    uid = obj.get("bmp_uuid")
+    if snapshot is None:
+        animation = getattr(obj, "animation_data", None)
+        if animation is not None:
+            animation.action = None
+        if uid:
+            runtime["action_shadow"][uid] = "null"
+        return
+    if not isinstance(snapshot, dict):
+        return
+    name = str(snapshot.get("name", "Action"))[:64] or "Action"
+    action = bpy.data.actions.get(name)
+    if action is None:
+        action = bpy.data.actions.new(name)
+    try:
+        _clear_action_curves(action, obj)
+        channelbag = _action_channelbag(action, obj)
+        for curve_spec in (snapshot.get("curves") or [])[:128]:
+            if not isinstance(curve_spec, dict):
+                continue
+            if channelbag is not None:
+                curve = channelbag.fcurves.new(
+                    data_path=str(curve_spec.get("path", ""))[:256],
+                    index=int(curve_spec.get("index", 0)),
+                )
+            else:
+                curve = action.fcurves.new(
+                    data_path=str(curve_spec.get("path", ""))[:256],
+                    index=int(curve_spec.get("index", 0)),
+                )
+            curve.extrapolation = str(curve_spec.get("extrapolation", "CONSTANT"))[:16]
+            points = [item for item in (curve_spec.get("points") or [])[:512] if isinstance(item, list) and len(item) == 7]
+            if points:
+                curve.keyframe_points.add(len(points))
+                for target, item in zip(curve.keyframe_points, points):
+                    target.co = (float(item[0]), float(item[1]))
+                    target.handle_left = (float(item[2]), float(item[3]))
+                    target.handle_right = (float(item[4]), float(item[5]))
+                    target.interpolation = str(item[6])[:16]
+        animation = obj.animation_data_create()
+        animation.action = action
+        if hasattr(animation, "action_slot") and len(action.slots):
+            try:
+                animation.action_slot = action.slots[0]
+            except (AttributeError, TypeError, RuntimeError):
+                pass
+        if uid:
+            runtime["action_shadow"][uid] = json.dumps(snapshot, sort_keys=True, default=str)
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        traceback.print_exc()
+
+
 def _sync_materials(context) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
@@ -1560,6 +1875,10 @@ def modifier_snapshot(obj) -> list:
                 props["node_group"] = mod.node_group.name if mod.node_group else ""
             except AttributeError:
                 props["node_group"] = ""
+        if mod.type in {"ARMATURE", "LATTICE", "CURVE", "HOOK", "SURFACE_DEFORM", "MESH_DEFORM"}:
+            target = getattr(mod, "object", None)
+            if target is not None and target.get("bmp_uuid"):
+                props["object_uid"] = target.get("bmp_uuid")
         snapshot.append(
             {
                 "type": mod.type,
@@ -1604,6 +1923,23 @@ def object_details(obj) -> dict:
         )
     if collections:
         details["collections"] = collections
+    constraints = []
+    for constraint in list(getattr(obj, "constraints", []))[:32]:
+        item = {
+            "type": str(constraint.type)[:32],
+            "name": str(constraint.name)[:64],
+            "influence": float(getattr(constraint, "influence", 1.0)),
+            "mute": bool(getattr(constraint, "mute", False)),
+        }
+        target = getattr(constraint, "target", None)
+        if target is not None and target.get("bmp_uuid"):
+            item["target"] = target.get("bmp_uuid")
+        subtarget = getattr(constraint, "subtarget", "")
+        if subtarget:
+            item["subtarget"] = str(subtarget)[:64]
+        constraints.append(item)
+    if constraints:
+        details["constraints"] = constraints
     return details
 
 
@@ -1754,6 +2090,38 @@ def _apply_object_details(obj, details) -> None:
                         collection.objects.unlink(obj)
                     except (TypeError, RuntimeError):
                         pass
+    constraints = details.get("constraints")
+    if isinstance(constraints, list):
+        for item in constraints[:32]:
+            if not isinstance(item, dict):
+                continue
+            type_ = str(item.get("type", ""))[:32]
+            name = str(item.get("name", ""))[:64]
+            if not type_ or not name:
+                continue
+            constraint = obj.constraints.get(name)
+            if constraint is None or constraint.type != type_:
+                if constraint is not None:
+                    try:
+                        obj.constraints.remove(constraint)
+                    except (TypeError, RuntimeError):
+                        pass
+                try:
+                    constraint = obj.constraints.new(type_)
+                    constraint.name = name
+                except (TypeError, RuntimeError):
+                    continue
+            try:
+                constraint.influence = float(item.get("influence", 1.0))
+                constraint.mute = bool(item.get("mute", False))
+                target = obj_sync.find(str(item.get("target", "")))
+                if target is not None:
+                    constraint.target = target
+                subtarget = item.get("subtarget")
+                if isinstance(subtarget, str) and subtarget:
+                    constraint.subtarget = subtarget
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                pass
 
 
 def _apply_modifier_stack(context, body: dict) -> None:
@@ -1797,6 +2165,14 @@ def _apply_modifier_stack(context, body: dict) -> None:
                 if group is not None:
                     try:
                         mod.node_group = group
+                    except Exception:  # noqa: BLE001
+                        pass
+                continue
+            if key == "object_uid":
+                target = obj_sync.find(str(value))
+                if target is not None:
+                    try:
+                        mod.object = target
                     except Exception:  # noqa: BLE001
                         pass
                 continue
@@ -2108,6 +2484,8 @@ def _object_kind(obj) -> int:
         return object_payload.KIND_CAMERA
     if obj.type == "LIGHT":
         return object_payload.KIND_LIGHT
+    if obj.type == "ARMATURE":
+        return object_payload.KIND_ARMATURE
     return object_payload.KIND_EMPTY
 
 
@@ -2855,6 +3233,147 @@ def _finish_scene_bootstrap(context, body: dict | None = None) -> None:
     _push_message(context, "system", "Host scene loaded")
 
 
+MAX_RIG_BYTES = 8 * 1024 * 1024
+
+
+def _pack_floats(values) -> str:
+    return base64.b64encode(zlib.compress(np.asarray(values, dtype=np.float32).tobytes(), 6)).decode("ascii")
+
+
+def _unpack_floats(value: str, count: int):
+    try:
+        raw = zlib.decompress(base64.b64decode(str(value).encode("ascii")))
+    except (ValueError, TypeError, zlib.error):
+        return None
+    if len(raw) != count * 4:
+        return None
+    return np.frombuffer(raw, dtype=np.float32).copy()
+
+
+def _armature_bones(obj) -> list:
+    bones = []
+    try:
+        source = list(obj.data.bones)[:256]
+    except (AttributeError, ReferenceError):
+        return bones
+    for bone in source:
+        try:
+            try:
+                _axis, roll = bone.AxisRollFromMatrix(bone.matrix_local.to_3x3())
+                roll = float(roll)
+            except (AttributeError, TypeError, ValueError):
+                roll = 0.0
+            bones.append(
+                {
+                    "name": bone.name[:64],
+                    "parent": bone.parent.name[:64] if bone.parent else "",
+                    "head": [float(value) for value in bone.head_local],
+                    "tail": [float(value) for value in bone.tail_local],
+                    "roll": roll,
+                    "connected": bool(bone.use_connect),
+                    "deform": bool(bone.use_deform),
+                }
+            )
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return bones
+
+
+def _mesh_rig_payload(obj) -> tuple[list, list]:
+    mesh = obj.data
+    count = len(mesh.vertices)
+    if count == 0:
+        return [], []
+    arrays = []
+    try:
+        for group in list(obj.vertex_groups)[:64]:
+            arrays.append((group.name[:64], np.zeros(count, dtype=np.float32)))
+    except (AttributeError, ReferenceError):
+        return [], []
+    if arrays:
+        for vertex in mesh.vertices:
+            for item in vertex.groups:
+                if 0 <= item.group < len(arrays):
+                    arrays[item.group][1][vertex.index] = float(item.weight)
+    groups = []
+    used = 0
+    for name, values in arrays:
+        if not np.any(values):
+            continue
+        data = _pack_floats(values)
+        used += len(data)
+        if used > MAX_RIG_BYTES:
+            break
+        groups.append({"name": name, "count": count, "data": data})
+    shapes = []
+    try:
+        key_blocks = list(mesh.shape_keys.key_blocks) if mesh.shape_keys is not None else []
+    except (AttributeError, ReferenceError):
+        key_blocks = []
+    for key in key_blocks[1:32]:
+        values = np.empty(count * 3, dtype=np.float32)
+        try:
+            key.data.foreach_get("co", values)
+        except (AttributeError, RuntimeError):
+            continue
+        data = _pack_floats(values)
+        if used + len(data) > MAX_RIG_BYTES:
+            break
+        used += len(data)
+        shapes.append(
+            {
+                "name": key.name[:64],
+                "count": count,
+                "data": data,
+                "value": float(key.value),
+                "min": float(key.slider_min),
+                "max": float(key.slider_max),
+            }
+        )
+    return groups, shapes
+
+
+def _apply_mesh_rig(obj, meta: dict) -> None:
+    mesh = obj.data
+    count = len(mesh.vertices)
+    for item in meta.get("vertex_groups") or []:
+        if not isinstance(item, dict) or item.get("count") != count:
+            continue
+        values = _unpack_floats(item.get("data", ""), count)
+        if values is None:
+            continue
+        name = str(item.get("name", "Group"))[:64] or "Group"
+        group = obj.vertex_groups.get(name) or obj.vertex_groups.new(name=name)
+        buckets: dict[float, list[int]] = {}
+        for index in np.nonzero(values > 0.0)[0]:
+            weight = round(float(values[index]), 3)
+            buckets.setdefault(weight, []).append(int(index))
+        for weight, indices in buckets.items():
+            try:
+                group.add(indices, weight, "REPLACE")
+            except (TypeError, RuntimeError):
+                pass
+    shapes = meta.get("shape_keys") or []
+    if not shapes:
+        return
+    try:
+        if mesh.shape_keys is None:
+            obj.shape_key_add(name="Basis", from_mix=False)
+        for item in shapes:
+            if not isinstance(item, dict) or item.get("count") != count:
+                continue
+            values = _unpack_floats(item.get("data", ""), count * 3)
+            if values is None:
+                continue
+            key = obj.shape_key_add(name=str(item.get("name", "Key"))[:64] or "Key", from_mix=False)
+            key.data.foreach_set("co", values)
+            key.value = max(float(item.get("min", 0.0)), min(float(item.get("max", 1.0)), float(item.get("value", 0.0))))
+            key.slider_min = float(item.get("min", 0.0))
+            key.slider_max = float(item.get("max", 1.0))
+    except (AttributeError, RuntimeError, TypeError):
+        traceback.print_exc()
+
+
 def _object_create_payload(obj) -> dict:
     uid = obj.get("bmp_uuid") or str(uuid.uuid4())
     obj["bmp_uuid"] = uid
@@ -2912,6 +3431,20 @@ def _object_create_payload(obj) -> dict:
         meta["light_type"] = obj.data.type
         meta["energy"] = float(obj.data.energy)
         meta["color"] = list(obj.data.color)[:3]
+    elif kind == object_payload.KIND_ARMATURE:
+        meta["bones"] = _armature_bones(obj)
+        action = _action_snapshot(obj)
+        if action is not None:
+            meta["action"] = action
+    if kind == object_payload.KIND_MESH:
+        try:
+            groups, shapes = _mesh_rig_payload(obj)
+            if groups:
+                meta["vertex_groups"] = groups
+            if shapes:
+                meta["shape_keys"] = shapes
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
     return {"uuid": uid, "kind": kind, "meta": meta, "geometry": geometry}
 
 
@@ -2936,6 +3469,65 @@ def _send_object_create(session: SessionService, obj) -> None:
         runtime["create_errors"].discard(uid)
     if kind == object_payload.KIND_MESH:
         runtime["tracked"].add(obj.name)
+
+
+def _apply_armature_bones(context, obj, bones) -> None:
+    if not isinstance(bones, list) or not bones:
+        return
+    previous = context.view_layer.objects.active
+    previous_mode = context.mode
+    selected = [item for item in context.selected_objects]
+    try:
+        if context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        context.view_layer.objects.active = obj
+        obj.select_set(True)
+        bpy.ops.object.mode_set(mode="EDIT")
+        edit_bones = obj.data.edit_bones
+        pending = [item for item in bones[:256] if isinstance(item, dict)]
+        for _ in range(4):
+            remaining = []
+            for item in pending:
+                name = str(item.get("name", ""))[:64]
+                if not name or name in edit_bones:
+                    continue
+                parent = str(item.get("parent", ""))[:64]
+                if parent and parent not in edit_bones:
+                    remaining.append(item)
+                    continue
+                try:
+                    bone = edit_bones.new(name)
+                    bone.head = [float(value) for value in item.get("head", (0.0, 0.0, 0.0))][:3]
+                    bone.tail = [float(value) for value in item.get("tail", (0.0, 0.0, 1.0))][:3]
+                    bone.roll = float(item.get("roll", 0.0))
+                    bone.use_deform = bool(item.get("deform", True))
+                    if parent:
+                        bone.parent = edit_bones.get(parent)
+                        bone.use_connect = bool(item.get("connected", False))
+                except (TypeError, ValueError, RuntimeError):
+                    continue
+            pending = remaining
+            if not pending:
+                break
+        bpy.ops.object.mode_set(mode="OBJECT")
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        try:
+            bpy.ops.object.mode_set(mode="OBJECT")
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        try:
+            for item in context.selected_objects:
+                if item not in selected:
+                    item.select_set(False)
+            for item in selected:
+                item.select_set(True)
+            context.view_layer.objects.active = previous
+            if previous is not None and previous_mode in {"EDIT_MESH", "SCULPT", "POSE", "EDIT_ARMATURE"}:
+                bpy.ops.object.mode_set(mode=previous_mode)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _apply_object_create(context, body: dict) -> None:
@@ -2991,6 +3583,9 @@ def _apply_object_create(context, body: dict) -> None:
             color = meta.get("color")
             if isinstance(color, list) and len(color) == 3:
                 data.color = [max(0.0, min(1.0, float(v))) for v in color]
+        elif kind == object_payload.KIND_ARMATURE:
+            data = bpy.data.armatures.new(name)
+            obj = bpy.data.objects.new(name, data)
         else:
             obj = bpy.data.objects.new(name, None)
     except Exception:  # noqa: BLE001
@@ -3008,6 +3603,22 @@ def _apply_object_create(context, body: dict) -> None:
     runtime["known_objects"].add(uid)
     if obj.type == "MESH":
         runtime["tracked"].add(obj.name)
+        _apply_mesh_rig(obj, meta)
+        if obj.data.shape_keys is not None:
+            runtime["shape_shadow"][uid] = {
+                key.name: round(float(key.value), 4) for key in obj.data.shape_keys.key_blocks
+            }
+    elif obj.type == "ARMATURE":
+        _apply_armature_bones(context, obj, meta.get("bones"))
+        runtime["pose_shadow"][uid] = {
+            bone.name: (
+                tuple(round(float(value), 5) for value in bone.location),
+                tuple(round(float(value), 5) for value in bone.rotation_quaternion),
+                tuple(round(float(value), 5) for value in bone.scale),
+                str(bone.rotation_mode)[:16],
+            )
+            for bone in obj.pose.bones
+        }
     modifiers = meta.get("modifiers")
     details = meta.get("details")
     if isinstance(modifiers, list) or isinstance(details, dict):
@@ -3034,6 +3645,8 @@ def _apply_object_create(context, body: dict) -> None:
             slot = item.get("slot")
             if isinstance(slot, int) and 0 <= slot <= 255:
                 _apply_material(context, {"uuid": uid, "slot": slot, "material": item})
+    if obj.type == "ARMATURE" and isinstance(meta.get("action"), dict):
+        _apply_action(context, {"uuid": uid, "action": meta.get("action")})
 
 
 def _apply_object_delete(context, body: dict) -> None:
@@ -3327,6 +3940,44 @@ def _sync_edit_mesh(context, session: SessionService, obj) -> None:
         session.send_mesh(obj, "delta", payload, rev)
 
 
+def _sync_sculpt_mesh(context, session: SessionService, obj) -> None:
+    settings = context.window_manager.bmp
+    uid = obj.get("bmp_uuid") or str(uuid.uuid4())
+    obj["bmp_uuid"] = uid
+    owner = runtime["lease_owners"].get(uid)
+    if owner is not None and owner != settings.name:
+        return
+    if any(mod.type == "MULTIRES" for mod in obj.modifiers):
+        if uid not in runtime["sculpt_warned"]:
+            runtime["sculpt_warned"].add(uid)
+            _push_message(context, "system", f"{obj.name[:40]}: multires sculpt is not synced; apply the modifier or use plain sculpt")
+        return
+    now = time.monotonic()
+    if now - runtime.get("last_sculpt", 0.0) < 1.0 / 20.0:
+        return
+    runtime["last_sculpt"] = now
+    mirror = runtime["mirrors"].get(uid)
+    if mirror is None or not mirror.matches(obj.data):
+        mirror = MeshMirror()
+        runtime["mirrors"][uid] = mirror
+        try:
+            snapshot = mirror.full_snapshot(obj.data)
+            _note_rev(uid)
+            session.send_mesh(obj, "snapshot", snapshot, 0)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        return
+    try:
+        delta = mirror.poll(obj.data)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return
+    if delta is not None:
+        rev, payload = delta
+        _note_rev(uid)
+        session.send_mesh(obj, "delta", payload, rev)
+
+
 def _sync_mesh(context) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
@@ -3334,8 +3985,11 @@ def _sync_mesh(context) -> None:
         return
     active = context.active_object
     editing = active is not None and active.type == "MESH" and context.mode == "EDIT_MESH"
+    sculpting = active is not None and active.type == "MESH" and context.mode == "SCULPT"
     if editing:
         _sync_edit_mesh(context, session, active)
+    elif sculpting:
+        _sync_sculpt_mesh(context, session, active)
     elif runtime["edit_mirrors"]:
         runtime["edit_mirrors"].clear()
         runtime["edit_lease_uid"] = None
@@ -3346,8 +4000,8 @@ def _sync_mesh(context) -> None:
     runtime["last_mesh"] = now
 
     names = sorted(name for name in runtime["tracked"] if name in bpy.data.objects)
-    if editing:
-        # The edit fast path already streams this object.
+    if editing or sculpting:
+        # The edit/sculpt fast path already streams this object.
         names = [name for name in names if name != active.name]
     if not names:
         return
@@ -3908,6 +4562,8 @@ def _send_presence(context) -> None:
     body = {
         "scene": context.scene.name,
         "frame": context.scene.frame_current,
+        "playing": bool(getattr(context.scene, "is_animation_playing", False)),
+        "fps": int(context.scene.render.fps),
         "mode": context.mode,
         "active": context.active_object.name if context.active_object is not None else "",
         "selected": ",".join(_selected_uids(context)),
@@ -4284,6 +4940,9 @@ def bmp_tick():
             _sync_edit_selection(context)
             _sync_materials(context)
             _sync_modifiers(context)
+            _sync_pose(context)
+            _sync_shape_keys(context)
+            _sync_actions(context)
             _process_image_queue(context)
             _send_presence(context)
         _journal_capture(context)

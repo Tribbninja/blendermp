@@ -3,7 +3,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $failed = @()
-foreach ($name in @('run_material.ps1', 'run_details.ps1', 'run_topology.ps1', 'run_resume.ps1', 'run_checkpoint.ps1', 'run_undo.ps1')) {
+foreach ($name in @('run_material.ps1', 'run_details.ps1', 'run_topology.ps1', 'run_resume.ps1', 'run_checkpoint.ps1', 'run_undo.ps1', 'run_animation.ps1', 'run_sculpt.ps1')) {
     Write-Host "== $name" -ForegroundColor Cyan
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot $name) -Blender $Blender
     if ($LASTEXITCODE -ne 0) {

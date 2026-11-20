@@ -54,6 +54,7 @@ def summary():
         "local": [round(float(value), 3) for value in obj.matrix_basis.translation],
         "parent_inverse": [round(float(value), 3) for value in obj.matrix_parent_inverse.translation],
         "modifiers": sorted(mod.type for mod in obj.modifiers),
+        "constraints": sorted(item.name for item in obj.constraints),
         "modifier_names": sorted(mod.name for mod in obj.modifiers),
         "subsurf_levels": int(subsurf.levels) if subsurf is not None else None,
         "color": [round(float(value), 3) for value in obj.color],

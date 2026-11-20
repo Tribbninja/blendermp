@@ -55,6 +55,10 @@ subsurf.render_levels = 2
 bevel = child.modifiers.new("Edge Bevel", "BEVEL")
 bevel.width = 0.1
 bevel.segments = 2
+constraint = child.constraints.new("COPY_ROTATION")
+constraint.name = "Follow Root"
+constraint.target = root
+constraint.influence = 0.5
 
 collection = bpy.data.collections.new("Props")
 context.scene.collection.children.link(collection)
@@ -92,6 +96,7 @@ def summary():
         "local": [round(float(value), 3) for value in obj.matrix_basis.translation],
         "parent_inverse": [round(float(value), 3) for value in obj.matrix_parent_inverse.translation],
         "modifiers": sorted(modifiers),
+        "constraints": sorted(item.name for item in child.constraints),
         "subsurf_levels": int(subsurf.levels),
         "color": [round(float(value), 3) for value in obj.color],
         "hide_render": bool(obj.hide_render),

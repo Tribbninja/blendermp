@@ -38,6 +38,19 @@ def test_empty_and_light_create():
     assert body["meta"]["light_type"] == "SUN"
 
 
+def test_armature_create_roundtrip():
+    uid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    bones = [{"name": "Root", "parent": "", "head": [0, 0, 0], "tail": [0, 0, 1], "roll": 0.0}]
+    payload = object_payload.encode_create(
+        uid,
+        object_payload.KIND_ARMATURE,
+        {"name": "Rig", "matrix": [0.0] * 16, "bones": bones},
+    )
+    body = object_payload.decode_create(payload)
+    assert body["kind"] == object_payload.KIND_ARMATURE
+    assert body["meta"]["bones"][0]["name"] == "Root"
+
+
 def test_create_rejects_bad_input():
     uid = "12345678-1234-5678-1234-567812345678"
     with pytest.raises(object_payload.ObjectPayloadError):

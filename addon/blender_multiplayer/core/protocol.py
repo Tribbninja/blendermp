@@ -65,7 +65,16 @@ class ErrorCode(StrEnum):
     INTERNAL = "INTERNAL"
 
 
-DEFAULT_CAPABILITIES = int(Capability.PRESENCE_VIEW | Capability.SELECTION | Capability.ROLES)
+DEFAULT_CAPABILITIES = int(
+    Capability.PRESENCE_VIEW
+    | Capability.SELECTION
+    | Capability.TOPOLOGY
+    | Capability.MATERIAL_GRAPH
+    | Capability.ANIMATION
+    | Capability.SCULPT
+    | Capability.RESUME
+    | Capability.ROLES
+)
 
 
 class MessageType(IntEnum):
@@ -98,6 +107,9 @@ class MessageType(IntEnum):
     LASER = 27
     ROLE = 38
     RESUME = 39
+    POSE = 33
+    ACTION = 34
+    SHAPE_KEYS = 35
 
 
 class Channel(IntEnum):

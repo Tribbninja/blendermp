@@ -70,6 +70,7 @@ if ($null -ne $initial) {
     Check ($initial.subsurf_levels -eq 2) "initial subsurf levels were $($initial.subsurf_levels)"
     Check ([math]::Abs($initial.color[0] - 0.2) -le 0.01 -and [math]::Abs($initial.color[1] - 0.8) -le 0.01) "initial colour was $($initial.color -join ',')"
     Check ($initial.hide_render -eq $true) 'initial hide_render was not true'
+    Check ($initial.constraints -contains 'Follow Root') "initial constraints were $($initial.constraints -join ',')"
     Check ($initial.collections -contains 'Props') "initial collections were $($initial.collections -join ',')"
     Check ($initial.collection_hide_render -eq $true) 'initial collection hide_render was not true'
 }

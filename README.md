@@ -98,6 +98,13 @@ surface that cross-process re-parenting causes on some GPUs).
   descriptor, clients verify it on join, the Worker verifies signed directory
   announcements, PINs are scrypt-hashed with a per-IP attempt limit, and role
   changes/kicks are audited.
+* **Armature, pose and actions**: bones, rest transforms, vertex weights and
+  armature modifier binding; pose bone location/quaternion/scale changes at
+  30 Hz; active action F-curves and keyframes; shape-key names/values and
+  constraint bindings.
+* **Sculpt streaming**: plain Sculpt Mode writes position deltas at 20 Hz and
+  sends a full topology snapshot when dyntopo/counts change. Multires sculpt is
+  detected and reported as unsupported instead of silently drifting.
 * **Presence, chat and 3D pings** between the addon UI and the desktop app, with
   latency and bandwidth telemetry, pause-sync, follow-host frame, and chat
   commands (`/who`, `/ping`, `/leave`, `/me`).
@@ -118,7 +125,7 @@ surface that cross-process re-parenting causes on some GPUs).
   same animated transition. Blender is hidden while arranging and returns to the
   viewport when you press Done or Escape.
 
-The protocol and engine have **131 passing tests**, including a real TLS
+The protocol and engine have **132 passing tests**, including a real TLS
 host/client session, certificate-mismatch rejection, relay chat, password
 rejection and host kick over a multiplexed tunnel, the public directory API, and
 1,000-vertex delta round-trips under loss/reordering. The Cloudflare Worker hub
@@ -306,15 +313,16 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   vertex drags propagate **both ways** without snapping back; the host's
   selection locks the object for the client until the host releases it.
 * Checked-in two-Blender harnesses cover textured material graphs
-  (`tests/e2e/run_material.ps1`), object details (`run_details.ps1`), live
-  topology (`run_topology.ps1`), resume/journal (`run_resume.ps1`), checkpoint
-  restore (`run_checkpoint.ps1`) and scoped undo (`run_undo.ps1`);
-  `run_all.ps1` runs all six.
+  (`run_material.ps1`), object details (`run_details.ps1`), live topology
+  (`run_topology.ps1`), resume/journal (`run_resume.ps1`), checkpoint restore
+  (`run_checkpoint.ps1`), scoped undo (`run_undo.ps1`), armature/pose/action/
+  shape keys (`run_animation.ps1`) and sculpt (`run_sculpt.ps1`);
+  `run_all.ps1` runs all eight.
 * Headless `bench/bench_mesh.py` records read/delta/topology/material timings in
   `bench/baseline.json`.
 * The production Worker relay was exercised with the host key: no token and a
   wrong token are rejected, a valid host tunnel and client join succeed.
-* `pytest`: 131 passed.
+* `pytest`: 132 passed.
 
 ## Limitations
 
@@ -337,8 +345,14 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   editor is still in Edit Mode; the receiver rebuilds the mesh in Object Mode.
 * Worlds are limited to background colour/strength. Node groups, scripts and
   other unsafe shader nodes are skipped rather than approximated; the rest of a
-  material graph still applies. Armatures/pose/actions, shape keys,
-  compositor nodes, simulations and linked libraries are not replicated yet.
+  material graph still applies. Compositor nodes, simulations and linked
+  libraries are not replicated yet.
+* Action sync covers the active action's F-curves/keyframes, not the full NLA
+  library. Shape-key values and coordinates sync; drivers are not replicated.
+* Constraint sync covers type/name/influence/target/subtarget, not every
+  constraint-specific property.
+* Multires sculpt is not supported; dyntopo sends full topology snapshots,
+  which are heavier than plain position deltas.
 * Modifier sync covers the common parameter set; unsupported modifier types only
   replicate type/name/visibility.
 * New objects are replicated for meshes, empties, cameras and lights; curve and
