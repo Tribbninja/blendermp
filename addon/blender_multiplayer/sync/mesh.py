@@ -11,7 +11,6 @@ from __future__ import annotations
 import numpy as np
 
 from ..core import chunker
-from ..core.chunker import GEO_MAGIC
 
 
 def _require_bpy():
@@ -89,16 +88,18 @@ class MeshMirror:
         self.counts = self.counts_of(mesh)
         self.hashes = chunker.chunk_hashes(self.shadow)
         self.rev = 0
-        return chunker.encode_geometry(
-            geometry["positions"],
-            geometry["edges"],
-            geometry["loops"],
-            geometry["loop_starts"],
-            geometry["loop_totals"],
-            geometry["smooth"],
-            geometry["materials"],
-            geometry["uv_name"] or None,
-            geometry["uvs"] if geometry["uvs"].size else None,
+        return chunker.pack_geometry(
+            chunker.encode_geometry(
+                geometry["positions"],
+                geometry["edges"],
+                geometry["loops"],
+                geometry["loop_starts"],
+                geometry["loop_totals"],
+                geometry["smooth"],
+                geometry["materials"],
+                geometry["uv_name"] or None,
+                geometry["uvs"] if geometry["uvs"].size else None,
+            )
         )
 
     def poll(self, mesh, epsilon: float = 1e-5) -> tuple[int, bytes] | None:
@@ -146,7 +147,7 @@ class MeshMirror:
 
     def apply_snapshot(self, mesh, payload: bytes) -> None:
         _require_bpy()
-        if payload[:4] == GEO_MAGIC:
+        if chunker.is_geometry(payload):
             self._apply_geometry(mesh, payload)
             return
         positions = chunker.decode_positions(payload)

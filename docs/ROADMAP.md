@@ -1,7 +1,7 @@
 # Blendermp Master Roadmap: 0.1.7 -> 1.0
 
 Living implementation plan. Last updated: 2026-11-20.
-Baseline: **0.1.10** (public directory, authenticated relay, TLS pinning, scene
+Baseline: **0.1.12** (public directory, authenticated relay, TLS pinning, scene
 bootstrap, object/transform sync, chunked mesh deltas, live Edit Mode vertex
 streaming, edit leases, presence 2.0, exact remote application, durable settings,
 strict version gate, lease request UX, server-enforced roles, optional LAN direct).
@@ -14,6 +14,7 @@ Progress log:
 - [x] 2026-11-20: Phase 1 lock reliability: lease sweep broadcasts `expiring`/`released`, snapshot-driven owner cleanup, expiry auto-renew, request queue, host-side grant/deny, lock status in the N-panel.
 - [x] 2026-11-20: Phase 1 presence 2.0: edit-mode vertex selection relay/points, 3D cursor, follow-user camera, overlay toggles. Laser pointer removed after poor reliability.
 - [x] 2026-11-20: Phase 1 roles: host assigns viewer/commenter/editor/admin, server-enforced mutating-frame guard, downgrade releases leases, role UI in the desktop member list.
+- [x] 2026-11-20: 0.1.12: object import reliability (bulk object creates no longer dropped by the per-4KB rate bucket, stale/copied UUIDs get a fresh identity, zlib geometry compression), fixed overlay font/scale/dedupe. Laser removed.
 - [x] 2026-11-20: 0.1.11: removed all display interpolation; transforms/mesh/camera apply immediately at network rate. 60 Hz LAN streaming, client-reported ping, total data stat, stable dock bounds.
 - [x] 2026-11-20: 0.1.10: LAN direct path (dual listener + local directory `direct_code`), 60 Hz transforms/presence on low latency, client-reported ping, total data stat, stable dock bounds (no scrollbar flash).
 - [ ] Phase 2: live topology, material graphs/textures, object details.

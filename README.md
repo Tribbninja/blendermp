@@ -63,7 +63,8 @@ surface that cross-process re-parenting causes on some GPUs).
 * **Object creation and deletion**: new mesh/empty/camera/light/curve/text objects
   are sent with a full geometry snapshot (mesh) and appear on the other side,
   respecting the source collection name when it exists; deleting sends a UUID
-  tombstone. Transforms stream at up to 60 Hz on low-latency/LAN links (30 Hz
+  tombstone. Imported or duplicated objects with stale/copied IDs are assigned a
+  fresh identity. Large snapshots are zlib-compressed before transfer. Transforms stream at up to 60 Hz on low-latency/LAN links (30 Hz
   otherwise) and multiple tracked meshes round-robin at 20 Hz. A LAN-discovered
   host advertises a direct code that bypasses the relay.
 * **Immediate remote application**: received transforms and vertex deltas are

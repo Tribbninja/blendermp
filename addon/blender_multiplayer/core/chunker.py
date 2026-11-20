@@ -12,6 +12,7 @@ both the addon and the headless tools.
 from __future__ import annotations
 
 import struct
+import zlib
 from dataclasses import dataclass
 
 import numpy as np
@@ -272,7 +273,33 @@ def validate_positions(payload: bytes, max_vertices: int = 5_000_000) -> tuple[i
 
 # --------------------------------------------------------------------------- geometry
 GEO_MAGIC = b"GEO1"
+GEOZ_MAGIC = b"GZ01"
 GEO_HEADER = struct.Struct("<4s6I")
+MAX_GEO_BYTES = 128 * 1024 * 1024
+
+
+def is_geometry(payload: bytes) -> bool:
+    return payload[:4] in (GEO_MAGIC, GEOZ_MAGIC)
+
+
+def pack_geometry(payload: bytes) -> bytes:
+    """Compress a full geometry snapshot when it is worth the CPU."""
+    if payload[:4] != GEO_MAGIC or len(payload) < 4096:
+        return payload
+    return GEOZ_MAGIC + zlib.compress(payload, 6)
+
+
+def unpack_geometry(payload: bytes) -> bytes:
+    if payload[:4] != GEOZ_MAGIC:
+        return payload
+    try:
+        decompressor = zlib.decompressobj()
+        data = decompressor.decompress(payload[4:], MAX_GEO_BYTES + 1)
+    except zlib.error as exc:
+        raise ValueError("invalid compressed geometry") from exc
+    if len(data) > MAX_GEO_BYTES or decompressor.unconsumed_tail:
+        raise ValueError("compressed geometry is too large")
+    return data
 
 
 def encode_geometry(
@@ -333,6 +360,7 @@ def encode_geometry(
 
 
 def decode_geometry(payload: bytes) -> dict:
+    payload = unpack_geometry(payload)
     if len(payload) < GEO_HEADER.size:
         raise ValueError("geometry payload is truncated")
     magic, nv, ne, nl, npoly, npoly2, has_uv = GEO_HEADER.unpack_from(payload, 0)

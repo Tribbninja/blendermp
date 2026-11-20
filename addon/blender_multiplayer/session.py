@@ -74,6 +74,12 @@ MUTATING_TYPES = {
     MessageType.MODIFIER_STACK,
     MessageType.IMAGE_ASSET,
 }
+BULK_TYPES = {
+    MessageType.OBJECT_CREATE,
+    MessageType.MESH_SNAPSHOT,
+    MessageType.IMAGE_ASSET,
+    MessageType.BULK,
+}
 
 
 class Violation(Exception):
@@ -501,7 +507,13 @@ class SessionService:
 
     async def _handle_host_frame(self, peer: Peer, frame: Frame) -> None:
         now = time.monotonic()
-        cost = 1.0 + len(frame.payload) / 4096.0
+        # Large one-shot structural payloads (models, mesh snapshots, images)
+        # must not be charged per 4 KB or they exceed the burst bucket and are
+        # silently dropped. Keep a modest cap so a flood is still rate-limited.
+        if frame.type in BULK_TYPES:
+            cost = min(64.0, 1.0 + len(frame.payload) / 1_000_000.0)
+        else:
+            cost = 1.0 + len(frame.payload) / 4096.0
         if not peer.bucket.allow(cost, now):
             peer.strikes += 1
             if peer.strikes >= DISCONNECT_STRIKES:
@@ -1006,7 +1018,7 @@ class SessionService:
         try:
             if type_ == MessageType.MESH_DELTA:
                 chunker.validate_delta(payload, MAX_VERTICES)
-            elif payload[:4] == chunker.GEO_MAGIC:
+            elif chunker.is_geometry(payload):
                 chunker.validate_geometry(payload, MAX_VERTICES)
             else:
                 chunker.validate_positions(payload, MAX_VERTICES)
@@ -1744,14 +1756,15 @@ class SessionService:
             return
         self._enqueue(protocol.json_frame(MessageType.PING_MARK, {"pos": values}))
 
-    def send_object_create(self, uid: str, kind: int, meta: dict, geometry: bytes = b"") -> None:
+    def send_object_create(self, uid: str, kind: int, meta: dict, geometry: bytes = b"") -> bool:
         try:
             payload = object_payload.encode_create(uid, kind, meta, geometry)
         except object_payload.ObjectPayloadError:
-            return
+            return False
         if len(payload) > MAX_MESH:
-            return
+            return False
         self._enqueue(Frame(type=MessageType.OBJECT_CREATE, channel=Channel.MESH, payload=payload))
+        return True
 
     def send_object_delete(self, uid: str) -> None:
         try:

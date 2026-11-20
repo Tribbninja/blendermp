@@ -48,7 +48,7 @@ from .sync.mesh import EditMirror, MeshMirror
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 1, 11),
+    "version": (0, 1, 12),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -140,6 +140,7 @@ runtime: dict = {
     "last_edit_sel": 0.0,
     "last_selection_uid": "",
     "last_selection_count": 0,
+    "create_errors": set(),
     "draw_lines": None,
     "draw_labels": None,
     "transform_smoothers": {},
@@ -1771,9 +1772,20 @@ def _send_object_create(session: SessionService, obj) -> None:
         meta["energy"] = float(obj.data.energy)
         meta["color"] = list(obj.data.color)[:3]
     try:
-        session.send_object_create(uid, kind, meta, geometry)
+        sent = session.send_object_create(uid, kind, meta, geometry)
     except Exception:  # noqa: BLE001
         traceback.print_exc()
+        sent = False
+    if not sent:
+        if uid not in runtime["create_errors"]:
+            runtime["create_errors"].add(uid)
+            _push_message(
+                context,
+                "system",
+                f"{obj.name[:40]} is too large to sync; reduce its geometry and re-import",
+            )
+    else:
+        runtime["create_errors"].discard(uid)
     if kind == object_payload.KIND_MESH:
         runtime["tracked"].add(obj.name)
 
@@ -1981,14 +1993,20 @@ def _sync_transforms(context) -> None:
     runtime["last_transform"] = now
     known = runtime["known_objects"]
     current = set()
+    assigned = set()
     for obj in context.scene.objects:
         if obj.get("bmp_ping"):
             continue
         uid = obj.get("bmp_uuid")
-        if not uid:
+        # Imported/duplicated objects can carry a stale or copied bmp_uuid.
+        # If it is not a UID we have already announced this session, send a
+        # create; duplicated UIDs get a fresh identity.
+        if not uid or uid in assigned:
             uid = str(uuid.uuid4())
             obj["bmp_uuid"] = uid
+        if uid not in known:
             _send_object_create(session, obj)
+        assigned.add(uid)
         current.add(uid)
     for uid in list(known - current):
         session.send_object_delete(uid)
@@ -2248,7 +2266,7 @@ def _camera_segments(matrix, aspect: float, distance: float = 7.0) -> list:
         orbit = 7.0
     if not math.isfinite(orbit) or orbit <= 0.0:
         orbit = 7.0
-    size = max(0.35, min(8.0, orbit * 0.16))
+    size = max(0.25, min(2.5, orbit * 0.12))
     forward = size
     height = size * 0.34
     width = height * max(0.6, min(2.6, float(aspect or 1.6)))
@@ -2439,7 +2457,7 @@ def _sync_remote_visuals(context) -> None:
                 for first, second in segments:
                     max_segment = max(max_segment, float((second - first).length))
                 origin = matrix.translation
-                widget = max(0.35, min(8.0, float(user.view_distance) * 0.16))
+                widget = max(0.25, min(2.5, float(user.view_distance) * 0.12))
                 labels.append(
                     (origin + Vector((0.0, 0.0, widget * 0.5)), user.name, color)
                 )
@@ -2585,29 +2603,20 @@ def _draw_remote_labels() -> None:
     width = float(region.width)
     height = float(region.height)
     matrix = region_data.perspective_matrix
-    try:
-        preferences = context.preferences.system
-        scale = max(1.0, float(getattr(preferences, "ui_scale", 1.0) or 1.0))
-        dpi = max(72.0, float(getattr(preferences, "dpi", 72.0) or 72.0))
-    except Exception:  # noqa: BLE001
-        scale = 1.0
-        dpi = 72.0
     font = 0
-    pad = max(1.0, round(scale))
-    lift = round(10.0 * scale)
+    pad = 1
+    lift = 8
     try:
-        # Render at the UI DPI so HiDPI displays get crisp text instead of a
-        # blurry, doubled-looking shadow.
-        blf.size(font, 12.0, dpi * scale)
+        # Fixed point size at the default DPI keeps the tags identical on
+        # every display instead of looking doubled or blurry on HiDPI.
+        blf.size(font, 12.0, 72.0)
     except Exception:  # noqa: BLE001
         try:
-            blf.size(font, int(12 * scale))
+            blf.size(font, 12)
         except Exception:  # noqa: BLE001
             pass
-    outline = (
-        (-pad, 0.0), (pad, 0.0), (0.0, -pad), (0.0, pad),
-        (-pad, -pad), (pad, -pad), (-pad, pad), (pad, pad),
-    )
+    outline = ((-pad, 0.0), (pad, 0.0), (0.0, -pad), (0.0, pad))
+    drawn = []
     for position, name, color in labels:
         clip = matrix @ Vector((position[0], position[1], position[2], 1.0))
         if clip.w <= 0.0001:
@@ -2615,6 +2624,8 @@ def _draw_remote_labels() -> None:
         x = (clip.x / clip.w * 0.5 + 0.5) * width
         y = (clip.y / clip.w * 0.5 + 0.5) * height + lift
         if x < -160 or y < -160 or x > width + 160 or y > height + 160:
+            continue
+        if any(other == name and abs(x - ox) < 18 and abs(y - oy) < 18 for other, ox, oy in drawn):
             continue
         try:
             text_width, _text_height = blf.dimensions(font, name)
@@ -2627,6 +2638,7 @@ def _draw_remote_labels() -> None:
             blf.color(font, float(color[0]), float(color[1]), float(color[2]), 1.0)
             blf.position(font, left, base, 0.0)
             blf.draw(font, name)
+            drawn.append((name, x, y))
         except Exception:  # noqa: BLE001
             pass
 
