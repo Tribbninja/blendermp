@@ -252,6 +252,7 @@ class SessionService:
         self._writer: asyncio.StreamWriter | None = None
         self._ping_task: asyncio.Task | None = None
         self._leases = LeaseManager(ttl=120.0, grace=20.0)
+        self._expiry_notified: set[str] = set()
         self._bytes_in = 0
         self._bytes_out = 0
         self._rtt_ms = 0.0
@@ -761,26 +762,33 @@ class SessionService:
                 )
                 self._leases.request(key, peer.name, now)
                 if owner:
+                    requested = {
+                        "key": key,
+                        "owner": owner,
+                        "action": "requested",
+                        "requester": peer.name,
+                        "leases": self._leases.snapshot(now),
+                    }
+                    if owner == self.name:
+                        self._emit("lease", requested)
                     for other in self._peers.values():
                         if other.name == owner:
                             other.enqueue(
                                 protocol.encode(
-                                    protocol.json_frame(
-                                        MessageType.LEASE,
-                                        {"key": key, "owner": owner, "action": "requested", "requester": peer.name},
-                                    )
+                                    protocol.json_frame(MessageType.LEASE, requested)
                                 ),
                                 critical=True,
                             )
                             break
                 return
+            self._expiry_notified.discard(key)
         elif action == "grant":
             requester = clean_name(body.get("requester"), "")
             if not requester or self._leases.owner_of(key, now) != peer.name:
                 raise Violation("only the lease owner can grant it")
             if not self._leases.resolve_request(key, requester, grant=True, now=now):
                 self._leases.force(key, requester, now)
-            peer_name = requester
+            self._expiry_notified.discard(key)
             snapshot = self._leases.snapshot(now)
             self._broadcast(
                 protocol.json_frame(
@@ -788,8 +796,27 @@ class SessionService:
                 )
             )
             return
+        elif action == "deny":
+            requester = clean_name(body.get("requester"), "")
+            if not requester or self._leases.owner_of(key, now) != peer.name:
+                raise Violation("only the lease owner can deny a request")
+            self._leases.resolve_request(key, requester, grant=False, now=now)
+            self._broadcast(
+                protocol.json_frame(
+                    MessageType.LEASE,
+                    {
+                        "key": key,
+                        "owner": peer.name,
+                        "requester": requester,
+                        "action": "denied_request",
+                        "leases": self._leases.snapshot(now),
+                    },
+                )
+            )
+            return
         elif action == "release":
             self._leases.release(key, peer.name)
+            self._expiry_notified.discard(key)
         elif action == "force":
             # Admin actions are not exposed to clients in this build.
             raise Violation("force leases are not permitted")
@@ -814,6 +841,7 @@ class SessionService:
             return True
         if owner == peer.name:
             self._leases.renew(key, peer.name, now)
+            self._expiry_notified.discard(key)
             return True
         peer.strikes += 1
         if peer.strikes >= DISCONNECT_STRIKES:
@@ -953,6 +981,7 @@ class SessionService:
             released = False
             for key in self._leases.held_by(peer.name, now):
                 if self._leases.release(key, peer.name):
+                    self._expiry_notified.discard(key)
                     released = True
             if released:
                 self._broadcast(
@@ -1273,7 +1302,34 @@ class SessionService:
                 for peer in list(self._peers.values()):
                     if now - peer.last_seen > PEER_TIMEOUT:
                         asyncio.create_task(self._drop_peer(peer))
-                self._leases.sweep(now)
+                result = self._leases.sweep(now)
+                snapshot = self._leases.snapshot(now)
+                if result.released:
+                    self._expiry_notified.difference_update(result.released)
+                    self._broadcast(
+                        protocol.json_frame(
+                            MessageType.LEASE,
+                            {
+                                "action": "released",
+                                "keys": list(result.released),
+                                "leases": snapshot,
+                            },
+                        )
+                    )
+                for key in result.expiring:
+                    if key in self._expiry_notified:
+                        continue
+                    self._expiry_notified.add(key)
+                    self._broadcast(
+                        protocol.json_frame(
+                            MessageType.LEASE,
+                            {
+                                "action": "expiring",
+                                "keys": [key],
+                                "leases": snapshot,
+                            },
+                        )
+                    )
 
     # ------------------------------------------------------------------ public API
     def send_scene_reset(self, target: str, extra: dict | None = None) -> None:
@@ -1397,10 +1453,46 @@ class SessionService:
         self._enqueue(protocol.json_frame(MessageType.LEASE, {"key": key, "action": action}))
 
     def send_lease(self, key: str, action: str, requester: str | None = None) -> None:
+        if self.is_host and action in {"grant", "deny"}:
+            self._local_resolve_lease(key, action, requester)
+            return
         body = {"key": key, "action": action}
         if requester:
             body["requester"] = requester
         self._enqueue(protocol.json_frame(MessageType.LEASE, body))
+
+    def _local_resolve_lease(self, key: str, action: str, requester: str | None) -> None:
+        """Grant or deny a request from the host's own Blender."""
+        now = time.monotonic()
+        owner = self._leases.owner_of(key, now)
+        if not requester or owner != self.name:
+            self._emit("lease", {"key": key, "owner": owner, "action": "held"})
+            return
+        grant = action == "grant"
+        resolved = self._leases.resolve_request(key, requester, grant=grant, now=now)
+        if grant and not resolved:
+            self._leases.force(key, requester, now)
+        elif not grant and not resolved:
+            self._emit("lease", {"key": key, "owner": self.name, "action": "held"})
+            return
+        self._expiry_notified.discard(key)
+        if grant:
+            body = {
+                "key": key,
+                "owner": requester,
+                "action": "grant",
+                "leases": self._leases.snapshot(now),
+            }
+        else:
+            body = {
+                "key": key,
+                "owner": self.name,
+                "requester": requester,
+                "action": "denied_request",
+                "leases": self._leases.snapshot(now),
+            }
+        self._broadcast(protocol.json_frame(MessageType.LEASE, body))
+        self._emit("lease", body)
 
     def local_lease(self, key: str, action: str) -> bool:
         """Acquire/release a lease from the host's own Blender."""
@@ -1413,10 +1505,13 @@ class SessionService:
                 owner = self._leases.owner_of(key, now)
                 self._emit("lease", {"key": key, "owner": owner, "action": "held"})
                 return False
+            self._expiry_notified.discard(key)
         elif action == "release":
             self._leases.release(key, self.name)
+            self._expiry_notified.discard(key)
         elif action == "force":
             self._leases.force(key, self.name, now)
+            self._expiry_notified.discard(key)
         else:
             return False
         body = {

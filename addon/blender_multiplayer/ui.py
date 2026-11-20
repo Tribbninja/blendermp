@@ -78,6 +78,10 @@ class BMP_PT_main(bpy.types.Panel):
         lock_row = box.row(align=True)
         lock_row.operator("bmp.request_edit", text="Request edit", icon="UNLOCKED")
         lock_row.operator("bmp.grant_edit", text="Grant", icon="LOCKED")
+        if settings.lease_requester:
+            lock_row.operator("bmp.deny_edit", text="Deny", icon="CANCEL")
+        if settings.lease_info:
+            box.label(text=settings.lease_info[:120], icon="LOCKED")
         box.operator("bmp.share_images", text="Share images", icon="IMAGE_DATA")
 
         if settings.state != "offline":

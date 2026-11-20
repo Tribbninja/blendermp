@@ -52,6 +52,79 @@ class Events:
         self.stop_flag.set()
 
 
+def test_host_grant_and_deny(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    port = free_port()
+    code = encode_room("127.0.0.1", port)
+    host_inbox = queue.Queue()
+    client_inbox = queue.Queue()
+    host_events = Events(host_inbox)
+    client_events = Events(client_inbox)
+    host = session_mod.SessionService(host_inbox, host=True, code=code, name="host", color=(1, 1, 1, 1), port=port)
+    host.start()
+    assert wait_for(lambda: host.state == "hosting")
+    client = session_mod.SessionService(client_inbox, host=False, code=code, name="alice", color=(1, 1, 1, 1))
+    client.start()
+    try:
+        assert wait_for(lambda: client.state == "connected")
+        key = "22222222-2222-2222-2222-222222222222"
+        assert host.local_lease(key, "acquire")
+        assert wait_for(lambda: host_events.has("lease", action="acquire", owner="host"))
+
+        client.send_lease(key, "acquire")
+        assert wait_for(lambda: client_events.has("lease", action="denied", owner="host"))
+        assert wait_for(lambda: host_events.has("lease", action="requested", requester="alice", key=key))
+
+        host.send_lease(key, "grant", "alice")
+        assert wait_for(lambda: client_events.has("lease", action="grant", owner="alice"))
+        assert host._leases.owner_of(key, time.monotonic()) == "alice"
+
+        assert host.local_lease(key, "force")
+        key2 = "44444444-4444-4444-4444-444444444444"
+        assert host.local_lease(key2, "acquire")
+        client.send_lease(key2, "acquire")
+        assert wait_for(lambda: host_events.has("lease", action="requested", requester="alice", key=key2))
+        host.send_lease(key2, "deny", "alice")
+        assert wait_for(lambda: client_events.has("lease", action="denied_request", requester="alice", key=key2))
+        assert host._leases.requests_for(key2) == []
+    finally:
+        client.stop()
+        host.stop()
+        client_events.stop()
+        host_events.stop()
+
+
+def test_lease_expiry_is_broadcast(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    port = free_port()
+    code = encode_room("127.0.0.1", port)
+    host_inbox = queue.Queue()
+    client_inbox = queue.Queue()
+    host_events = Events(host_inbox)
+    client_events = Events(client_inbox)
+    host = session_mod.SessionService(host_inbox, host=True, code=code, name="host", color=(1, 1, 1, 1), port=port)
+    host._leases = session_mod.LeaseManager(ttl=0.4, grace=0.4)
+    host.start()
+    assert wait_for(lambda: host.state == "hosting")
+    client = session_mod.SessionService(client_inbox, host=False, code=code, name="alice", color=(1, 1, 1, 1))
+    client.start()
+    try:
+        assert wait_for(lambda: client.state == "connected")
+        key = "33333333-3333-3333-3333-333333333333"
+        client.send_lease(key, "acquire")
+        assert wait_for(lambda: client_events.has("lease", action="acquire", owner="alice"))
+        assert wait_for(lambda: client_events.has("lease", action="expiring"), timeout=4)
+        assert wait_for(lambda: client_events.has("lease", action="released"), timeout=4)
+        assert host._leases.owner_of(key, time.monotonic()) is None
+    finally:
+        client.stop()
+        host.stop()
+        client_events.stop()
+        host_events.stop()
+
+
 def test_lease_request_and_grant(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
@@ -91,3 +164,4 @@ def test_lease_request_and_grant(tmp_path, monkeypatch):
         a_events.stop()
         b_events.stop()
         host_events.stop()
+

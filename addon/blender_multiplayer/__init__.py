@@ -48,7 +48,7 @@ from .sync.mesh import EditMirror, MeshMirror
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 1, 7),
+    "version": (0, 1, 8),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -133,6 +133,7 @@ runtime: dict = {
     "modifier_shadow": {},
     "last_modifier": 0.0,
     "lease_request": None,
+    "lease_requests": {},
     "last_material": 0.0,
     "last_presence": 0.0,
     "control_checked": 0.0,
@@ -195,6 +196,8 @@ class BMPState(PropertyGroup):
     messages: CollectionProperty(type=BMPMessage)
     show_users: BoolProperty(default=True)
     show_chat: BoolProperty(default=True)
+    lease_info: StringProperty()
+    lease_requester: StringProperty()
 
 
 def state(context) -> BMPState:
@@ -420,6 +423,8 @@ def stop_session(context, publish: bool = True) -> None:
     runtime["object_shadow"].clear()
     runtime["lease_owners"].clear()
     runtime["owned_leases"].clear()
+    runtime["lease_requests"].clear()
+    runtime["lease_request"] = None
     runtime["local_transform"].clear()
     runtime["transform_smoothers"].clear()
     runtime["mesh_smoothers"].clear()
@@ -570,28 +575,68 @@ def _handle_event(context, kind: str, body: dict) -> None:
     elif kind == "lease":
         leases = body.get("leases")
         if isinstance(leases, dict):
-            runtime["lease_owners"] = {
-                key: info["owner"]
-                for key, info in leases.items()
-                if isinstance(key, str) and isinstance(info, dict) and isinstance(info.get("owner"), str)
-            }
+            owners = {}
+            requests = {}
+            for key, info in leases.items():
+                if not isinstance(key, str) or not isinstance(info, dict):
+                    continue
+                lease_owner = info.get("owner")
+                if isinstance(lease_owner, str):
+                    owners[key] = lease_owner
+                names = info.get("requests")
+                if isinstance(names, list):
+                    requests[key] = [str(name)[:48] for name in names if isinstance(name, str)][:8]
+            runtime["lease_owners"] = owners
+            runtime["lease_requests"] = requests
         key = body.get("key")
         owner = body.get("owner")
         action = body.get("action")
-        if action != "release" and isinstance(key, str) and isinstance(owner, str):
+        if (
+            action not in {"release", "released", "expiring", "denied_request"}
+            and isinstance(key, str)
+            and isinstance(owner, str)
+        ):
             runtime["lease_owners"][key] = owner
         runtime["owned_leases"] = {
             item
             for item, lease_owner in runtime["lease_owners"].items()
             if lease_owner == settings.name
         }
+        pending = None
+        for lease_key, names in runtime["lease_requests"].items():
+            if names and runtime["lease_owners"].get(lease_key) == settings.name:
+                pending = (lease_key, names[0])
+                break
+        runtime["lease_request"] = (
+            {"key": pending[0], "requester": pending[1]} if pending else None
+        )
+        settings.lease_requester = pending[1] if pending else ""
+        if pending:
+            obj = obj_sync.find(pending[0])
+            settings.lease_info = f"{pending[1]} wants {obj.name if obj else 'an object'}"
+        elif action == "expiring":
+            settings.lease_info = "Edit lock expiring - edit the object to renew"
+        else:
+            settings.lease_info = ""
         if action in {"denied", "held"}:
             _push_message(context, "system", f"Locked by {body.get('owner', 'someone')}")
         elif action == "requested":
-            runtime["lease_request"] = {"key": body.get("key"), "requester": body.get("requester")}
             _push_message(context, "system", f"{body.get('requester', 'someone')} requested edit")
         elif action == "grant":
             _push_message(context, "system", f"Lease granted to {body.get('owner', 'someone')}")
+        elif action == "denied_request":
+            _push_message(context, "system", f"{body.get('owner', 'owner')} denied the edit request")
+        elif action == "expiring":
+            keys = body.get("keys")
+            if not isinstance(keys, list):
+                keys = [key] if isinstance(key, str) else []
+            mine = [item for item in keys if runtime["lease_owners"].get(item) == settings.name]
+            if mine:
+                _push_message(context, "system", "Your edit lock is expiring - edit the object to renew")
+                session = runtime.get("session")
+                if session is not None:
+                    for item in mine:
+                        _lease_request(session, item, "acquire")
     elif kind == "image_asset":
         _apply_image(context, body)
     elif kind == "modifier_stack":
@@ -1478,6 +1523,8 @@ def _clear_scene(context, body: dict | None = None) -> None:
     runtime["hidden_objects"].clear()
     runtime["deselected"].clear()
     runtime["owned_leases"].clear()
+    runtime["lease_requests"].clear()
+    runtime["lease_request"] = None
     runtime["transform_smoothers"].clear()
     runtime["mesh_smoothers"].clear()
     runtime["view_smoothers"].clear()
@@ -2882,7 +2929,30 @@ class BMP_OT_grant_edit(Operator):
             return {"CANCELLED"}
         session.send_lease(request["key"], "grant", request.get("requester"))
         runtime["lease_request"] = None
+        settings = context.window_manager.bmp
+        settings.lease_info = ""
+        settings.lease_requester = ""
         self.report({"INFO"}, f"Granted to {request.get('requester')}")
+        return {"FINISHED"}
+
+
+class BMP_OT_deny_edit(Operator):
+    bl_idname = "bmp.deny_edit"
+    bl_label = "Deny Edit"
+    bl_description = "Deny the pending edit request"
+
+    def execute(self, context):
+        session: SessionService | None = runtime.get("session")
+        request = runtime.get("lease_request")
+        if session is None or not request:
+            self.report({"ERROR"}, "No pending request")
+            return {"CANCELLED"}
+        session.send_lease(request["key"], "deny", request.get("requester"))
+        runtime["lease_request"] = None
+        settings = context.window_manager.bmp
+        settings.lease_info = ""
+        settings.lease_requester = ""
+        self.report({"INFO"}, f"Denied {request.get('requester')}")
         return {"FINISHED"}
 
 
@@ -2956,6 +3026,7 @@ classes = (
     BMP_OT_share_images,
     BMP_OT_request_edit,
     BMP_OT_grant_edit,
+    BMP_OT_deny_edit,
     BMP_OT_export_log,
 )
 
