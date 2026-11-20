@@ -2269,8 +2269,9 @@ def _sync_remote_visuals(context) -> None:
                 for first, second in segments:
                     max_segment = max(max_segment, float((second - first).length))
                 origin = matrix.translation
+                widget = max(0.35, min(8.0, float(user.view_distance) * 0.16))
                 labels.append(
-                    (origin + Vector((0.0, 0.0, max(0.4, user.view_distance * 0.05))), user.name, color)
+                    (origin + Vector((0.0, 0.0, widget * 0.5)), user.name, color)
                 )
         uids = [uid for uid in str(user.selected or "").split(",") if uid]
         for uid in uids[:6]:
