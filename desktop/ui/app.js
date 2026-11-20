@@ -84,6 +84,9 @@ const settings = {
 const state = {
   status: null,
   embedded: false,
+  dockEnabled: true,
+  embedError: "",
+  blenderHidden: false,
   panel: "session",
   latency: [],
   lastBytes: null,
@@ -104,6 +107,7 @@ const state = {
   lastAnnounce: 0,
   directoryError: "",
   wasHosting: false,
+  offlineStreak: 0,
   demo: demoMode,
 };
 
@@ -262,8 +266,11 @@ async function updateBounds() {
     });
   } catch (error) {
     log(`bounds failed: ${error}`);
-    state.embedded = false;
-    renderEmbed();
+    const alive = await invoke("blender_running").catch(() => true);
+    if (alive === false) {
+      state.embedded = false;
+      renderEmbed();
+    }
   } finally {
     boundsBusy = false;
     if (boundsPending) {
@@ -544,14 +551,14 @@ function drawSpark() {
 
 function renderEmbed() {
   $("placeholder").hidden = state.embedded;
-  $("embedChip").hidden = !isActive(state.status) || state.embedded;
+  $("embedChip").hidden = state.embedded;
   $("detachChip").hidden = !state.embedded;
   $("focusBtn").hidden = !state.embedded;
   $("embedBtn").hidden = state.embedded;
   $("detachBtn").hidden = !state.embedded;
   const launchLabel = $("launchLabel");
   if (launchLabel) launchLabel.textContent = state.embedded ? "Focus Blender" : "Launch Blender";
-  $("stageMode").textContent = state.embedded ? "embedded - native" : isActive(state.status) ? "Blender separate" : "no Blender window";
+  $("stageMode").textContent = state.embedded ? "Blender docked" : "Blender separate";
 }
 
 function applyStatus(status) {
@@ -566,9 +573,21 @@ function applyStatus(status) {
     state.lastError = "";
   }
   const hosting = status.state === "hosting" && Boolean(status.is_host);
-  if (hosting && !state.wasHosting && settings.public) announceServer();
-  if (!hosting && state.wasHosting && status.state === "offline") removeServer();
-  state.wasHosting = hosting;
+  if (hosting) {
+    state.offlineStreak = 0;
+    if (!state.wasHosting && settings.public) announceServer();
+    state.wasHosting = true;
+  } else if (state.wasHosting && status.state === "offline") {
+    // A single offline read can be a status-file write in flight. Removing the
+    // public entry on the first one made servers vanish mid-session.
+    state.offlineStreak += 1;
+    if (state.offlineStreak >= 3) {
+      removeServer();
+      state.wasHosting = false;
+    }
+  } else if (status.state !== "offline") {
+    state.offlineStreak = 0;
+  }
   renderState(status);
   renderMembers(status);
   renderMessages(status);
@@ -622,6 +641,7 @@ async function launchBlender() {
     }
     const pid = await invoke("launch_blender", { path: settings.blender, blendFile: null });
     log(`launch_blender ok pid=${pid}`);
+    state.dockEnabled = true;
     toast("Blender launching...", "ok");
   } catch (error) {
     log(`launch_blender failed: ${error}`);
@@ -967,8 +987,13 @@ function removeServer() {
 }
 
 async function embedNow() {
+  state.dockEnabled = true;
   try {
     const box = insets();
+    if (box.width < 80 || box.height < 60) {
+      toast("The viewport is not ready yet", "error");
+      return;
+    }
     await invoke("embed_blender", {
       xPx: box.x,
       yPx: box.y,
@@ -978,6 +1003,7 @@ async function embedNow() {
       viewportH: box.viewportH,
     });
     state.embedded = true;
+    state.embedError = "";
     renderEmbed();
     toast("Blender docked", "ok");
   } catch (error) {
@@ -986,6 +1012,7 @@ async function embedNow() {
 }
 
 async function detachNow() {
+  state.dockEnabled = false;
   try {
     await invoke("detach_blender");
   } catch {
@@ -1024,21 +1051,33 @@ async function embedLoop() {
   if (!isTauri || state.embedBusy) return;
   state.embedBusy = true;
   try {
-    if (!isActive(state.status)) {
+    // Docking follows Blender's lifetime, not the session state. Session events
+    // can arrive late or be rewritten mid-flight; using them here caused the
+    // window to detach while the multiplayer session was still healthy.
+    const alive = await invoke("blender_running").catch(() => true);
+    if (alive === false) {
       if (state.embedded) {
         await invoke("detach_blender").catch(() => {});
         state.embedded = false;
         renderEmbed();
       }
+      if (state.wasHosting) {
+        removeServer();
+        state.wasHosting = false;
+      }
       return;
     }
+    // Layout edit mode hides the window on purpose; do not mistake that for a
+    // closed Blender and tear the dock down.
+    if (state.blenderHidden || !state.dockEnabled) return;
+    const box = insets();
+    if (box.width < 80 || box.height < 60) return;
     if (state.embedded) {
       await updateBounds();
       return;
     }
     const found = await invoke("find_blender_window").catch(() => null);
     if (!found) return;
-    const box = insets();
     await invoke("embed_blender", {
       xPx: box.x,
       yPx: box.y,
@@ -1048,10 +1087,15 @@ async function embedLoop() {
       viewportH: box.viewportH,
     });
     state.embedded = true;
+    state.embedError = "";
     renderEmbed();
     log("embed ok");
   } catch (error) {
-    log(`embed skipped: ${error}`);
+    const message = String(error);
+    if (message !== state.embedError) {
+      state.embedError = message;
+      log(`embed skipped: ${message}`);
+    }
   } finally {
     state.embedBusy = false;
   }
@@ -1145,7 +1189,10 @@ async function boot() {
       chat: $("tileChat"),
     },
     onBounds: scheduleBounds,
-    setBlenderVisible: (visible) => invoke("set_blender_visible", { visible }).catch(() => {}),
+    setBlenderVisible: (visible) => {
+      state.blenderHidden = !visible;
+      invoke("set_blender_visible", { visible }).catch(() => {});
+    },
     getPanel: () => state.panel,
     setPanel,
   });

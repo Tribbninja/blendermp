@@ -184,8 +184,22 @@ def start_host(
     port: int | None = None,
     relay_url: str | None = None,
 ) -> None:
-    stop_session(context)
     settings = context.window_manager.bmp
+    existing = runtime.get("session")
+    if (
+        existing is not None
+        and getattr(existing, "is_host", False)
+        and existing.is_alive()
+        and getattr(existing, "state", "") == "hosting"
+        and code is None
+    ):
+        print("BMP host already running; ignoring duplicate start", flush=True)
+        return
+    # Keep the previous session's late events out of this one. They used to land
+    # in a shared inbox and overwrite the fresh state with "offline".
+    stop_session(context, publish=False)
+    inbox = queue.Queue()
+    runtime["inbox"] = inbox
     from .core.roomcode import FLAG_PIN, FLAG_RELAY, encode_room, room_id
 
     flags = FLAG_PIN if settings.pin else 0
@@ -197,6 +211,10 @@ def start_host(
             code = encode_room(_local_ip(), endpoint_port, flags | FLAG_RELAY)
             from .net.worker_relay import WorkerBridge
 
+            settings.code = code
+            settings.is_host = True
+            settings.state = "hosting"
+            settings.last_error = ""
             bridge = WorkerBridge("host", relay_url, room_id(code))
             relay = ("127.0.0.1", bridge.start())
             port = 0
@@ -223,9 +241,10 @@ def start_host(
     settings.last_error = ""
     name = settings.name or f"user-{uuid.uuid4().hex[:4]}"
     settings.name = name
+    print(f"BMP host code={code} relay={relay_url or relay}", flush=True)
     try:
         session = SessionService(
-            inbox=runtime["inbox"],
+            inbox=inbox,
             host=True,
             code=code,
             name=name,
@@ -246,12 +265,14 @@ def start_host(
     _prime_objects(context)
     _upsert_user(context, name, tuple(settings.color), host=True)
     _push_message(context, "system", f"Hosting room {code}")
-    bpy.app.timers.register(bmp_tick, first_interval=0.05, persistent=True)
+    _ensure_timer()
 
 
 def start_join(context, code: str, relay_url: str | None = None) -> None:
-    stop_session(context)
     settings = context.window_manager.bmp
+    stop_session(context, publish=False)
+    inbox = queue.Queue()
+    runtime["inbox"] = inbox
     name = settings.name or f"user-{uuid.uuid4().hex[:4]}"
     settings.name = name
     settings.code = code.strip().upper()
@@ -260,15 +281,16 @@ def start_join(context, code: str, relay_url: str | None = None) -> None:
     settings.last_error = ""
     bridge = None
     relay: tuple[str, int] | None = None
-    if relay_url:
-        from .core.roomcode import room_id
-        from .net.worker_relay import WorkerBridge
-
-        bridge = WorkerBridge("join", relay_url, room_id(settings.code))
-        relay = ("127.0.0.1", bridge.start())
+    print(f"BMP join code={settings.code} relay={relay_url}", flush=True)
     try:
+        if relay_url:
+            from .core.roomcode import room_id
+            from .net.worker_relay import WorkerBridge
+
+            bridge = WorkerBridge("join", relay_url, room_id(settings.code))
+            relay = ("127.0.0.1", bridge.start())
         session = SessionService(
-            inbox=runtime["inbox"],
+            inbox=inbox,
             host=False,
             code=settings.code,
             name=name,
@@ -290,10 +312,21 @@ def start_join(context, code: str, relay_url: str | None = None) -> None:
     _prime_objects(context)
     _upsert_user(context, name, tuple(settings.color), host=False)
     _push_message(context, "system", f"Joining room {settings.code}")
-    bpy.app.timers.register(bmp_tick, first_interval=0.05, persistent=True)
+    _ensure_timer()
 
 
-def stop_session(context) -> None:
+def _ensure_timer() -> None:
+    # register() already owns the timer. Registering it again from a session
+    # start raised "already registered" and left the start half-finished.
+    try:
+        if not bpy.app.timers.is_registered(bmp_tick):
+            bpy.app.timers.register(bmp_tick, first_interval=0.05, persistent=True)
+    except (ValueError, AttributeError):
+        bpy.app.timers.register(bmp_tick, first_interval=0.05, persistent=True)
+
+
+
+def stop_session(context, publish: bool = True) -> None:
     session = runtime.get("session")
     if session:
         try:
@@ -310,7 +343,6 @@ def stop_session(context) -> None:
     runtime["mirrors"].clear()
     runtime["object_shadow"].clear()
     settings = context.window_manager.bmp
-    settings.state = "offline"
     settings.rtt_ms = 0
     settings.users.clear()
     if runtime["inbox"] is not None:
@@ -319,6 +351,13 @@ def stop_session(context) -> None:
                 runtime["inbox"].get_nowait()
             except queue.Empty:
                 break
+    if not publish:
+        # A new session is about to start in the same control tick. Writing
+        # "offline" here made the desktop app detach Blender and remove the
+        # public listing for a moment every time a session began.
+        return
+    settings.state = "offline"
+    settings.is_host = False
     # Publish the offline state immediately; otherwise the app keeps showing
     # the last connected status until another session starts.
     runtime["last_status"] = 0.0
@@ -894,6 +933,12 @@ def _poll_control(context) -> None:
     nonce = request.get("nonce")
     if not nonce or nonce == runtime["last_control_nonce"]:
         return
+    # Re-enabling the addon (or a second module copy) must not replay the last
+    # host/join request: doing that restarts the relay tunnel and kicks every
+    # connected player.
+    if nonce == control.read_ack():
+        runtime["last_control_nonce"] = nonce
+        return
     runtime["last_control_nonce"] = nonce
     settings = context.window_manager.bmp
     if request.get("name"):
@@ -939,9 +984,19 @@ def _poll_control(context) -> None:
             elif target:
                 session.kick(target)
         elif action == "leave":
+            settings.last_error = ""
             stop_session(context)
     except Exception as exc:  # noqa: BLE001
         settings.last_error = str(exc)
+        traceback.print_exc()
+        if action in {"host", "join"}:
+            try:
+                stop_session(context)
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+    try:
+        control.write_ack(nonce)
+    except Exception:  # noqa: BLE001
         traceback.print_exc()
 
 
@@ -1225,6 +1280,20 @@ def _write_status(context, force: bool = False) -> None:
     runtime["last_status"] = now
     settings = context.window_manager.bmp
     stats = session.stats() if session else {}
+    # The session object is the source of truth. Settings are updated from
+    # queued events and can lag (or be overwritten by a late event), which used
+    # to publish "offline" while the socket was healthy.
+    state = settings.state
+    code = settings.code
+    is_host = settings.is_host
+    name = settings.name
+    if session is not None:
+        live_state = getattr(session, "state", None)
+        if live_state in {"offline", "hosting", "joining", "connected"}:
+            state = live_state
+        code = getattr(session, "code", None) or code
+        is_host = bool(getattr(session, "is_host", is_host))
+        name = getattr(session, "name", None) or name
     users = [
         {
             "name": user.name,
@@ -1240,10 +1309,10 @@ def _write_status(context, force: bool = False) -> None:
     ]
     control.write_status(
         {
-            "state": settings.state,
-            "code": settings.code,
-            "is_host": settings.is_host,
-            "name": settings.name,
+            "state": state,
+            "code": code,
+            "is_host": is_host,
+            "name": name,
             "fingerprint": settings.fingerprint,
             "verify_code": settings.verify_code,
             "last_error": settings.last_error,
@@ -1285,7 +1354,11 @@ def bmp_tick():
         # Keep writing while offline too, so the desktop app always sees the
         # current state and never stays stuck on "connected".
         _write_status(context)
-        if session is not None and session.failed:
+        if session is not None and not session.is_alive():
+            settings = context.window_manager.bmp
+            settings.last_error = session.failure_reason or "session stopped"
+            stop_session(context)
+        elif session is not None and session.failed:
             settings = context.window_manager.bmp
             settings.last_error = session.failure_reason or "connection failed"
             stop_session(context)

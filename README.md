@@ -1,12 +1,13 @@
 # Blendermp
 
 Low-latency collaborative Blender sessions, with a desktop app that launches
-Blender and **docks the live window inside the app** (native re-parenting, not
-video capture, so it keeps full GPU performance).
+Blender and **docks the live window over the app viewport** (a native owned
+window, not video capture, so it keeps full GPU performance and avoids the black
+surface that cross-process re-parenting causes on some GPUs).
 
 > **Status: alpha vertical slice.** Hosting, the public server browser, TLS
-> pinning, presence, chat, object transforms, mesh streaming and window
-> embedding work.
+> pinning, presence, chat, object transforms, mesh streaming and window docking
+> work.
 > Cross-network sessions use the self-hosted relay or the Cloudflare Worker hub.
 > Edit-mode topology sync and the long feature list in the plan are not
 > implemented yet.
@@ -193,7 +194,7 @@ addon/blender_multiplayer/     Blender 5.x extension (importable package)
   control.py  validated local control files shared with the app
   ui.py       N-panel
 desktop/ui/                    static UI (no bundler)
-desktop/src-tauri/             Tauri 2 shell + Win32 embedding
+desktop/src-tauri/             Tauri 2 shell + Win32 window docking
 server/relay.py                self-hosted cross-network relay
 server/directory.py            self-hosted public server directory
 cloudflare/                    free Worker hub: public directory + WS relay
@@ -234,7 +235,7 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   loops, UVs, smooth flags).
 * The packaged extension validates and installs with
   `blender --command extension install-file`.
-* The app launches Blender, embeds its window, and reports the live server
+* The app launches Blender, docks its window, and reports the live server
   status, fingerprint and verification code.
 * `pytest`: 103 passed.
 
@@ -250,7 +251,7 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
 * New objects are replicated for meshes, empties, cameras and lights; curves,
   font objects and modifiers are not, and collections/parenting are only
   partially covered.
-* Windows-only window embedding; other platforms run Blender in its own window.
+* Windows-only window docking; other platforms run Blender in its own window.
 * Multires is not supported.
 * Alpha software: back up work before a session.
 

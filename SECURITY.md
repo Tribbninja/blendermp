@@ -72,8 +72,8 @@ The desktop app drives the addon through two JSON files in
 
 * Strict CSP: no remote content, no inline scripts, no `eval` in our code.
 * Minimal Tauri capability list; only the commands the app needs are allowed.
-* The embedded window must belong to the Blender process the app launched, and
-  only a window whose title matches Blender is accepted.
+* The docked window must belong to the Blender process the app launched, and
+  only the largest visible Blender window is accepted.
 * Blender is launched with a fixed `--python-expr` and an allowlisted addon
   path; no shell, no arbitrary arguments from the webview.
 * Release builds disable devtools.

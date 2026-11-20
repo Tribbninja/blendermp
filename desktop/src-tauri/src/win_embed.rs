@@ -1,30 +1,43 @@
 #![cfg(target_os = "windows")]
 
-//! Native window embedding.
+//! Native window docking.
 //!
-//! Blender is re-parented into our window with `SetParent`, so its GPU surface
-//! keeps rendering at full speed: no capture, no encoding, no extra latency.
+//! Blender is kept as a real top-level GPU window and **owned** by the app, then
+//! positioned exactly over the stage area with its frame removed. This looks
+//! identical to embedding but avoids `SetParent` across processes, which is the
+//! classic cause of a black OpenGL surface on some GPUs, DPI settings and
+//! WebView2 builds.
 //!
 //! Safety rules for the bridge:
-//! * Only a window owned by the Blender PID we launched is embedded.
+//! * Only a window owned by the Blender PID we launched is docked.
 //! * The caller passes the bounds; they are clamped to sane minimums.
-//! * The original window style is restored on detach.
+//! * The original window style and owner are restored on detach.
+//! * Nothing is ever closed here; Blender's lifetime belongs to the user.
 
-use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
+use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+use windows_sys::Win32::System::Threading::AttachThreadInput;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClientRect, GetWindow, GetWindowLongPtrW, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetForegroundWindow, SetParent,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, GetWindowRect, GetClassNameW, PostMessageW, WM_CLOSE,
-    BringWindowToTop,
-    GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SWP_NOACTIVATE, SWP_ASYNCWINDOWPOS, SW_SHOW, SW_HIDE,
-    WS_CAPTION, WS_CHILD, WS_POPUP, WS_THICKFRAME,
+    BringWindowToTop, EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetParent,
+    GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SetForegroundWindow, SetParent,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_HWNDPARENT, GWL_STYLE, GW_OWNER,
+    SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
 };
+
+const MIN_DOCK_WIDTH: f64 = 80.0;
+const MIN_DOCK_HEIGHT: f64 = 60.0;
+const WS_EX_APPWINDOW: isize = 0x0004_0000;
+const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
 
 struct Search {
     pid: u32,
     title: Option<String>,
     found: Option<HWND>,
+    best_area: i64,
 }
 
 unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -34,8 +47,19 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     }
 
     let owner = GetWindow(hwnd, GW_OWNER);
-    if !owner.is_null() {
-        return 1;
+    if search.title.is_some() {
+        if !owner.is_null() {
+            return 1;
+        }
+    } else if !owner.is_null() {
+        // Skip Blender's own splash/tool windows, which are owned by its main
+        // window. A docked main window is owned by the app (a different PID),
+        // so it must still be found.
+        let mut owner_pid = 0u32;
+        GetWindowThreadProcessId(owner, &mut owner_pid);
+        if owner_pid == search.pid {
+            return 1;
+        }
     }
 
     let length = GetWindowTextLengthW(hwnd);
@@ -59,7 +83,7 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
 
     // Blender's main window uses GHOST_WindowClass. Its console window (from
     // launching blender.exe directly) also has a title containing "blender",
-    // so filter by class to avoid embedding the console.
+    // so filter by class to avoid docking the console.
     let mut class_buffer = [0u16; 128];
     let class_length = GetClassNameW(hwnd, class_buffer.as_mut_ptr(), class_buffer.len() as i32);
     if class_length <= 0 {
@@ -72,9 +96,25 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
 
     let mut pid = 0u32;
     GetWindowThreadProcessId(hwnd, &mut pid);
-    if pid == search.pid && title.to_lowercase().contains("blender") {
+    if pid != search.pid || !title.to_lowercase().contains("blender") {
+        return 1;
+    }
+
+    // Prefer the largest window. Startup can briefly expose a small splash or
+    // a tool window; docking that produces a tiny or black viewport.
+    let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    if GetWindowRect(hwnd, &mut rect) == 0 {
+        return 1;
+    }
+    let width = (rect.right - rect.left).max(0) as i64;
+    let height = (rect.bottom - rect.top).max(0) as i64;
+    if width < 320 || height < 200 {
+        return 1;
+    }
+    let area = width * height;
+    if area > search.best_area {
+        search.best_area = area;
         search.found = Some(hwnd);
-        return 0;
     }
     1
 }
@@ -91,6 +131,7 @@ pub fn find_window_for_pid(pid: u32) -> Option<isize> {
         pid,
         title: None,
         found: None,
+        best_area: 0,
     };
     enumerate(&mut search).map(|hwnd| hwnd as isize)
 }
@@ -100,6 +141,7 @@ pub fn find_window_by_title(fragment: &str) -> Option<isize> {
         pid: 0,
         title: Some(fragment.to_string()),
         found: None,
+        best_area: 0,
     };
     enumerate(&mut search).map(|hwnd| hwnd as isize)
 }
@@ -109,6 +151,7 @@ pub struct EmbedInfo {
     pub style: isize,
     pub exstyle: isize,
     pub parent: isize,
+    pub overlay: bool,
 }
 
 pub fn embed(
@@ -129,29 +172,65 @@ pub fn embed(
     if unsafe { IsWindow(parent) } == 0 {
         return Err("application window is no longer valid".into());
     }
+    if viewport_w < MIN_DOCK_WIDTH || viewport_h < MIN_DOCK_HEIGHT {
+        return Err("the stage is not laid out yet".into());
+    }
 
     let style = unsafe { GetWindowLongPtrW(child, GWL_STYLE) };
     let exstyle = unsafe { GetWindowLongPtrW(child, GWL_EXSTYLE) };
     unsafe {
         let _ = EnableWindow(child, 1);
     }
-    let strip = (WS_POPUP | WS_CAPTION | WS_THICKFRAME) as isize;
-    let new_style = (style & !strip) | WS_CHILD as isize;
-    unsafe {
-        SetWindowLongPtrW(child, GWL_STYLE, new_style);
-    }
 
-    let previous = unsafe { SetParent(child, parent) };
-    if previous.is_null() {
-        // SetParent returns NULL on success when the window had no parent, so a
-        // zero result is not by itself an error. Verify by checking the window
-        // is still alive instead.
-        if unsafe { IsWindow(child) } == 0 {
-            return Err("SetParent failed".into());
+    // An older run (or a previous build) may have left the window parented as a
+    // true child. Move it back to the desktop first so the owner/z-order logic
+    // below works on a normal top-level window.
+    if unsafe { GetParent(child) } == parent {
+        unsafe {
+            let _ = SetParent(child, std::ptr::null_mut());
         }
     }
 
-    position(child, parent, x_px, y_px, width_px, height_px, viewport_w, viewport_h)?;
+    // Owned top-level window: it follows the app's z-order, minimizes with it,
+    // but keeps its own native GPU surface. Do not use SetParent here.
+    let dock_style = (style
+        & !((WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CHILD)
+            as isize))
+        | (WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN) as isize;
+    let dock_exstyle = (exstyle & !WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW;
+
+    unsafe {
+        SetWindowLongPtrW(child, GWL_HWNDPARENT, parent as isize);
+        SetWindowLongPtrW(child, GWL_STYLE, dock_style);
+        SetWindowLongPtrW(child, GWL_EXSTYLE, dock_exstyle);
+        // Apply the style change without moving the window yet.
+        let _ = SetWindowPos(
+            child,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE
+                | SWP_NOSIZE
+                | SWP_NOACTIVATE
+                | SWP_FRAMECHANGED
+                | SWP_ASYNCWINDOWPOS,
+        );
+    }
+
+    position_overlay(
+        child,
+        parent,
+        x_px,
+        y_px,
+        width_px,
+        height_px,
+        viewport_w,
+        viewport_h,
+        true,
+    )?;
+
     unsafe {
         let _ = ShowWindow(child, SW_SHOW);
     }
@@ -161,10 +240,11 @@ pub fn embed(
         style,
         exstyle,
         parent: parent_handle,
+        overlay: true,
     })
 }
 
-fn position(
+fn position_overlay(
     child: HWND,
     parent: HWND,
     x_px: i32,
@@ -173,20 +253,42 @@ fn position(
     height_px: i32,
     viewport_w: f64,
     viewport_h: f64,
+    raise: bool,
 ) -> Result<(), String> {
+    if viewport_w < MIN_DOCK_WIDTH || viewport_h < MIN_DOCK_HEIGHT {
+        return Err("the stage is not laid out yet".into());
+    }
+    // Minimized/hidden app windows have no usable client rect. Leave the docked
+    // window alone; it follows the owner's minimize state automatically.
+    if unsafe { IsIconic(parent) } != 0 || unsafe { IsWindowVisible(parent) } == 0 {
+        return Ok(());
+    }
     let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
     if unsafe { GetClientRect(parent, &mut rect) } == 0 {
         return Err("GetClientRect failed".into());
     }
     let client_w = (rect.right - rect.left) as f64;
     let client_h = (rect.bottom - rect.top) as f64;
+    if client_w < MIN_DOCK_WIDTH || client_h < MIN_DOCK_HEIGHT {
+        return Err("the app window is minimized".into());
+    }
     let scale_x = (client_w / viewport_w.max(1.0)).clamp(0.25, 4.0);
     let scale_y = (client_h / viewport_h.max(1.0)).clamp(0.25, 4.0);
-    let x = ((x_px.max(0) as f64) * scale_x).round() as i32;
-    let y = ((y_px.max(0) as f64) * scale_y).round() as i32;
-    let width = ((width_px.max(40) as f64) * scale_x).round() as i32;
-    let height = ((height_px.max(30) as f64) * scale_y).round() as i32;
 
+    let mut origin = POINT { x: 0, y: 0 };
+    if unsafe { ClientToScreen(parent, &mut origin) } == 0 {
+        return Err("ClientToScreen failed".into());
+    }
+
+    let x = origin.x + ((x_px.max(0) as f64) * scale_x).round() as i32;
+    let y = origin.y + ((y_px.max(0) as f64) * scale_y).round() as i32;
+    let width = ((width_px.max(MIN_DOCK_WIDTH as i32) as f64) * scale_x).round() as i32;
+    let height = ((height_px.max(MIN_DOCK_HEIGHT as i32) as f64) * scale_y).round() as i32;
+
+    let mut flags = SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS | SWP_FRAMECHANGED;
+    if !raise {
+        flags |= SWP_NOZORDER;
+    }
     let ok = unsafe {
         SetWindowPos(
             child,
@@ -195,7 +297,7 @@ fn position(
             y,
             width,
             height,
-            SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+            flags,
         )
     };
     if ok == 0 {
@@ -218,62 +320,83 @@ pub fn resize(
     if unsafe { IsWindow(child) } == 0 || unsafe { IsWindow(parent) } == 0 {
         return Err(format!("window was closed (child={}, parent={})", info.hwnd, info.parent));
     }
-    position(child, parent, x_px, y_px, width_px, height_px, viewport_w, viewport_h)
+    if info.overlay {
+        // The window may have been moved behind another window; keep it owned
+        // by the app so it stays above the app and follows its minimize state.
+        unsafe {
+            if GetWindowLongPtrW(child, GWL_HWNDPARENT) != parent as isize {
+                SetWindowLongPtrW(child, GWL_HWNDPARENT, parent as isize);
+            }
+        }
+        position_overlay(
+            child,
+            parent,
+            x_px,
+            y_px,
+            width_px,
+            height_px,
+            viewport_w,
+            viewport_h,
+            false,
+        )
+    } else {
+        let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        if unsafe { GetClientRect(parent, &mut rect) } == 0 {
+            return Err("GetClientRect failed".into());
+        }
+        let scale_x = ((rect.right - rect.left) as f64 / viewport_w.max(1.0)).clamp(0.25, 4.0);
+        let scale_y = ((rect.bottom - rect.top) as f64 / viewport_h.max(1.0)).clamp(0.25, 4.0);
+        let ok = unsafe {
+            SetWindowPos(
+                child,
+                std::ptr::null_mut(),
+                (x_px.max(0) as f64 * scale_x).round() as i32,
+                (y_px.max(0) as f64 * scale_y).round() as i32,
+                (width_px.max(MIN_DOCK_WIDTH as i32) as f64 * scale_x).round() as i32,
+                (height_px.max(MIN_DOCK_HEIGHT as i32) as f64 * scale_y).round() as i32,
+                SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS | SWP_NOZORDER,
+            )
+        };
+        if ok == 0 {
+            return Err("SetWindowPos failed".into());
+        }
+        Ok(())
+    }
 }
 
 pub fn detach(info: &EmbedInfo) {
     let child = info.hwnd as HWND;
+    if unsafe { IsWindow(child) } == 0 {
+        return;
+    }
     unsafe {
-        let _ = SetParent(child, std::ptr::null_mut());
+        if info.overlay {
+            SetWindowLongPtrW(child, GWL_HWNDPARENT, 0);
+        } else {
+            let _ = SetParent(child, std::ptr::null_mut());
+        }
         SetWindowLongPtrW(child, GWL_STYLE, info.style);
         SetWindowLongPtrW(child, GWL_EXSTYLE, info.exstyle);
+        let _ = SetWindowPos(
+            child,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE
+                | SWP_NOSIZE
+                | SWP_NOZORDER
+                | SWP_NOACTIVATE
+                | SWP_FRAMECHANGED
+                | SWP_SHOWWINDOW,
+        );
         let _ = ShowWindow(child, SW_SHOW);
     }
 }
 
-pub fn dismiss_splash(pid: u32) -> usize {
-    // After the main Blender window becomes a child, any remaining top-level
-    // GHOST window for its process is the startup splash. Close it with WM_CLOSE
-    // rather than killing the process.
-    struct Search {
-        pid: u32,
-        count: usize,
-    }
-    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let search = &mut *(lparam as *mut Search);
-        let mut window_pid = 0u32;
-        GetWindowThreadProcessId(hwnd, &mut window_pid);
-        if window_pid != search.pid || IsWindowVisible(hwnd) == 0 {
-            return 1;
-        }
-        let mut class_buffer = [0u16; 128];
-        let class_length = GetClassNameW(hwnd, class_buffer.as_mut_ptr(), class_buffer.len() as i32);
-        if class_length <= 0 {
-            return 1;
-        }
-        let class_name = String::from_utf16_lossy(&class_buffer[..class_length as usize]);
-        if class_name != "GHOST_WindowClass" {
-            return 1;
-        }
-        let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-        if GetWindowRect(hwnd, &mut rect) == 0 {
-            return 1;
-        }
-        let width = rect.right - rect.left;
-        let height = rect.bottom - rect.top;
-        // Splash windows are centered and modest; avoid closing large tool windows.
-        if (360..=1600).contains(&width) && (180..=1000).contains(&height) {
-            let _ = PostMessageW(hwnd, WM_CLOSE, 0, 0);
-            search.count += 1;
-        }
-        1
-    }
-
-    let mut search = Search { pid, count: 0 };
-    unsafe {
-        let _ = EnumWindows(Some(callback), &mut search as *mut Search as LPARAM);
-    }
-    search.count
+pub fn window_alive(handle: isize) -> bool {
+    unsafe { IsWindow(handle as HWND) != 0 }
 }
 
 pub fn process_alive(pid: u32) -> bool {
@@ -302,10 +425,29 @@ pub fn set_visible(info: &EmbedInfo, visible: bool) {
 
 pub fn focus(info: &EmbedInfo) {
     let child = info.hwnd as HWND;
-    let parent = info.parent as HWND;
+    if unsafe { IsWindow(child) } == 0 {
+        return;
+    }
     unsafe {
-        let _ = SetForegroundWindow(parent);
+        // Cross-process focus requires sharing the input state with the window's
+        // thread; SetFocus alone silently fails for another process.
+        let foreground = GetForegroundWindow();
+        let foreground_thread = if foreground.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(foreground, std::ptr::null_mut())
+        };
+        let mut pid = 0u32;
+        let child_thread = GetWindowThreadProcessId(child, &mut pid);
+        let attached = foreground_thread != 0
+            && child_thread != 0
+            && foreground_thread != child_thread
+            && AttachThreadInput(foreground_thread, child_thread, 1) != 0;
+        let _ = SetForegroundWindow(child);
         let _ = BringWindowToTop(child);
         let _ = SetFocus(child);
+        if attached {
+            let _ = AttachThreadInput(foreground_thread, child_thread, 0);
+        }
     }
 }

@@ -254,6 +254,9 @@ class SessionService:
         self._thread = threading.Thread(target=self._thread_main, name="bmp-session", daemon=True)
         self._thread.start()
 
+    def is_alive(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
     def _thread_main(self) -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)

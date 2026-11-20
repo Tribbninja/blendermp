@@ -10,6 +10,7 @@
     "allow-detect-blender",
     "allow-launch-blender",
     "allow-find-blender-window",
+    "allow-blender-running",
     "allow-embed-blender",
     "allow-set-embed-bounds",
     "allow-detach-blender",

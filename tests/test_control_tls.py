@@ -73,6 +73,40 @@ def test_oversized_control_file_rejected(appdir):
     assert control.read_session() is None
 
 
+def test_worker_relay_url_request(appdir):
+    write_session(
+        appdir,
+        {
+            "action": "join",
+            "nonce": "w" * 16,
+            "code": encode_room("127.0.0.1", 51999),
+            "relay_url": "wss://blendermp-hub.example.workers.dev",
+        },
+    )
+    request = control.read_session()
+    assert request["relay_url"] == "wss://blendermp-hub.example.workers.dev"
+
+    for bad in ("https://example.com", "blendermp-hub.example", "wss://bad\nurl"):
+        write_session(
+            appdir,
+            {
+                "action": "join",
+                "nonce": "w" * 16,
+                "code": encode_room("127.0.0.1", 51999),
+                "relay_url": bad,
+            },
+        )
+        assert control.read_session() is None, bad
+
+
+def test_ack_nonce_roundtrip(appdir):
+    assert control.read_ack() == ""
+    control.write_ack("a" * 16)
+    assert control.read_ack() == "a" * 16
+    control.write_ack("short")
+    assert control.read_ack() == "a" * 16
+
+
 def test_status_is_bounded_and_atomic(appdir):
     control.write_status(
         {

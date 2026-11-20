@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::State;
+use tauri::{Manager, State};
 
 const APP_DIR: &str = "Blendermp";
 const MAX_STATUS_BYTES: u64 = 64 * 1024;
@@ -313,6 +313,21 @@ fn find_blender_window(state: State<AppState>) -> Result<Option<i64>, String> {
 }
 
 #[tauri::command]
+fn blender_running(state: State<AppState>) -> Result<bool, String> {
+    let pid = *state.blender_pid.lock().map_err(|_| "state lock poisoned".to_string())?;
+    let Some(pid) = pid else { return Ok(false) };
+    #[cfg(windows)]
+    {
+        Ok(win_embed::process_alive(pid))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        Ok(true)
+    }
+}
+
+#[tauri::command]
 fn embed_blender(
     state: State<AppState>,
     x_px: f64,
@@ -328,18 +343,20 @@ fn embed_blender(
         let pid = pid.ok_or_else(|| "Blender is not running".to_string())?;
         let child = win_embed::find_window_for_pid(pid).ok_or_else(|| "Blender window not found".to_string())?;
         let parent = win_embed::find_window_by_title("Blendermp").ok_or_else(|| "app window not found".to_string())?;
-        let info = win_embed::embed(
-            child,
-            parent,
-            x_px.max(0.0).round() as i32,
-            y_px.max(0.0).round() as i32,
-            width_px.max(40.0).round() as i32,
-            height_px.max(30.0).round() as i32,
-            viewport_w,
-            viewport_h,
-        )?;
-        *state.embedded.lock().map_err(|_| "state lock poisoned".to_string())? = Some(info);
-        let _ = win_embed::dismiss_splash(pid);
+        let x = x_px.max(0.0).round() as i32;
+        let y = y_px.max(0.0).round() as i32;
+        let width = width_px.max(40.0).round() as i32;
+        let height = height_px.max(30.0).round() as i32;
+        let mut guard = state.embedded.lock().map_err(|_| "state lock poisoned".to_string())?;
+        // Docking is idempotent: re-docking the same window would toggle styles
+        // and can stall Blender's surface. Resize instead.
+        if let Some(info) = guard.as_ref() {
+            if info.hwnd == child {
+                return win_embed::resize(info, x, y, width, height, viewport_w, viewport_h);
+            }
+        }
+        let info = win_embed::embed(child, parent, x, y, width, height, viewport_w, viewport_h)?;
+        *guard = Some(info);
         Ok(())
     }
     #[cfg(not(windows))]
@@ -363,15 +380,26 @@ fn set_embed_bounds(
     {
         let guard = state.embedded.lock().map_err(|_| "state lock poisoned".to_string())?;
         let info = guard.as_ref().ok_or_else(|| "Blender is not embedded".to_string())?;
-        win_embed::resize(
-            info,
-            x_px.max(0.0).round() as i32,
-            y_px.max(0.0).round() as i32,
-            width_px.max(40.0).round() as i32,
-            height_px.max(30.0).round() as i32,
-            viewport_w,
-            viewport_h,
-        )
+        let x = x_px.max(0.0).round() as i32;
+        let y = y_px.max(0.0).round() as i32;
+        let width = width_px.max(40.0).round() as i32;
+        let height = height_px.max(30.0).round() as i32;
+        if let Err(error) = win_embed::resize(info, x, y, width, height, viewport_w, viewport_h) {
+            // Blender can replace its main window (for example after loading a
+            // file). Re-dock the replacement instead of staying detached.
+            if win_embed::window_alive(info.hwnd) {
+                return Err(error);
+            }
+            let parent = info.parent;
+            let pid = *state.blender_pid.lock().map_err(|_| "state lock poisoned".to_string())?;
+            let Some(pid) = pid else { return Err(error); };
+            let child = win_embed::find_window_for_pid(pid).ok_or(error)?;
+            drop(guard);
+            let mut guard = state.embedded.lock().map_err(|_| "state lock poisoned".to_string())?;
+            let new_info = win_embed::embed(child, parent, x, y, width, height, viewport_w, viewport_h)?;
+            *guard = Some(new_info);
+        }
+        Ok(())
     }
     #[cfg(not(windows))]
     {
@@ -674,6 +702,7 @@ pub fn run() {
             detect_blender,
             launch_blender,
             find_blender_window,
+            blender_running,
             embed_blender,
             set_embed_bounds,
             detach_blender,
@@ -684,6 +713,30 @@ pub fn run() {
             startup_flags,
             write_session
         ])
+        .on_window_event(|window, event| {
+            // A docked window is owned by the app, so destroying the app window
+            // would destroy Blender with it. Release it on close and let Blender
+            // keep running (the session lives inside Blender).
+            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                #[cfg(windows)]
+                {
+                    let info = window
+                        .app_handle()
+                        .state::<AppState>()
+                        .embedded
+                        .lock()
+                        .ok()
+                        .and_then(|mut guard| guard.take());
+                    if let Some(info) = info {
+                        win_embed::detach(&info);
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = window;
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running Blendermp");
 }

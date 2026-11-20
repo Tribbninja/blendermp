@@ -56,6 +56,53 @@ def status_path() -> Path:
     return data_dir() / "status.json"
 
 
+def ack_path() -> Path:
+    return data_dir() / "ack.json"
+
+
+def read_ack() -> str:
+    """The last control nonce this user's Blender already executed."""
+    body = _read_json(ack_path(), 512)
+    nonce = body.get("nonce") if body else None
+    return nonce if isinstance(nonce, str) and 8 <= len(nonce) <= 64 else ""
+
+
+def write_ack(nonce: str) -> None:
+    if not isinstance(nonce, str) or not 8 <= len(nonce) <= 64:
+        return
+    _atomic_write(ack_path(), json.dumps({"nonce": nonce}, separators=(",", ":")), ".ack-")
+
+
+def _atomic_write(path: Path, payload: str, prefix: str) -> None:
+    descriptor, temp = tempfile.mkstemp(dir=str(path.parent), prefix=prefix, suffix=".tmp")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        try:
+            os.chmod(temp, 0o600)
+        except OSError:
+            pass
+        # The desktop app polls this file. A short-lived reader handle must not
+        # make the atomic replace fail on Windows.
+        last_error: OSError | None = None
+        for _ in range(10):
+            try:
+                os.replace(temp, path)
+                last_error = None
+                break
+            except PermissionError as exc:
+                last_error = exc
+                time.sleep(0.03)
+        if last_error is not None:
+            raise last_error
+    finally:
+        if os.path.exists(temp):
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+
+
 def _read_json(path: Path, limit: int) -> dict[str, Any] | None:
     try:
         if path.is_symlink() or not path.is_file():
@@ -215,31 +262,4 @@ def write_status(data: dict[str, Any]) -> None:
         ]
 
     payload = json.dumps(safe, separators=(",", ":"))[:MAX_STATUS_BYTES]
-    path = status_path()
-    descriptor, temp = tempfile.mkstemp(dir=str(path.parent), prefix=".status-", suffix=".tmp")
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-        try:
-            os.chmod(temp, 0o600)
-        except OSError:
-            pass
-        # The desktop app polls this file. A short-lived reader handle must not
-        # make the atomic replace fail on Windows.
-        last_error: OSError | None = None
-        for _ in range(10):
-            try:
-                os.replace(temp, path)
-                last_error = None
-                break
-            except PermissionError as exc:
-                last_error = exc
-                time.sleep(0.03)
-        if last_error is not None:
-            raise last_error
-    finally:
-        if os.path.exists(temp):
-            try:
-                os.unlink(temp)
-            except OSError:
-                pass
+    _atomic_write(status_path(), payload, ".status-")

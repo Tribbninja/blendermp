@@ -7,6 +7,7 @@ fn main() {
                 "detect_blender",
                 "launch_blender",
                 "find_blender_window",
+                "blender_running",
                 "embed_blender",
                 "set_embed_bounds",
                 "detach_blender",
