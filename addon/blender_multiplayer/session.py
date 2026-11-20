@@ -277,6 +277,8 @@ class SessionService:
         fingerprint: str | None = None,
         pin: str = "",
         relay: tuple[str, int] | None = None,
+        direct_code: str | None = None,
+        direct_first: bool = False,
         version: str | None = None,
     ):
         self.inbox = inbox
@@ -318,6 +320,10 @@ class SessionService:
         # Direct LAN: raw payloads. Relay/cross-network: lossless zlib.
         self.compress_enabled = bool(self.relay_mode)
         compression.set_enabled(self.compress_enabled)
+        self.direct_first = bool(direct_first)
+        self.direct_code = (direct_code or "").strip().upper()
+        self._direct_failed = False
+        self._using_relay = bool(self.relay_mode)
         self._relay_host: RelayHostAgent | None = None
         self._relay_client: RelayClientAgent | None = None
 
@@ -340,7 +346,6 @@ class SessionService:
         self._server: asyncio.AbstractServer | None = None
         self._peers: dict[str, Peer] = {}
         self._peer_id: str | None = None
-        self.direct_code = ""
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._ping_task: asyncio.Task | None = None
@@ -559,7 +564,7 @@ class SessionService:
                 "direct_code": self.direct_code,
                 "fingerprint": fingerprint,
                 "short": tls.short_fingerprint(fingerprint),
-                "relay": self.relay_mode,
+                "relay": self._using_relay,
             },
         )
 
@@ -1868,23 +1873,55 @@ class SessionService:
         except Exception as exc:  # noqa: BLE001
             self._fail(f"invalid room code: {exc}")
             return
+        direct_info = None
+        if self.direct_code:
+            try:
+                direct_info = decode_room(self.direct_code)
+            except Exception:  # noqa: BLE001
+                direct_info = None
 
         self._set_state("joining")
         context = tls.client_context()
-        if self.relay_mode and self._relay_client is not None:
+        use_relay = bool(
+            self.relay_mode
+            and self._relay_client is not None
+            and (not self.direct_first or self._direct_failed)
+        )
+        if use_relay:
             host, port = "127.0.0.1", self._relay_client.port
+        elif self.direct_first and direct_info is not None:
+            host, port = direct_info.ip, direct_info.port
         else:
             host, port = info.ip, info.port
         try:
-            reader, writer = await asyncio.open_connection(
-                host,
-                port,
-                ssl=context,
-                server_hostname="blendermp",
-                limit=MAX_MESH + HEADER_SIZE,
-            )
+            if self.direct_first and not use_relay:
+                # LAN is preferred; give it a short window before falling back
+                # to the relay so a blocked direct port cannot hang the join.
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        host,
+                        port,
+                        ssl=context,
+                        server_hostname="blendermp",
+                        limit=MAX_MESH + HEADER_SIZE,
+                    ),
+                    3.0,
+                )
+            else:
+                reader, writer = await asyncio.open_connection(
+                    host,
+                    port,
+                    ssl=context,
+                    server_hostname="blendermp",
+                    limit=MAX_MESH + HEADER_SIZE,
+                )
         except (OSError, asyncio.TimeoutError) as exc:
+            if self.direct_first and not use_relay:
+                self._direct_failed = True
             raise RuntimeError(f"cannot reach host: {exc}") from exc
+        self._using_relay = use_relay
+        self.compress_enabled = use_relay
+        compression.set_enabled(use_relay)
 
         actual = tls.peer_fingerprint(writer)
         expected = self.expected_fingerprint or tls.known_fingerprint(control.data_dir(), self.code)
@@ -2781,6 +2818,25 @@ class SessionService:
         self._broadcast(protocol.json_frame(MessageType.LEASE, body))
         self._emit("lease", body)
 
+    def force_lease(self, key: str) -> None:
+        """Host takes an object's lease so its own edit is authoritative."""
+        loop = self._loop
+        if self.is_host and loop and loop.is_running():
+            loop.call_soon_threadsafe(self._force_lease, key)
+
+    def _force_lease(self, key: str) -> None:
+        now = time.monotonic()
+        self._leases.force(key, self.name, now)
+        self._expiry_notified.discard(key)
+        body = {
+            "key": key,
+            "owner": self.name,
+            "action": "force",
+            "leases": self._leases.snapshot(now),
+        }
+        self._broadcast(protocol.json_frame(MessageType.LEASE, body))
+        self._emit("lease", body)
+
     def local_lease(self, key: str, action: str) -> bool:
         """Acquire/release a lease from the host's own Blender."""
         if not self.is_host:
@@ -2847,5 +2903,5 @@ class SessionService:
             "peers": peers,
             "fingerprint": self.fingerprint,
             "port": self.bound_port,
-            "relay": self.relay_mode,
+            "relay": self._using_relay,
         }

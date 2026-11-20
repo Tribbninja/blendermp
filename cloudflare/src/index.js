@@ -267,6 +267,14 @@ export class Hub {
         if (!validId(body.id)) return json({ error: "invalid server id" }, 400);
         const identity = await verifyIdentity(body);
         if (!identity.ok) return json({ error: identity.error }, 400);
+        let directCode = "";
+        if (body.direct_code) {
+          try {
+            directCode = cleanCode(body.direct_code);
+          } catch {
+            directCode = "";
+          }
+        }
         const entry = {
           id: body.id,
           name: cleanText(body.name, 48, true),
@@ -281,6 +289,7 @@ export class Hub {
           caps: cleanInt(body.caps, 0, 0, 2147483647),
           min_app: cleanText(body.min_app, 16, false),
           relay_url: cleanText(body.relay_url, 256, false),
+          direct_code: directCode,
           identity_public: identity.publicKey,
           identity_signature: identity.signature,
           identity_descriptor: identity.descriptor,

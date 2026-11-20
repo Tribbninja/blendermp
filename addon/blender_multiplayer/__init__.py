@@ -66,7 +66,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 8, 5),
+    "version": (0, 8, 7),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -398,6 +398,23 @@ def _local_ip() -> str:
         probe.close()
 
 
+def _same_lan(host_ip: str) -> bool:
+    """True when the host address is on this machine's /24 (typical home LAN)."""
+    try:
+        local = _local_ip()
+    except Exception:  # noqa: BLE001
+        return False
+    if not host_ip or host_ip.startswith("127.") or local.startswith("127."):
+        return False
+    local_parts = local.split(".")
+    host_parts = host_ip.split(".")
+    return (
+        len(local_parts) == 4
+        and len(host_parts) == 4
+        and local_parts[:3] == host_parts[:3]
+    )
+
+
 # --------------------------------------------------------------------------- session control
 def start_host(
     context,
@@ -510,6 +527,8 @@ def start_join(
     code: str,
     relay_url: str | None = None,
     fingerprint: str | None = None,
+    prefer_direct: bool = False,
+    direct_code: str | None = None,
 ) -> None:
     settings = context.window_manager.bmp
     stop_session(context, publish=False)
@@ -531,7 +550,20 @@ def start_join(
         "code": settings.code,
         "relay_url": relay_url or "",
         "fingerprint": fingerprint or "",
+        "prefer_direct": bool(prefer_direct),
+        "direct_code": direct_code or "",
     }
+    direct_first = False
+    if prefer_direct and relay_url and direct_code:
+        # Only attempt direct when the host looks like it is on this /24;
+        # a remote client should go straight to the relay instead of waiting
+        # out a direct-connect timeout.
+        try:
+            from .core.roomcode import decode_room
+
+            direct_first = _same_lan(decode_room(direct_code).ip)
+        except Exception:  # noqa: BLE001
+            direct_first = False
     runtime["session_started"] = time.monotonic()
     runtime["bootstrapping"] = True
     runtime["bootstrap_deadline"] = time.monotonic() + 20.0
@@ -556,6 +588,8 @@ def start_join(
             fingerprint=fingerprint or None,
             pin=settings.pin,
             relay=relay,
+            direct_code=direct_code or None,
+            direct_first=bool(direct_first and relay is not None),
         )
         session.start()
     except Exception:
@@ -2727,6 +2761,8 @@ def _poll_control(context) -> None:
                     code,
                     request.get("relay_url"),
                     request.get("fingerprint"),
+                    bool(request.get("prefer_direct")),
+                    request.get("direct_code"),
                 )
         elif action == "chat":
             text = request.get("text", "")
@@ -4340,7 +4376,14 @@ def _sync_transforms(context) -> None:
         seen.add(uid)
         owner = runtime["lease_owners"].get(uid)
         if owner is not None and owner != settings.name:
-            continue
+            if settings.is_host:
+                # The host is authoritative. Take the lease so the client stops
+                # echoing transforms and the host's own drag is not overwritten.
+                session.force_lease(uid)
+                runtime["lease_owners"][uid] = settings.name
+                runtime["owned_leases"].add(uid)
+            else:
+                continue
         if not settings.is_host and uid not in runtime["owned_leases"]:
             # Only the host broadcasts unleased objects. A client that does
             # not hold the lease must not send idle/echo transforms, or it
@@ -6494,7 +6537,14 @@ class BMP_OT_trust_host(Operator):
         settings.last_error = ""
         settings.last_error_code = ""
         relay_url = last.get("relay_url") or ""
-        start_join(context, code, relay_url or None, pending)
+        start_join(
+            context,
+            code,
+            relay_url or None,
+            pending,
+            bool(last.get("prefer_direct")),
+            last.get("direct_code") or None,
+        )
         self.report({"INFO"}, "Trusted the new host certificate; rejoining")
         return {"FINISHED"}
 

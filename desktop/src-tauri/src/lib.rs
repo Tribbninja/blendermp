@@ -72,6 +72,8 @@ pub(crate) struct SessionRequest {
     relay_url: Option<String>,
     relay_token: Option<String>,
     use_relay: Option<bool>,
+    prefer_direct: Option<bool>,
+    direct_code: Option<String>,
     role: Option<String>,
 }
 
@@ -1296,6 +1298,8 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
         "relay_url": request.relay_url,
         "relay_token": request.relay_token,
         "use_relay": request.use_relay,
+        "prefer_direct": request.prefer_direct,
+        "direct_code": request.direct_code,
         "role": role,
         "nonce": format!("{:x}-{:x}", std::process::id(), stamp),
     });

@@ -201,6 +201,20 @@ def read_session() -> dict[str, Any] | None:
             return None
         result["relay_url"] = relay_url
 
+    prefer_direct = body.get("prefer_direct")
+    if isinstance(prefer_direct, bool):
+        result["prefer_direct"] = prefer_direct
+
+    direct_code = body.get("direct_code")
+    if direct_code is not None:
+        if not isinstance(direct_code, str):
+            return None
+        try:
+            decode_room(normalize(direct_code))
+        except Exception:  # noqa: BLE001
+            return None
+        result["direct_code"] = direct_code.strip().upper()[:32]
+
     relay_token = body.get("relay_token")
     if relay_token is not None:
         if (
