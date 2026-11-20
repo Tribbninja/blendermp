@@ -47,6 +47,7 @@ from bpy_extras.io_utils import ExportHelper
 from . import control, ui
 from .core import chunker
 from .core import accessibility
+from .core import compression
 from .core import asset_bundle
 from .core import bookmarks
 from .core import checkpoints
@@ -65,7 +66,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 8, 4),
+    "version": (0, 8, 5),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -3532,12 +3533,20 @@ MAX_RIG_BYTES = 8 * 1024 * 1024
 
 
 def _pack_floats(values) -> str:
-    return base64.b64encode(zlib.compress(np.asarray(values, dtype=np.float32).tobytes(), 6)).decode("ascii")
+    raw = np.asarray(values, dtype=np.float32).tobytes()
+    if compression.enabled():
+        return "z" + base64.b64encode(zlib.compress(raw, 6)).decode("ascii")
+    return "r" + base64.b64encode(raw).decode("ascii")
 
 
 def _unpack_floats(value: str, count: int):
+    text = str(value)
+    if len(text) < 2 or text[0] not in "zr":
+        return None
     try:
-        raw = zlib.decompress(base64.b64decode(str(value).encode("ascii")))
+        raw = base64.b64decode(text[1:].encode("ascii"))
+        if text[0] == "z":
+            raw = zlib.decompress(raw)
     except (ValueError, TypeError, zlib.error):
         return None
     if len(raw) != count * 4:

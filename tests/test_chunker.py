@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from core import chunker
+from core import chunker, compression
 
 
 def make_positions(count: int, seed: int = 0) -> np.ndarray:
@@ -77,17 +77,58 @@ def test_delta_roundtrip_int16_is_close():
 
 
 def test_validate_delta_rejects_bad_payloads():
-    positions = make_positions(50)
-    scan = chunker.diff_positions(positions, positions + 1.0, epsilon=0.0)
-    payload = chunker.encode_delta(1, scan.indices, scan.values)
-    assert chunker.validate_delta(payload) == (1, scan.count, chunker.MODE_I16)
+    previous = compression.enabled()
+    compression.set_enabled(False)
+    try:
+        positions = make_positions(50)
+        scan = chunker.diff_positions(positions, positions + 1.0, epsilon=0.0)
+        payload = chunker.encode_delta(1, scan.indices, scan.values)
+        assert chunker.validate_delta(payload) == (1, scan.count, chunker.MODE_F32)
 
-    with pytest.raises(ValueError):
-        chunker.validate_delta(payload[:-1])
-    with pytest.raises(ValueError):
-        chunker.validate_delta(b"")
-    with pytest.raises(ValueError):
-        chunker.validate_delta(payload + b"junk")
+        with pytest.raises(ValueError):
+            chunker.validate_delta(payload[:-1])
+        with pytest.raises(ValueError):
+            chunker.validate_delta(b"")
+        with pytest.raises(ValueError):
+            chunker.validate_delta(payload + b"junk")
+    finally:
+        compression.set_enabled(previous)
+
+
+def test_delta_is_lossless_in_both_compression_modes():
+    positions = make_positions(200)
+    changed = positions.copy()
+    changed[list(range(20))] += 0.123456789
+    scan = chunker.diff_positions(positions, changed, epsilon=0.0)
+    previous = compression.enabled()
+    try:
+        compression.set_enabled(False)
+        raw = chunker.encode_delta(4, scan.indices, scan.values)
+        assert chunker.validate_delta(raw)[2] == chunker.MODE_F32
+        _rev, _indices, raw_values = chunker.decode_delta(raw)
+        assert np.array_equal(raw_values, scan.values)
+
+        compression.set_enabled(True)
+        packed = chunker.encode_delta(5, scan.indices, scan.values)
+        assert chunker.validate_delta(packed)[2] == chunker.MODE_F32_ZLIB
+        _rev, _indices, packed_values = chunker.decode_delta(packed)
+        assert np.array_equal(packed_values, scan.values)
+    finally:
+        compression.set_enabled(previous)
+
+
+def test_pack_geometry_respects_the_compression_policy():
+    payload = chunker.GEO_MAGIC + b"x" * 8192
+    previous = compression.enabled()
+    try:
+        compression.set_enabled(False)
+        assert chunker.pack_geometry(payload) == payload
+        compression.set_enabled(True)
+        packed = chunker.pack_geometry(payload)
+        assert packed[:4] == chunker.GEOZ_MAGIC
+        assert chunker.unpack_geometry(packed) == payload
+    finally:
+        compression.set_enabled(previous)
 
 
 def test_positions_snapshot_roundtrip_and_validation():

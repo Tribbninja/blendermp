@@ -18,10 +18,12 @@ from dataclasses import dataclass
 import numpy as np
 
 from .varint import decode_uvarint, encode_uvarint
+from . import compression
 
 CHUNK_VERTS = 8192
 MODE_F32 = 0
 MODE_I16 = 1
+MODE_F32_ZLIB = 2
 _QUANT_MAX = 65535
 
 
@@ -143,8 +145,13 @@ def apply_positions(shadow, indices, values) -> None:
     target[idx] = vals
 
 
-def encode_delta(rev: int, indices, values, mode: int = MODE_I16) -> bytes:
-    """Serialise changed vertices: varint delta indices + float32 or int16 values."""
+def encode_delta(rev: int, indices, values, mode: int = MODE_F32) -> bytes:
+    """Serialise changed vertices losslessly.
+
+    Positions are float32 by default. ``MODE_I16`` exists only to decode old
+    payloads; new deltas never quantise, so a received mesh is exact. Over a
+    relay the float32 block is zlib-compressed, which is still lossless.
+    """
     idx = np.asarray(indices, dtype=np.int64).ravel()
     vals = as_positions(values)
     if idx.size != vals.shape[0]:
@@ -152,13 +159,28 @@ def encode_delta(rev: int, indices, values, mode: int = MODE_I16) -> bytes:
     if idx.size > 1 and np.any(np.diff(idx) < 0):
         raise ValueError("indices must be ascending")
 
-    header = bytearray(struct.pack("<IIB", rev, idx.size, mode))
     if vals.shape[0]:
         base = vals.min(axis=0)
         span = (vals.max(axis=0) - base).astype(np.float32)
     else:
         base = np.zeros(3, np.float32)
         span = np.zeros(3, np.float32)
+
+    wire_mode = mode
+    values_bytes = b""
+    if mode == MODE_F32:
+        values_bytes = np.asarray(vals, dtype="<f4").tobytes()
+        if compression.enabled() and len(values_bytes) > 64:
+            values_bytes = zlib.compress(values_bytes, 6)
+            wire_mode = MODE_F32_ZLIB
+    elif mode == MODE_I16:
+        safe = np.where(span > 0, span, 1.0).astype(np.float32)
+        scaled = np.clip((vals - base) / safe, 0.0, 1.0) * _QUANT_MAX
+        values_bytes = np.rint(scaled).astype("<u2").tobytes()
+    else:
+        raise ValueError(f"unknown delta mode {mode}")
+
+    header = bytearray(struct.pack("<IIB", rev, idx.size, wire_mode))
     header += np.asarray(base, dtype="<f4").tobytes()
     header += np.asarray(span, dtype="<f4").tobytes()
 
@@ -166,16 +188,7 @@ def encode_delta(rev: int, indices, values, mode: int = MODE_I16) -> bytes:
     for index in idx.tolist():
         header += encode_uvarint(index - previous)
         previous = index
-
-    if mode == MODE_F32:
-        header += np.asarray(vals, dtype="<f4").tobytes()
-    elif mode == MODE_I16:
-        safe = np.where(span > 0, span, 1.0).astype(np.float32)
-        scaled = np.clip((vals - base) / safe, 0.0, 1.0) * _QUANT_MAX
-        quantised = np.rint(scaled).astype("<u2")
-        header += quantised.tobytes()
-    else:
-        raise ValueError(f"unknown delta mode {mode}")
+    header += values_bytes
     return bytes(header)
 
 
@@ -204,6 +217,20 @@ def decode_delta(payload: bytes) -> tuple[int, np.ndarray, np.ndarray]:
         if len(payload) < offset + need:
             raise ValueError("delta payload is truncated (f32 values)")
         values = np.frombuffer(payload, dtype="<f4", count=count * 3, offset=offset).astype(np.float32).reshape(-1, 3)
+    elif mode == MODE_F32_ZLIB:
+        decompressor = zlib.decompressobj()
+        try:
+            raw = decompressor.decompress(payload[offset:], count * 12 + 1)
+        except zlib.error as exc:
+            raise ValueError("invalid compressed delta") from exc
+        if (
+            len(raw) != count * 12
+            or decompressor.unconsumed_tail
+            or decompressor.unused_data
+            or not decompressor.eof
+        ):
+            raise ValueError("compressed delta length does not match its header")
+        values = np.frombuffer(raw, dtype="<f4", count=count * 3).astype(np.float32).reshape(-1, 3)
     elif mode == MODE_I16:
         need = count * 6
         if len(payload) < offset + need:
@@ -242,7 +269,7 @@ def validate_delta(payload: bytes, max_vertices: int = 5_000_000) -> tuple[int, 
     rev, count, mode = struct.unpack_from("<IIB", payload, 0)
     if count > max_vertices:
         raise ValueError("delta exceeds the vertex limit")
-    if mode not in (MODE_F32, MODE_I16):
+    if mode not in (MODE_F32, MODE_I16, MODE_F32_ZLIB):
         raise ValueError("unknown delta mode")
     offset = 9 + 24
     if len(payload) < offset:
@@ -255,9 +282,23 @@ def validate_delta(payload: bytes, max_vertices: int = 5_000_000) -> tuple[int, 
         previous += delta
         if previous > max_vertices:
             raise ValueError("delta index exceeds the vertex limit")
-    need = count * (12 if mode == MODE_F32 else 6)
-    if len(payload) != offset + need:
-        raise ValueError("delta payload length does not match its header")
+    if mode == MODE_F32_ZLIB:
+        decompressor = zlib.decompressobj()
+        try:
+            raw = decompressor.decompress(payload[offset:], count * 12 + 1)
+        except zlib.error as exc:
+            raise ValueError("invalid compressed delta") from exc
+        if (
+            len(raw) != count * 12
+            or decompressor.unconsumed_tail
+            or decompressor.unused_data
+            or not decompressor.eof
+        ):
+            raise ValueError("compressed delta length does not match its header")
+    else:
+        need = count * (12 if mode == MODE_F32 else 6)
+        if len(payload) != offset + need:
+            raise ValueError("delta payload length does not match its header")
     return rev, count, mode
 
 
@@ -285,7 +326,13 @@ def is_geometry(payload: bytes) -> bool:
 
 
 def pack_geometry(payload: bytes) -> bytes:
-    """Compress a full geometry snapshot when it is worth the CPU."""
+    """Compress a full geometry snapshot when it is worth the CPU.
+
+    Direct LAN sessions skip this entirely (``compression.enabled()`` is False);
+    relay sessions use zlib, which is lossless.
+    """
+    if not compression.enabled():
+        return payload
     if payload[:4] not in (GEO_MAGIC, GEO2_MAGIC) or len(payload) < 4096:
         return payload
     # Large uploads get the slower/higher ratio pass; small edits stay cheap.

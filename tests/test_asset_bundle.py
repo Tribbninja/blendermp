@@ -72,6 +72,15 @@ def test_bundle_roundtrip():
     assert summary["vertices"] == 3
 
 
+def test_bundle_raw_roundtrip_without_compression():
+    wire = asset_bundle.pack(manifest(), compress=False)
+    assert wire[:4] == asset_bundle.MAGIC_RAW
+    body = asset_bundle.decode(wire)
+    assert body["objects"][0]["meta"]["name"] == "Cube"
+    assert body["images"][0]["data"].startswith(b"\x89PNG")
+    assert body["id"] == asset_bundle.decode(asset_bundle.pack(manifest()))["id"]
+
+
 def test_bundle_id_is_content_addressed_and_target_independent():
     first = asset_bundle.decode(asset_bundle.pack(manifest("bob")))
     second = asset_bundle.decode(asset_bundle.pack(manifest("carol")))

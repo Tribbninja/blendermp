@@ -44,6 +44,7 @@ if __package__:
     from .core import identity
     from .core import material as material_payload
     from .core import object_payload, protocol, tls
+    from .core import compression
     from .core import transfer
     from .core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, ErrorCode, Frame, MessageType
     from .core.roomcode import FLAG_RELAY, decode_room, encode_room, normalize, room_id
@@ -59,6 +60,7 @@ else:  # pragma: no cover - allows importing the module standalone (tests)
     from core import identity
     from core import material as material_payload
     from core import object_payload, protocol, tls
+    from core import compression
     from core import transfer
     from core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, ErrorCode, Frame, MessageType
     from core.roomcode import FLAG_RELAY, decode_room, encode_room, normalize, room_id
@@ -313,6 +315,9 @@ class SessionService:
         elif info is not None and (info.flags & FLAG_RELAY):
             self.relay_addr = (info.ip, info.port)
             self.relay_mode = True
+        # Direct LAN: raw payloads. Relay/cross-network: lossless zlib.
+        self.compress_enabled = bool(self.relay_mode)
+        compression.set_enabled(self.compress_enabled)
         self._relay_host: RelayHostAgent | None = None
         self._relay_client: RelayClientAgent | None = None
 

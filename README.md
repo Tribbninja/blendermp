@@ -65,7 +65,7 @@ surface that cross-process re-parenting causes on some GPUs).
   are sent with a full geometry snapshot (mesh) and appear on the other side,
   respecting the source collection name when it exists; deleting sends a UUID
   tombstone. Imported or duplicated objects with stale/copied IDs are assigned a
-  fresh identity. Large snapshots are zlib-compressed before transfer. Transforms stream at up to 60 Hz on low-latency/LAN links (30 Hz
+  fresh identity. Model data is never quantised: direct LAN sessions send raw payloads, and relay sessions use lossless zlib for geometry, vertex deltas, bundles and images. Transforms stream at up to 60 Hz on low-latency/LAN links (30 Hz
   otherwise) and multiple tracked meshes round-robin at 20 Hz. A LAN-discovered
   host advertises a direct code that bypasses the relay.
 * **Immediate remote application**: received transforms and vertex deltas are
@@ -168,7 +168,7 @@ surface that cross-process re-parenting causes on some GPUs).
   same animated transition. Blender is hidden while arranging and returns to the
   viewport when you press Done or Escape.
 
-The protocol and engine have **169 passing tests**, including a real TLS
+The protocol and engine have **173 passing tests**, including a real TLS
 host/client session, certificate-mismatch rejection, relay chat, password
 rejection and host kick over a multiplexed tunnel, the public directory API, and
 1,000-vertex delta round-trips under loss/reordering. The Cloudflare Worker hub

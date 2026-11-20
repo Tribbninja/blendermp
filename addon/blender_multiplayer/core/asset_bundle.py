@@ -25,8 +25,10 @@ import zlib
 
 from . import image_payload, material as material_payload, object_payload
 from . import chunker
+from . import compression
 
 MAGIC = b"BMB1"
+MAGIC_RAW = b"BMB2"
 HEADER = struct.Struct("<4sI")
 VERSION = 1
 MAX_RAW = 96 * 1024 * 1024
@@ -218,7 +220,9 @@ def content_id(manifest: dict) -> str:
     return hashlib.sha256(raw).hexdigest()[:32]
 
 
-def pack(manifest: dict) -> bytes:
+def pack(manifest: dict, compress: bool | None = None) -> bytes:
+    if compress is None:
+        compress = compression.enabled()
     clean = _clean(manifest)
     clean["id"] = content_id(clean)
     body = _content(clean)
@@ -229,8 +233,13 @@ def pack(manifest: dict) -> bytes:
     raw = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
     if len(raw) > MAX_RAW:
         raise AssetBundleError("bundle exceeds the uncompressed limit")
-    wire = HEADER.pack(MAGIC, len(raw)) + zlib.compress(raw, 9)
-    if len(wire) > MAX_WIRE:
+    if compress:
+        wire = HEADER.pack(MAGIC, len(raw)) + zlib.compress(raw, 9)
+        limit = MAX_WIRE
+    else:
+        wire = HEADER.pack(MAGIC_RAW, len(raw)) + raw
+        limit = MAX_RAW + HEADER.size
+    if len(wire) > limit:
         raise AssetBundleError("bundle exceeds the transfer limit")
     return wire
 
@@ -238,20 +247,25 @@ def pack(manifest: dict) -> bytes:
 def decode(payload: bytes) -> dict:
     if not isinstance(payload, (bytes, bytearray)) or len(payload) < HEADER.size:
         raise AssetBundleError("bundle frame is truncated")
-    if len(payload) > MAX_WIRE:
-        raise AssetBundleError("bundle frame is too large")
     magic, raw_len = HEADER.unpack_from(payload, 0)
-    if magic != MAGIC:
+    if magic not in (MAGIC, MAGIC_RAW):
         raise AssetBundleError("bad bundle magic")
     if raw_len <= 0 or raw_len > MAX_RAW:
         raise AssetBundleError("bundle size is invalid")
-    try:
-        decompressor = zlib.decompressobj()
-        raw = decompressor.decompress(payload[HEADER.size :], raw_len + 1)
-    except zlib.error as exc:
-        raise AssetBundleError("invalid compressed bundle") from exc
-    if len(raw) != raw_len or decompressor.unconsumed_tail or decompressor.unused_data or not decompressor.eof:
-        raise AssetBundleError("bundle length mismatch")
+    if len(payload) > (MAX_RAW + HEADER.size if magic == MAGIC_RAW else MAX_WIRE):
+        raise AssetBundleError("bundle frame is too large")
+    if magic == MAGIC_RAW:
+        raw = bytes(payload[HEADER.size :])
+        if len(raw) != raw_len:
+            raise AssetBundleError("bundle length mismatch")
+    else:
+        try:
+            decompressor = zlib.decompressobj()
+            raw = decompressor.decompress(payload[HEADER.size :], raw_len + 1)
+        except zlib.error as exc:
+            raise AssetBundleError("invalid compressed bundle") from exc
+        if len(raw) != raw_len or decompressor.unconsumed_tail or decompressor.unused_data or not decompressor.eof:
+            raise AssetBundleError("bundle length mismatch")
     try:
         body = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:

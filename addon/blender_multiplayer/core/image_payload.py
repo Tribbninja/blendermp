@@ -12,6 +12,8 @@ import struct
 import re
 import zlib
 
+from . import compression
+
 HEADER = struct.Struct("<HBBI")
 DIGEST_SIZE = 20
 MAX_IMAGE = 32 * 1024 * 1024
@@ -29,7 +31,9 @@ class ImagePayloadError(ValueError):
     pass
 
 
-def encode(name: str, format_hint: str, data: bytes) -> bytes:
+def encode(name: str, format_hint: str, data: bytes, compress: bool | None = None) -> bytes:
+    if compress is None:
+        compress = compression.enabled()
     name = (name or "Image")[:MAX_NAME]
     format_hint = (format_hint or "png").lower().lstrip(".")
     if not FORMAT_RE.match(format_hint) or format_hint not in ALLOWED:
@@ -41,7 +45,7 @@ def encode(name: str, format_hint: str, data: bytes) -> bytes:
     digest = hashlib.sha1(data).digest()
     flags = 0
     wire = data
-    if len(data) > COMPRESS_THRESHOLD:
+    if compress and len(data) > COMPRESS_THRESHOLD:
         packed = zlib.compress(data, 6)
         if len(packed) < len(data):
             wire = packed
