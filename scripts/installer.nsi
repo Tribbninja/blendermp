@@ -8,7 +8,9 @@ Unicode true
 !include "blender-detect.nsh"
 
 !define APPNAME "Blendermp"
+!ifndef VERSION
 !define VERSION "0.1.6"
+!endif
 !define PUBLISHER "Blendermp"
 !define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Blendermp"
 

@@ -15,6 +15,8 @@ fn main() {
                 "focus_blender",
                 "set_blender_visible",
                 "read_status",
+                "read_settings",
+                "write_settings",
                 "startup_flags",
                 "write_session",
                 "log_client",

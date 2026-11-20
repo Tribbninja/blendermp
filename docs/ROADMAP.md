@@ -5,6 +5,12 @@ Baseline: **0.1.6** (public directory, authenticated relay, TLS pinning, scene
 bootstrap, object/transform sync, chunked mesh deltas, live Edit Mode vertex
 streaming, edit leases, viewport presence, display interpolation).
 
+Progress log:
+- [x] 2026-11-20: `version.json` + `scripts/check_version.py` + test; build fails on drift.
+- [x] 2026-11-20: durable `%LOCALAPPDATA%\Blendermp\settings.json`; host key, public toggle and layout survive reinstall; localStorage migrated once.
+- [x] 2026-11-20: CI skeleton for Python tests + version check + JS syntax.
+- [ ] Phase 0: checked-in e2e harness, diagnostics bundle, error codes, perf baseline, crash marker.
+
 Purpose: ship every feature discussed in the roadmap in dependency order,
 without regressing latency or reliability. Each phase has a hard exit gate.
 Do not start the next phase until the gate passes.

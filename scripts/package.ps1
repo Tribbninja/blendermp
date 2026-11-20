@@ -6,12 +6,23 @@
     dist/blender_multiplayer-<version>.zip    installable Blender extension
     dist/blendermp-windows-x64-<version>.zip  app + addon + docs
 #>
-param([string]$Version = "0.1.6")
+param([string]$Version = "")
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $dist = Join-Path $root 'dist'
 $tools = Join-Path $root '.tools'
+
+if (-not $Version) {
+    $Version = (Get-Content (Join-Path $root 'version.json') -Raw | ConvertFrom-Json).version
+}
+if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "invalid version: $Version" }
+
+# Catch a half-finished version bump before building anything.
+$python = Join-Path $root '.venv\Scripts\python.exe'
+if (-not (Test-Path $python)) { $python = 'python' }
+& $python (Join-Path $root 'scripts\check_version.py')
+if ($LASTEXITCODE -ne 0) { throw 'version mismatch; update every version string first' }
 
 $mingw = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Filter gcc.exe -Recurse -ErrorAction SilentlyContinue |
     Where-Object { $_.FullName -match '\\mingw64\\bin\\gcc\.exe$' } | Select-Object -First 1
@@ -66,7 +77,7 @@ if ($makensisPath) {
     Write-Host 'Building installer...' -ForegroundColor Cyan
     Push-Location $root
     try {
-        & $makensisPath 'scripts\installer.nsi' | Out-Host
+        & $makensisPath "/DVERSION=$Version" 'scripts\installer.nsi' | Out-Host
     } finally {
         Pop-Location
     }

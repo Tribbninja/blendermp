@@ -14,6 +14,10 @@
   const LS_KEY = "bmp.slots.v1";
   const DURATION = 240;
 
+  function storeKey() {
+    return LS_KEY.startsWith("bmp.") ? LS_KEY.slice(4) : LS_KEY;
+  }
+
   let slots = { ...DEFAULT_SLOTS };
   let sizes = { left: 300, right: 300, bottom: 220 };
   let tiles = {};
@@ -30,15 +34,27 @@
   let ghost = null;
 
   function save() {
+    const raw = JSON.stringify({ slots, sizes });
+    const shared = window.BMPStore;
+    if (shared) {
+      shared.set(storeKey(), raw);
+      return;
+    }
     try {
-      localStorage.setItem(LS_KEY, JSON.stringify({ slots, sizes }));
+      localStorage.setItem(LS_KEY, raw);
     } catch { /* ignore */ }
   }
 
   function load() {
+    const shared = window.BMPStore;
+    let raw = null;
     try {
-      const raw = localStorage.getItem(LS_KEY);
-      if (!raw) return false;
+      raw = shared ? shared.get(storeKey(), null) : localStorage.getItem(LS_KEY);
+    } catch {
+      raw = null;
+    }
+    if (!raw) return false;
+    try {
       const parsed = JSON.parse(raw);
       if (!parsed || typeof parsed !== "object" || !parsed.slots) return false;
       const next = { ...DEFAULT_SLOTS };

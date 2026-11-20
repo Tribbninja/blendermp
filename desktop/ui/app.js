@@ -41,47 +41,152 @@ function markBridge() {
   document.title = isTauri ? "Blendermp" : "Blendermp (preview)";
 }
 
-const store = {
-  get(key, fallback) {
-    try {
-      const value = localStorage.getItem(`bmp.${key}`);
-      return value === null ? fallback : value;
-    } catch {
-      return fallback;
+const store = (() => {
+  const memory = new Map();
+  let persistTimer = 0;
+  try {
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (key && key.startsWith("bmp.")) {
+        memory.set(key.slice(4), localStorage.getItem(key) || "");
+      }
     }
-  },
-  set(key, value) {
+  } catch {
+    /* localStorage is optional (privacy mode, tests) */
+  }
+  function localSet(key, value) {
     try {
-      localStorage.setItem(`bmp.${key}`, String(value));
+      localStorage.setItem(`bmp.${key}`, value);
     } catch {
       /* ignore */
     }
-  },
-};
+  }
+  function persist() {
+    clearTimeout(persistTimer);
+    persistTimer = 0;
+    if (!isTauri || !store.loaded) return;
+    invoke("write_settings", { settings: store.all() }).catch((error) => {
+      log(`settings write failed: ${error}`);
+    });
+  }
+  function schedule() {
+    if (!store.loaded) return;
+    clearTimeout(persistTimer);
+    persistTimer = setTimeout(persist, 150);
+  }
+  return {
+    loaded: false,
+    get(key, fallback) {
+      if (memory.has(key)) return memory.get(key);
+      let value = null;
+      try {
+        value = localStorage.getItem(`bmp.${key}`);
+      } catch {
+        value = null;
+      }
+      if (value !== null) {
+        memory.set(key, value);
+        return value;
+      }
+      return fallback;
+    },
+    set(key, value) {
+      const text = String(value);
+      memory.set(key, text);
+      localSet(key, text);
+      schedule();
+    },
+    all() {
+      return Object.fromEntries(memory);
+    },
+    hydrate(values) {
+      if (!values || typeof values !== "object" || Array.isArray(values)) return;
+      for (const [key, value] of Object.entries(values)) {
+        if (typeof key !== "string" || !key || key.length > 64) continue;
+        if (typeof value !== "string" || value.length > 8192) continue;
+        memory.set(key, value);
+        localSet(key, value);
+      }
+    },
+    markLoaded() {
+      store.loaded = true;
+    },
+    flush: persist,
+  };
+})();
+
+window.BMPStore = store;
+
+async function loadSettings() {
+  if (!isTauri) {
+    store.markLoaded();
+    return;
+  }
+  let saved = null;
+  try {
+    saved = await invoke("read_settings");
+    if (saved) store.hydrate(saved);
+  } catch (error) {
+    log(`settings read failed: ${error}`);
+  }
+  store.markLoaded();
+  if (!saved) store.flush();
+}
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
 const APP_VERSION = "0.1.6";
-const storedDirectory = store.get("directory", DEFAULT_HUB);
-// Drop the localhost values used while developing the Worker hub; a deployment
-// URL (or a deliberately configured hub) is kept.
-const initialDirectory = /^https?:\/\/(127\.0\.0\.1|localhost):(7101|8787)\/?$/.test(storedDirectory)
-  ? DEFAULT_HUB
-  : storedDirectory;
-if (initialDirectory !== storedDirectory) store.set("directory", initialDirectory);
-
 const settings = {
-  name: store.get("name", `user-${Math.random().toString(36).slice(2, 6)}`),
-  port: Number(store.get("port", 51999)),
-  pin: store.get("pin", ""),
-  serverName: store.get("serverName", ""),
-  public: store.get("public", "1") === "1",
-  directory: initialDirectory,
-  workerRelay: store.get("workerRelay", "1") === "1",
-  relay: store.get("relay", ""),
-  useRelay: store.get("useRelay", "0") === "1",
-  blender: store.get("blender", ""),
-  hostKey: store.get("hostKey", ""),
+  name: "",
+  port: 51999,
+  pin: "",
+  serverName: "",
+  public: true,
+  directory: DEFAULT_HUB,
+  workerRelay: true,
+  relay: "",
+  useRelay: false,
+  blender: "",
+  hostKey: "",
 };
+
+function applyStoredSettings() {
+  const fallbackName = `user-${Math.random().toString(36).slice(2, 6)}`;
+  const storedDirectory = store.get("directory", DEFAULT_HUB);
+  // Drop the localhost values used while developing the Worker hub; a deployment
+  // URL (or a deliberately configured hub) is kept.
+  const directory = /^https?:\/\/(127\.0\.0\.1|localhost):(7101|8787)\/?$/.test(storedDirectory)
+    ? DEFAULT_HUB
+    : storedDirectory;
+  settings.name = String(store.get("name", fallbackName) || fallbackName);
+  settings.port = Math.max(1024, Math.min(65535, Number(store.get("port", 51999)) || 51999));
+  settings.pin = String(store.get("pin", ""));
+  settings.serverName = String(store.get("serverName", ""));
+  settings.public = store.get("public", "1") === "1";
+  settings.directory = directory;
+  settings.workerRelay = store.get("workerRelay", "1") === "1";
+  settings.relay = String(store.get("relay", ""));
+  settings.useRelay = store.get("useRelay", "0") === "1";
+  settings.blender = String(store.get("blender", ""));
+  settings.hostKey = String(store.get("hostKey", ""));
+  if (!settings.hostKey) settings.hostKey = randomHex(32);
+  // Materialise every key so the durable settings file is complete and a
+  // reinstall cannot silently drop the host key or the public toggle.
+  for (const [key, value] of Object.entries({
+    name: settings.name,
+    port: settings.port,
+    pin: settings.pin,
+    serverName: settings.serverName,
+    public: settings.public ? "1" : "0",
+    directory: settings.directory,
+    workerRelay: settings.workerRelay ? "1" : "0",
+    relay: settings.relay,
+    useRelay: settings.useRelay ? "1" : "0",
+    blender: settings.blender,
+    hostKey: settings.hostKey,
+  })) {
+    store.set(key, value);
+  }
+}
 
 function randomHex(bytes) {
   const data = new Uint8Array(bytes);
@@ -93,11 +198,6 @@ function randomHex(bytes) {
     }
   }
   return Array.from(data, (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-if (!settings.hostKey) {
-  settings.hostKey = randomHex(32);
-  store.set("hostKey", settings.hostKey);
 }
 
 const state = {
@@ -166,6 +266,10 @@ async function mockInvoke(command) {
       return "C:\\Program Files\\Blender Foundation\\Blender 5.3\\blender.exe";
     case "read_status":
       return state.demo ? demoStatus : null;
+    case "read_settings":
+      return null;
+    case "write_settings":
+      return null;
     case "launch_blender":
       return 4242;
     case "find_blender_window":
@@ -1268,6 +1372,8 @@ function wire() {
 }
 
 async function boot() {
+  await loadSettings();
+  applyStoredSettings();
   wire();
   window.BMPLayout?.init({
     content: {
@@ -1335,4 +1441,11 @@ async function boot() {
 }
 
 boot();
+window.addEventListener("pagehide", () => {
+  try {
+    store.flush();
+  } catch {
+    /* best effort on shutdown */
+  }
+});
 })();

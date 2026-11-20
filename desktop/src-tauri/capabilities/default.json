@@ -18,6 +18,8 @@
     "allow-focus-blender",
     "allow-set-blender-visible",
     "allow-read-status",
+    "allow-read-settings",
+    "allow-write-settings",
     "allow-startup-flags",
     "allow-write-session",
     "allow-log-client"

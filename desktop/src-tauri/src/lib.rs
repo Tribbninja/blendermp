@@ -11,6 +11,7 @@ use tauri::{Manager, State};
 
 const APP_DIR: &str = "Blendermp";
 const MAX_STATUS_BYTES: u64 = 64 * 1024;
+const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
 const CROCKFORD: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 fn read_text_shared(path: &Path) -> Option<String> {
@@ -525,6 +526,47 @@ fn read_status(state: State<AppState>) -> Option<serde_json::Value> {
 }
 
 #[tauri::command]
+fn read_settings() -> Option<serde_json::Value> {
+    let path = data_dir().join("settings.json");
+    let metadata = fs::metadata(&path).ok()?;
+    if metadata.len() > MAX_SETTINGS_BYTES {
+        return None;
+    }
+    let body = read_text_shared(&path)?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    Some(value)
+}
+
+#[tauri::command]
+fn write_settings(settings: serde_json::Value) -> Result<(), String> {
+    if !settings.is_object() {
+        return Err("settings must be an object".into());
+    }
+    let body = serde_json::to_string(&settings).map_err(|error| error.to_string())?;
+    if body.len() as u64 > MAX_SETTINGS_BYTES {
+        return Err("settings are too large".into());
+    }
+    let directory = data_dir();
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let path = directory.join("settings.json");
+    let temp = directory.join("settings.json.tmp");
+    {
+        use std::io::Write;
+        let mut file = fs::File::create(&temp).map_err(|error| error.to_string())?;
+        file.write_all(body.as_bytes()).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+    }
+    if path.exists() {
+        fs::remove_file(&path).map_err(|error| error.to_string())?;
+    }
+    fs::rename(&temp, &path).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 fn log_client(message: String) {
     let dir = data_dir();
     if fs::create_dir_all(&dir).is_err() {
@@ -738,6 +780,8 @@ pub fn run() {
             set_blender_visible,
             focus_blender,
             read_status,
+            read_settings,
+            write_settings,
             log_client,
             startup_flags,
             write_session
