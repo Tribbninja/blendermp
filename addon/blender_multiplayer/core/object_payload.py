@@ -12,8 +12,8 @@ import struct
 import uuid as uuidlib
 
 HEADER = struct.Struct("<16sBII")
-MAX_META = 8 * 1024 * 1024
-MAX_GEOMETRY = 48 * 1024 * 1024
+MAX_META = 16 * 1024 * 1024
+MAX_GEOMETRY = 256 * 1024 * 1024
 
 KIND_EMPTY = 0
 KIND_MESH = 1

@@ -57,6 +57,16 @@ group2 = mesh_obj.vertex_groups.new(name="Bone2")
 group1.add(list(range(4)), 1.0, "REPLACE")
 group2.add(list(range(4, 8)), 1.0, "REPLACE")
 
+second_uv = mesh_obj.data.uv_layers.new(name="Second")
+for index, item in enumerate(second_uv.data):
+    item.uv = (index * 0.01, 0.5)
+mesh_obj.data.uv_layers.active_index = 1
+
+bpy.ops.object.empty_add(location=(5, 0, 0))
+driver_empty = context.active_object
+driver_empty.name = "DriverEmpty"
+driver_empty.driver_add("location", 0).driver.expression = "frame * 0.1"
+
 basis = mesh_obj.shape_key_add(name="Basis", from_mix=False)
 smile = mesh_obj.shape_key_add(name="Smile", from_mix=False)
 for index, point in enumerate(smile.data):
@@ -78,6 +88,17 @@ try:
     rig.animation_data.action_slot = slot
 except Exception:
     pass
+
+nla_action = bpy.data.actions.new("NlaAction")
+nla_bag = bmp._action_channelbag(nla_action, rig)
+nla_curve = nla_bag.fcurves.new(data_path="location", index=0)
+nla_curve.keyframe_points.add(2)
+nla_curve.keyframe_points[0].co = (1.0, 0.0)
+nla_curve.keyframe_points[1].co = (12.0, 2.0)
+nla_track = rig.animation_data.nla_tracks.new()
+nla_track.name = "Track1"
+nla_strip = nla_track.strips.new("Strip1", 1, nla_action)
+nla_strip.frame_end = 12.0
 
 bpy.ops.object.select_all(action="DESELECT")
 

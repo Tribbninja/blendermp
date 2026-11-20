@@ -60,6 +60,9 @@ Check (($client.materials -join ',') -match 'BundleMat') "materials: $($client.m
 Check (($client.images -join ',') -match 'BundleTex') "images: $($client.images -join ',')"
 Check (($client.messages -join '|') -match 'sent .* object') 'client did not see the bundle notice'
 Check ([math]::Abs([double]$client.bookmark_distance - 42.0) -le 0.1) "bookmark distance was '$($client.bookmark_distance)'"
+Check ($client.instance_type -eq 'COLLECTION') "instance type was '$($client.instance_type)'"
+Check ($client.instance_collection -eq 'InstancedSet') "instance collection was '$($client.instance_collection)'"
+Check (($client.instance_objects -join ',') -match 'InstCube') "instance objects: $($client.instance_objects -join ',')"
 if ($null -ne $hostResult) {
     Check (($hostResult.messages -join '|') -match 'Sent .* object') 'host did not confirm the send'
 }

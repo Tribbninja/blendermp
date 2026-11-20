@@ -125,6 +125,15 @@ The desktop app drives the addon through two JSON files in
 * **View bookmarks.** Incoming pushes are sanitized (finite matrix, bounded
   aspect/distance, known perspective mode) and only a host/admin may broadcast
   one. A client can turn off pushed views locally.
+* **Chunked transfers.** Chunks carry a content-derived transfer id, index/count
+  and total size; the receiver caps transfers at 256 MB/20M vertices, rejects
+  out-of-range or mismatched chunks, and expires partials after five minutes.
+  The host reassembles and validates an object payload before relaying it.
+* **Import fidelity data.** UV layers, NLA actions, collection references and
+  drivers are size/type bounded. Drivers are applied only when the expression is
+  a safe arithmetic/math subset (no attribute access, quotes, brackets or
+  unknown identifiers). Collection-instance imports create local collections and
+  never execute embedded code.
 * **Invite links.** The installer registers `blender://` and `blendermp://` URL
   handlers for the current user. The app validates the code before writing a
   pending invite, forwards it to the already-running instance, and joins only

@@ -44,6 +44,7 @@ if __package__:
     from .core import identity
     from .core import material as material_payload
     from .core import object_payload, protocol, tls
+    from .core import transfer
     from .core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, ErrorCode, Frame, MessageType
     from .core.roomcode import FLAG_RELAY, decode_room, encode_room, room_id
     from .core.version import ADDON_VERSION, compatible
@@ -58,6 +59,7 @@ else:  # pragma: no cover - allows importing the module standalone (tests)
     from core import identity
     from core import material as material_payload
     from core import object_payload, protocol, tls
+    from core import transfer
     from core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, ErrorCode, Frame, MessageType
     from core.roomcode import FLAG_RELAY, decode_room, encode_room, room_id
     from core.version import ADDON_VERSION, compatible
@@ -67,7 +69,8 @@ else:  # pragma: no cover - allows importing the module standalone (tests)
 RESUME_TTL = 120.0
 MAX_CONTROL = 64 * 1024
 MAX_MESH = 64 * 1024 * 1024
-MAX_VERTICES = 5_000_000
+CHUNK_THRESHOLD = 32 * 1024 * 1024
+MAX_VERTICES = 20_000_000
 MAX_CHAT = 2_000
 MAX_NAME = 48
 MAX_TEXT = 256
@@ -87,6 +90,7 @@ MUTATING_TYPES = {
     MessageType.MATERIAL_UPDATE,
     MessageType.MODIFIER_STACK,
     MessageType.IMAGE_ASSET,
+    MessageType.CHUNK,
 }
 BULK_TYPES = {
     MessageType.OBJECT_CREATE,
@@ -95,6 +99,7 @@ BULK_TYPES = {
     MessageType.ACTION,
     MessageType.BULK,
     MessageType.ASSET_BUNDLE,
+    MessageType.CHUNK,
 }
 
 
@@ -342,6 +347,7 @@ class SessionService:
         self._rtt_ms = 0.0
         self._last_ping = 0.0
         self._last_host_ping = 0.0
+        self._incoming = transfer.Reassembler()
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -618,7 +624,9 @@ class SessionService:
         # Large one-shot structural payloads (models, mesh snapshots, images)
         # must not be charged per 4 KB or they exceed the burst bucket and are
         # silently dropped. Keep a modest cap so a flood is still rate-limited.
-        if frame.type in BULK_TYPES:
+        if frame.type == MessageType.CHUNK:
+            cost = 4.0
+        elif frame.type in BULK_TYPES:
             cost = min(64.0, 1.0 + len(frame.payload) / 1_000_000.0)
         else:
             cost = 1.0 + len(frame.payload) / 4096.0
@@ -922,18 +930,23 @@ class SessionService:
             return
 
         if frame.type == MessageType.ACTION:
-            body = self._json(frame, 1024 * 1024)
+            body = self._json(frame, 16 * 1024 * 1024)
             try:
                 uid = str(uuidlib.UUID(str(body.get("uuid"))))
             except ValueError as exc:
                 raise Violation("invalid action object id") from exc
             action = body.get("action")
+            nla = body.get("nla")
             if action is not None and not isinstance(action, dict):
                 raise Violation("invalid action payload")
+            if nla is not None and not isinstance(nla, dict):
+                raise Violation("invalid NLA payload")
             if not self._may_edit(peer, uid, now):
                 return
             self.bump_rev(uid)
             message = {"uuid": uid, "action": action}
+            if "nla" in body:
+                message["nla"] = nla
             self._broadcast(protocol.json_frame(MessageType.ACTION, message), exclude=peer.peer_id)
             self._emit("action", message)
             return
@@ -1032,6 +1045,60 @@ class SessionService:
             message = {"name": peer.name, "color": list(peer.color), "pos": values}
             self._broadcast(protocol.json_frame(MessageType.PING_MARK, message), exclude=peer.peer_id)
             self._emit("ping_mark", message)
+            return
+
+        if frame.type == MessageType.CHUNK:
+            try:
+                result, progress = self._incoming.add(peer.name, frame.payload)
+            except transfer.TransferError as exc:
+                raise Violation(str(exc)) from exc
+            self._emit("transfer_progress", {**progress, "direction": "receive", "sender": peer.name})
+            if result is None:
+                return
+            if result.get("kind") != transfer.KIND_OBJECT:
+                raise Violation("unsupported chunked transfer kind")
+            try:
+                body = object_payload.decode_create(result["data"])
+            except object_payload.ObjectPayloadError as exc:
+                raise Violation(str(exc)) from exc
+            meta = body["meta"]
+            matrix = meta.get("matrix")
+            if not isinstance(matrix, list) or len(matrix) != 16:
+                raise Violation("object create needs a transform")
+            values = [float(v) for v in matrix]
+            if not all(math.isfinite(v) and abs(v) < 1e12 for v in values):
+                raise Violation("object transform is invalid")
+            meta["matrix"] = values
+            meta["name"] = clean_name(meta.get("name"), "Object")
+            geometry = body["geometry"]
+            if body["kind"] == object_payload.KIND_MESH and geometry:
+                from .core import chunker
+
+                try:
+                    chunker.validate_geometry(geometry, MAX_VERTICES)
+                except ValueError as exc:
+                    raise Violation(str(exc)) from exc
+            elif geometry:
+                raise Violation("only mesh objects may carry geometry")
+            self._emit("transfer_done", {"direction": "receive", "sender": peer.name, "id": progress.get("id")})
+            try:
+                _identity, chunks = transfer.split(result["data"], transfer.KIND_OBJECT)
+            except transfer.TransferError as exc:
+                raise Violation(str(exc)) from exc
+            for chunk in chunks:
+                self._broadcast(
+                    Frame(type=MessageType.CHUNK, channel=Channel.BULK, payload=chunk),
+                    exclude=peer.peer_id,
+                )
+            self._emit("object_create", body)
+            eventlog.log(
+                "info",
+                "CHUNKED_OBJECT",
+                "chunked object relayed",
+                sender=peer.name,
+                bytes=len(result["data"]),
+                chunks=len(chunks),
+            )
             return
 
         if frame.type == MessageType.OBJECT_CREATE:
@@ -2040,7 +2107,7 @@ class SessionService:
             return
 
         if frame.type == MessageType.ACTION:
-            body = self._json(frame, 1024 * 1024)
+            body = self._json(frame, 16 * 1024 * 1024)
             self._emit("action", body)
             return
 
@@ -2142,6 +2209,24 @@ class SessionService:
                 )
             return
 
+        if frame.type == MessageType.CHUNK:
+            try:
+                result, progress = self._incoming.add("host", frame.payload)
+            except transfer.TransferError:
+                return
+            self._emit("transfer_progress", {**progress, "direction": "receive", "sender": "host"})
+            if result is None:
+                return
+            if result.get("kind") != transfer.KIND_OBJECT:
+                return
+            try:
+                body = object_payload.decode_create(result["data"])
+            except object_payload.ObjectPayloadError:
+                return
+            self._emit("transfer_done", {"direction": "receive", "sender": "host", "id": progress.get("id")})
+            self._emit("object_create", body)
+            return
+
         if frame.type == MessageType.OBJECT_CREATE:
             try:
                 self._emit("object_create", object_payload.decode_create(frame.payload))
@@ -2204,7 +2289,7 @@ class SessionService:
             return
 
         if frame.type == MessageType.RESUME:
-            body = self._json(frame, 4 * 1024 * 1024)
+            body = self._json(frame, 16 * 1024 * 1024)
             objects = body.get("objects")
             if isinstance(objects, list):
                 self._emit("resume_state", {"objects": [str(item) for item in objects[:100000]]})
@@ -2241,7 +2326,16 @@ class SessionService:
                     elif self._writer:
                         data = protocol.encode(frame)
                         if self._writer.transport.get_write_buffer_size() > 4 * 1024 * 1024:
-                            continue  # drop rather than buffer unboundedly
+                            if frame.type not in {
+                                MessageType.CHUNK,
+                                MessageType.OBJECT_CREATE,
+                                MessageType.MESH_SNAPSHOT,
+                                MessageType.IMAGE_ASSET,
+                                MessageType.ASSET_BUNDLE,
+                                MessageType.ACTION,
+                            }:
+                                continue  # drop stale non-structural frames
+                            await self._writer.drain()
                         self._writer.write(data)
                         await self._writer.drain()
                         self._bytes_out += len(data)
@@ -2307,6 +2401,10 @@ class SessionService:
                             },
                         )
                     )
+
+            expired = self._incoming.sweep(time.monotonic())
+            if expired:
+                self._emit("transfer_expired", {"count": expired})
 
     # ------------------------------------------------------------------ public API
     def _send_targeted(self, name: str, frame: Frame, manifest: dict | None = None) -> None:
@@ -2523,12 +2621,13 @@ class SessionService:
             return
         self._enqueue(frame)
 
-    def send_action(self, uid: str, action: dict | None) -> None:
+    def send_action(self, uid: str, action: dict | None, nla: dict | None = None) -> None:
         try:
-            frame = protocol.json_frame(MessageType.ACTION, {"uuid": uid, "action": action})
+            body = {"uuid": uid, "action": action, "nla": nla}
+            frame = protocol.json_frame(MessageType.ACTION, body)
         except Exception:  # noqa: BLE001
             return
-        if len(frame.payload) > 1024 * 1024:
+        if len(frame.payload) > 16 * 1024 * 1024:
             return
         self._enqueue(Frame(type=MessageType.ACTION, channel=Channel.BULK, payload=frame.payload))
 
@@ -2562,8 +2661,31 @@ class SessionService:
             payload = object_payload.encode_create(uid, kind, meta, geometry)
         except object_payload.ObjectPayloadError:
             return False
-        if len(payload) > MAX_MESH:
+        if len(payload) > transfer.MAX_TRANSFER:
             return False
+        if len(payload) > CHUNK_THRESHOLD:
+            try:
+                identity, chunks = transfer.split(payload, transfer.KIND_OBJECT)
+            except transfer.TransferError:
+                return False
+            total = len(chunks)
+            for index, chunk in enumerate(chunks):
+                self._enqueue(Frame(type=MessageType.CHUNK, channel=Channel.BULK, payload=chunk))
+                self._emit(
+                    "transfer_progress",
+                    {
+                        "id": identity.hex(),
+                        "kind": transfer.KIND_OBJECT,
+                        "direction": "send",
+                        "received": index + 1,
+                        "total": total,
+                        "bytes": min(len(payload), (index + 1) * transfer.CHUNK_SIZE),
+                        "total_bytes": len(payload),
+                        "percent": round((index + 1) * 100.0 / max(1, total), 1),
+                    },
+                )
+            self._emit("transfer_done", {"direction": "send", "id": identity.hex()})
+            return True
         self._enqueue(Frame(type=MessageType.OBJECT_CREATE, channel=Channel.MESH, payload=payload))
         return True
 

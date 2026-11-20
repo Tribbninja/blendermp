@@ -51,7 +51,7 @@ def test_armature_create_roundtrip():
     assert body["meta"]["bones"][0]["name"] == "Root"
 
 
-def test_create_rejects_bad_input():
+def test_create_rejects_bad_input(monkeypatch):
     uid = "12345678-1234-5678-1234-567812345678"
     with pytest.raises(object_payload.ObjectPayloadError):
         object_payload.encode_create(uid, 99, {"name": "x"})
@@ -59,8 +59,9 @@ def test_create_rejects_bad_input():
         object_payload.encode_create("not-a-uuid", object_payload.KIND_EMPTY, {})
     with pytest.raises(object_payload.ObjectPayloadError):
         object_payload.encode_create(uid, object_payload.KIND_EMPTY, {"pad": "x" * (object_payload.MAX_META + 1)})
+    monkeypatch.setattr(object_payload, "MAX_GEOMETRY", 1024)
     with pytest.raises(object_payload.ObjectPayloadError):
-        object_payload.encode_create(uid, object_payload.KIND_MESH, {}, b"x" * (object_payload.MAX_GEOMETRY + 1))
+        object_payload.encode_create(uid, object_payload.KIND_MESH, {}, b"x" * 1025)
 
 
 def test_decode_truncated_and_trailing():

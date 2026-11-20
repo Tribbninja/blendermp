@@ -122,6 +122,13 @@ surface that cross-process re-parenting causes on some GPUs).
 * **Large uploads**: images over 10 MB are zlib-compressed before transfer when
   that reduces size, and large mesh geometry snapshots use the higher-ratio
   compression pass. Image payloads are capped at 32 MB and frames at 64 MB.
+* **Chunked large-object transfer**: object creation payloads above 32 MB are
+  split into 8 MB chunks with deterministic content hashes, progress events and
+  partial-transfer retention. Retried transfers fill missing chunks instead of
+  restarting. The same path works host-to-client and client-to-host.
+* **Import fidelity**: all mesh UV layers (not just the active one), object and
+  armature NLA tracks/strips with their actions, safe object-transform drivers,
+  collection instances with their instanced objects, and curve/text objects.
 * **Send selection**: package selected objects plus their materials and images
   into a content-addressed bundle, send it to one teammate, preview the summary,
   and import it with fresh object IDs. Bundles are validated and re-packed by the
@@ -151,7 +158,7 @@ surface that cross-process re-parenting causes on some GPUs).
   same animated transition. Blender is hidden while arranging and returns to the
   viewport when you press Done or Escape.
 
-The protocol and engine have **149 passing tests**, including a real TLS
+The protocol and engine have **156 passing tests**, including a real TLS
 host/client session, certificate-mismatch rejection, relay chat, password
 rejection and host kick over a multiplexed tunnel, the public directory API, and
 1,000-vertex delta round-trips under loss/reordering. The Cloudflare Worker hub
@@ -342,13 +349,13 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   (`run_material.ps1`), object details (`run_details.ps1`), live topology
   (`run_topology.ps1`), resume/journal (`run_resume.ps1`), checkpoint restore
   (`run_checkpoint.ps1`), scoped undo (`run_undo.ps1`), armature/pose/action/
-  shape keys (`run_animation.ps1`), sculpt (`run_sculpt.ps1`) and collaboration bundles/bookmarks (`run_collab.ps1`);
-  `run_all.ps1` runs all nine.
+  shape keys (`run_animation.ps1`), sculpt (`run_sculpt.ps1`), collaboration bundles/bookmarks (`run_collab.ps1`) and chunked large-object transfer (`run_chunk.ps1`);
+  `run_all.ps1` runs all ten.
 * Headless `bench/bench_mesh.py` records read/delta/topology/material timings in
   `bench/baseline.json`.
 * The production Worker relay was exercised with the host key: no token and a
   wrong token are rejected, a valid host tunnel and client join succeed.
-* `pytest`: 149 passed.
+* `pytest`: 156 passed.
 
 ## Limitations
 
@@ -373,22 +380,29 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   other unsafe shader nodes are skipped rather than approximated; the rest of a
   material graph still applies. Compositor nodes, simulations and linked
   libraries are not replicated yet.
-* Action sync covers the active action's F-curves/keyframes, not the full NLA
-  library. Shape-key values and coordinates sync; drivers are not replicated.
+* Action sync covers the active action plus NLA tracks/strips and their actions.
+  Shape-key values and coordinates sync. Object-transform drivers are replicated
+  only when their expression is a safe arithmetic/math subset; other drivers are
+  skipped.
 * Constraint sync covers type/name/influence/target/subtarget, not every
   constraint-specific property.
 * Multires sculpt is not supported; dyntopo sends full topology snapshots,
   which are heavier than plain position deltas.
 * Modifier sync covers the common parameter set; unsupported modifier types only
   replicate type/name/visibility.
-* New objects are replicated for meshes, empties, cameras and lights; curve and
-  font data is carried for objects created elsewhere but curve/font creation is
-  not detected locally.
+* New objects are replicated for meshes, empties, cameras, lights, curves and
+  text. Collection-instance contents are included in bundles; normal scene sync
+  only references collections that already exist on the receiver.
+* Chunked transfers are capped at 256 MB per object and 20M vertices. Partial
+  transfers survive for five minutes and a retried send resumes, but an
+  interrupted transfer is not automatically requested after reconnect.
 * Scoped undo currently covers object transforms. Offline journaling covers
   transforms plus the active object's mesh and materials; background objects
   with offline mesh/material edits are not journaled.
 * Checkpoint files use zip (`.bmpz`) rather than zstd, and the automatic
-  interval/retention are fixed at 10 minutes and three files.
+  interval/retention are fixed at 10 minutes and three files. The scene JSON is
+  capped at 64 MB, so very large scenes may exceed the checkpoint limit even
+  though live transfer supports larger objects.
 * Signed directory verification is implemented in `cloudflare/src/index.js`;
   the public Worker must be redeployed for it to take effect. LAN/self-hosted
   directories store the signature but do not verify it.

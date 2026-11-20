@@ -274,32 +274,35 @@ def validate_positions(payload: bytes, max_vertices: int = 5_000_000) -> tuple[i
 # --------------------------------------------------------------------------- geometry
 GEO_MAGIC = b"GEO1"
 GEOZ_MAGIC = b"GZ01"
+GEO2_MAGIC = b"GEO2"
+GEOZ2_MAGIC = b"GZ02"
 GEO_HEADER = struct.Struct("<4s6I")
-MAX_GEO_BYTES = 128 * 1024 * 1024
+MAX_GEO_BYTES = 256 * 1024 * 1024
 
 
 def is_geometry(payload: bytes) -> bool:
-    return payload[:4] in (GEO_MAGIC, GEOZ_MAGIC)
+    return payload[:4] in (GEO_MAGIC, GEOZ_MAGIC, GEO2_MAGIC, GEOZ2_MAGIC)
 
 
 def pack_geometry(payload: bytes) -> bytes:
     """Compress a full geometry snapshot when it is worth the CPU."""
-    if payload[:4] != GEO_MAGIC or len(payload) < 4096:
+    if payload[:4] not in (GEO_MAGIC, GEO2_MAGIC) or len(payload) < 4096:
         return payload
     # Large uploads get the slower/higher ratio pass; small edits stay cheap.
     level = 9 if len(payload) > 10 * 1024 * 1024 else 6
-    return GEOZ_MAGIC + zlib.compress(payload, level)
+    magic = GEOZ2_MAGIC if payload[:4] == GEO2_MAGIC else GEOZ_MAGIC
+    return magic + zlib.compress(payload, level)
 
 
 def unpack_geometry(payload: bytes) -> bytes:
-    if payload[:4] != GEOZ_MAGIC:
+    if payload[:4] not in (GEOZ_MAGIC, GEOZ2_MAGIC):
         return payload
     try:
         decompressor = zlib.decompressobj()
         data = decompressor.decompress(payload[4:], MAX_GEO_BYTES + 1)
     except zlib.error as exc:
         raise ValueError("invalid compressed geometry") from exc
-    if len(data) > MAX_GEO_BYTES or decompressor.unconsumed_tail:
+    if len(data) > MAX_GEO_BYTES or decompressor.unconsumed_tail or decompressor.unused_data:
         raise ValueError("compressed geometry is too large")
     return data
 
@@ -361,22 +364,97 @@ def encode_geometry(
     return bytes(payload)
 
 
+def encode_geometry_layers(
+    positions,
+    edges,
+    loops,
+    loop_starts,
+    loop_totals,
+    smooth,
+    materials,
+    uv_layers,
+    active_uv: int = 0,
+) -> bytes:
+    """Full mesh snapshot with every UV layer, in GEO2 format."""
+    positions = as_positions(positions)
+    edges = np.asarray(edges, dtype=np.uint32).ravel()
+    loops = np.asarray(loops, dtype=np.uint32).ravel()
+    starts = np.asarray(loop_starts, dtype=np.uint32).ravel()
+    totals = np.asarray(loop_totals, dtype=np.uint32).ravel()
+    smooth = np.asarray(smooth, dtype=np.uint8).ravel()
+    materials = np.asarray(materials, dtype=np.uint32).ravel()
+    nv, ne, nl, npoly = positions.shape[0], edges.size // 2, loops.size, starts.size
+    if totals.size != npoly or smooth.size != npoly or materials.size != npoly:
+        raise ValueError("polygon arrays must have the same length")
+    if edges.size % 2:
+        raise ValueError("edge array must contain pairs")
+    if edges.size and int(edges.max()) >= nv:
+        raise ValueError("edge references a vertex outside the mesh")
+    if loops.size and int(loops.max()) >= nv:
+        raise ValueError("loop references a vertex outside the mesh")
+    if int(totals.sum()) != nl:
+        raise ValueError("polygon loop totals do not match the loop count")
+    if not isinstance(uv_layers, (list, tuple)) or len(uv_layers) > 16:
+        raise ValueError("invalid UV layer list")
+    clean_layers = []
+    for item in uv_layers:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError("invalid UV layer")
+        name, uvs = item
+        name = str(name or "UVMap")[:64].encode("utf-8")
+        values = np.asarray(uvs, dtype=np.float32)
+        if values.size != nl * 2:
+            raise ValueError("UV array must have two values per loop")
+        clean_layers.append((name, values.ravel()))
+    if not clean_layers:
+        raise ValueError("GEO2 needs at least one UV layer")
+    active = max(0, min(len(clean_layers) - 1, int(active_uv)))
+    header = GEO_HEADER.pack(GEO2_MAGIC, nv, ne, nl, npoly, npoly, len(clean_layers))
+    payload = bytearray(header)
+    payload += struct.pack("<H", active)
+    for name, values in clean_layers:
+        payload += struct.pack("<H", len(name)) + name
+        payload += values.astype("<f4").tobytes()
+    payload += np.asarray(positions, dtype="<f4").tobytes()
+    payload += edges.astype("<u4").tobytes()
+    payload += loops.astype("<u4").tobytes()
+    payload += starts.astype("<u4").tobytes()
+    payload += totals.astype("<u4").tobytes()
+    payload += smooth.astype("u1").tobytes()
+    payload += materials.astype("<u4").tobytes()
+    return bytes(payload)
+
+
 def decode_geometry(payload: bytes) -> dict:
     payload = unpack_geometry(payload)
     if len(payload) < GEO_HEADER.size:
         raise ValueError("geometry payload is truncated")
-    magic, nv, ne, nl, npoly, npoly2, has_uv = GEO_HEADER.unpack_from(payload, 0)
-    if magic != GEO_MAGIC or npoly != npoly2:
+    magic, nv, ne, nl, npoly, npoly2, extra = GEO_HEADER.unpack_from(payload, 0)
+    if magic not in (GEO_MAGIC, GEO2_MAGIC) or npoly != npoly2:
         raise ValueError("invalid geometry header")
     offset = GEO_HEADER.size
-    if len(payload) < offset + 2:
-        raise ValueError("geometry payload is missing the UV name")
-    (name_len,) = struct.unpack_from("<H", payload, offset)
-    offset += 2
-    if name_len > 64 or len(payload) < offset + name_len:
-        raise ValueError("invalid UV layer name")
-    uv_name = payload[offset : offset + name_len].decode("utf-8", "replace")
-    offset += name_len
+    uv_layers = []
+    active_uv = 0
+    uv_name = ""
+    uvs = np.zeros(0, dtype=np.float32)
+    if magic == GEO_MAGIC:
+        if len(payload) < offset + 2:
+            raise ValueError("geometry payload is missing the UV name")
+        (name_len,) = struct.unpack_from("<H", payload, offset)
+        offset += 2
+        if name_len > 64 or len(payload) < offset + name_len:
+            raise ValueError("invalid UV layer name")
+        uv_name = payload[offset : offset + name_len].decode("utf-8", "replace")
+        offset += name_len
+        has_uv = 1 if extra else 0
+    else:
+        if len(payload) < offset + 2:
+            raise ValueError("geometry payload is missing the UV header")
+        (active_uv,) = struct.unpack_from("<H", payload, offset)
+        offset += 2
+        if extra == 0 or extra > 16:
+            raise ValueError("invalid UV layer count")
+        has_uv = 0
 
     def take(count, dtype):
         nonlocal offset
@@ -387,6 +465,22 @@ def decode_geometry(payload: bytes) -> dict:
         offset += size
         return value
 
+    if magic == GEO2_MAGIC:
+        for _ in range(extra):
+            if len(payload) < offset + 2:
+                raise ValueError("UV layer is truncated")
+            (name_len,) = struct.unpack_from("<H", payload, offset)
+            offset += 2
+            if name_len > 64 or len(payload) < offset + name_len:
+                raise ValueError("invalid UV layer name")
+            name = payload[offset : offset + name_len].decode("utf-8", "replace")
+            offset += name_len
+            layer_uvs = take(nl * 2, "<f4").reshape(-1, 2)
+            uv_layers.append((name, layer_uvs))
+        active_uv = max(0, min(len(uv_layers) - 1, int(active_uv)))
+        uv_name = uv_layers[active_uv][0] if uv_layers else ""
+        uvs = uv_layers[active_uv][1].ravel() if uv_layers else np.zeros(0, dtype=np.float32)
+
     positions = take(nv * 3, "<f4").reshape(-1, 3)
     edges = take(ne * 2, "<u4").reshape(-1, 2)
     loops = take(nl, "<u4")
@@ -394,7 +488,11 @@ def decode_geometry(payload: bytes) -> dict:
     totals = take(npoly, "<u4")
     smooth = take(npoly, "u1")
     materials = take(npoly, "<u4")
-    uvs = take(nl * 2, "<f4") if has_uv else np.zeros(0, dtype=np.float32)
+    if magic == GEO_MAGIC and has_uv:
+        uvs = take(nl * 2, "<f4")
+        if uv_name:
+            uv_layers = [(uv_name, uvs.reshape(-1, 2))]
+            active_uv = 0
     if offset != len(payload):
         raise ValueError("geometry payload has trailing bytes")
     return {
@@ -407,6 +505,8 @@ def decode_geometry(payload: bytes) -> dict:
         "materials": materials,
         "uv_name": uv_name,
         "uvs": uvs.reshape(-1, 2),
+        "uv_layers": uv_layers,
+        "uv_active": active_uv,
     }
 
 

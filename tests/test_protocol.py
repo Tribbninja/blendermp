@@ -69,5 +69,6 @@ def test_unknown_type_is_still_decodable():
 def test_collaboration_message_ids_are_stable():
     assert MessageType.VIEW_BOOKMARK == 42
     assert MessageType.ASSET_BUNDLE == 43
+    assert MessageType.CHUNK == 45
     assert int(MessageType.SUBSCRIPTION) == 36
     assert int(MessageType.CLIENT_STATS) == 37

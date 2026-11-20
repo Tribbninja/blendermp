@@ -26,7 +26,7 @@ from enum import IntEnum, IntFlag, StrEnum
 from typing import Any
 
 MAGIC = b"BMP1"
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 HEADER = struct.Struct("<4sBBBBIII")
 HEADER_SIZE = HEADER.size  # 20 bytes
 MAX_PAYLOAD = 64 * 1024 * 1024
@@ -47,6 +47,7 @@ class Capability(IntFlag):
     INTEREST = 1 << 9
     BOOKMARKS = 1 << 10
     ASSET_BUNDLE = 1 << 11
+    CHUNKED_TRANSFER = 1 << 12
 
 
 class ErrorCode(StrEnum):
@@ -79,6 +80,7 @@ DEFAULT_CAPABILITIES = int(
     | Capability.INTEREST
     | Capability.BOOKMARKS
     | Capability.ASSET_BUNDLE
+    | Capability.CHUNKED_TRANSFER
 )
 
 
@@ -119,6 +121,7 @@ class MessageType(IntEnum):
     CLIENT_STATS = 37
     VIEW_BOOKMARK = 42
     ASSET_BUNDLE = 43
+    CHUNK = 45
 
 
 class Channel(IntEnum):

@@ -49,6 +49,25 @@ def summary():
     action = rig.animation_data.action if rig.animation_data else None
     curves = bmp._action_fcurves(action) if action else []
     bone = rig.pose.bones.get("Bone2")
+    driver_empty = bpy.data.objects.get("DriverEmpty")
+    drivers = []
+    if driver_empty is not None and driver_empty.animation_data is not None:
+        drivers = [
+            (curve.data_path, curve.array_index, curve.driver.expression)
+            for curve in driver_empty.animation_data.drivers
+        ]
+    nla = []
+    if rig.animation_data is not None:
+        nla = [
+            (
+                track.name,
+                [
+                    (strip.name, strip.action.name if strip.action else None)
+                    for strip in track.strips
+                ],
+            )
+            for track in rig.animation_data.nla_tracks
+        ]
     return {
         "bones": sorted(bone.name for bone in rig.data.bones),
         "modifier_target": modifier.object.name if modifier and modifier.object else None,
@@ -59,6 +78,10 @@ def summary():
         "curves": len(curves),
         "points": len(curves[0].keyframe_points) if curves else 0,
         "quat": [round(float(value), 3) for value in bone.rotation_quaternion] if bone else None,
+        "uv_layers": [layer.name for layer in mesh_obj.data.uv_layers],
+        "uv_active": mesh_obj.data.uv_layers.active_index,
+        "drivers": drivers,
+        "nla": nla,
         "mode": context.mode,
     }
 

@@ -3,7 +3,7 @@ import os
 import random
 import struct
 
-from core import chunker, image_payload, material, object_payload, protocol
+from core import chunker, image_payload, material, object_payload, protocol, transfer
 
 
 def test_random_binary_decoders_do_not_crash():
@@ -18,6 +18,7 @@ def test_random_binary_decoders_do_not_crash():
             chunker.unpack_geometry,
             image_payload.decode,
             object_payload.decode_create,
+            transfer.decode_chunk,
         ):
             try:
                 decoder(payload)
@@ -42,7 +43,7 @@ def test_material_sanitize_survives_random_json():
 
 
 def test_protocol_rejects_bad_headers():
-    assert protocol.PROTOCOL_VERSION >= 2
+    assert protocol.PROTOCOL_VERSION == 3
     for payload in (b"", b"BMP1", b"X" * 20, struct.pack("<4sBBBBIII", b"BMP1", 9, 1, 0, 0, 0, 0, 0)):
         try:
             protocol.decode(payload)

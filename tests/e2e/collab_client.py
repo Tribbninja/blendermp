@@ -45,6 +45,7 @@ def view_distance():
 
 def finish(reason):
     asset = bpy.data.objects.get("BundleAsset")
+    instance = bpy.data.objects.get("BundleInstance")
     data = {
         "reason": reason,
         "state": wm.bmp.state,
@@ -55,6 +56,18 @@ def finish(reason):
         "materials": [material.name for material in bpy.data.materials if material.name.startswith("Bundle")],
         "images": [image.name for image in bpy.data.images if image.name.startswith("Bundle")],
         "bookmark_distance": globals().get("bookmark_distance"),
+        "instance": instance.name if instance is not None else None,
+        "instance_type": getattr(instance, "instance_type", None) if instance is not None else None,
+        "instance_collection": (
+            instance.instance_collection.name
+            if instance is not None and getattr(instance, "instance_collection", None) is not None
+            else None
+        ),
+        "instance_objects": (
+            sorted(item.name for item in instance.instance_collection.all_objects)
+            if instance is not None and getattr(instance, "instance_collection", None) is not None
+            else []
+        ),
         "messages": [message.text for message in wm.bmp.messages][-20:],
     }
     with open(result_path, "w", encoding="utf-8") as handle:

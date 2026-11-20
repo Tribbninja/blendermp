@@ -163,6 +163,11 @@ class BMP_PT_main(bpy.types.Panel):
             dismiss = row.operator("bmp.bundle_dismiss", text="Dismiss", icon="X")
             dismiss.bundle = settings.bundle_id
 
+        if settings.transfer_active:
+            transfer = layout.box()
+            transfer.label(text=settings.transfer_info[:150], icon="IMPORT")
+            transfer.label(text=f"{settings.transfer_percent:.0f}%")
+
         if settings.state != "offline":
             box = layout.box()
             box.label(text="Chat", icon="OUTLINER_OB_FONT")

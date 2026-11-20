@@ -134,9 +134,9 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.6.0";
-const PROTOCOL_VERSION = 2;
-const CAPABILITIES = 1 | (1 << 10) | (1 << 11); // presence + bookmarks + asset bundles
+const APP_VERSION = "0.7.0";
+const PROTOCOL_VERSION = 3;
+const CAPABILITIES = 1 | (1 << 10) | (1 << 11) | (1 << 12); // presence, bookmarks, bundles, chunks
 const settings = {
   name: "",
   port: 51999,

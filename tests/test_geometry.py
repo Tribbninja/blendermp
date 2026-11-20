@@ -73,3 +73,29 @@ def test_geometry_rejects_inconsistent_shapes():
         chunker.encode_geometry(
             positions, edges, loops, starts, totals, smooth, materials, "UVMap", np.zeros((2, 2), np.float32)
         )
+
+
+def test_multi_uv_geometry_roundtrip():
+    positions, edges, loops, starts, totals, smooth, materials, uvs = sample()
+    second = uvs * 0.5
+    payload = chunker.encode_geometry_layers(
+        positions,
+        edges,
+        loops,
+        starts,
+        totals,
+        smooth,
+        materials,
+        [("UVMap", uvs), ("Second", second)],
+        active_uv=1,
+    )
+    geometry = chunker.decode_geometry(payload)
+    assert geometry["uv_active"] == 1
+    assert [name for name, _values in geometry["uv_layers"]] == ["UVMap", "Second"]
+    assert np.array_equal(geometry["uv_layers"][0][1], uvs)
+    assert np.array_equal(geometry["uv_layers"][1][1], second)
+    assert np.array_equal(geometry["uvs"], second)
+    assert geometry["uv_name"] == "Second"
+    packed = chunker.pack_geometry(payload)
+    assert packed[:4] in (chunker.GEO2_MAGIC, chunker.GEOZ2_MAGIC)
+    assert chunker.validate_geometry(packed) == (4, 4, 6, 2)

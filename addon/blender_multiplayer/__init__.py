@@ -64,7 +64,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 6, 0),
+    "version": (0, 7, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -208,6 +208,7 @@ runtime: dict = {
     "bundle_offers": {},
     "bundle_imported": set(),
     "bundle_sent": {},
+    "transfer_clear_at": 0.0,
     "last_mesh": 0.0,
     "last_edit": 0.0,
     "mesh_cursor": 0,
@@ -328,6 +329,9 @@ class BMPState(PropertyGroup):
     bundle_info: StringProperty()
     bundle_sender: StringProperty()
     bundle_id: StringProperty()
+    transfer_active: BoolProperty(default=False)
+    transfer_info: StringProperty()
+    transfer_percent: FloatProperty(default=0.0, min=0.0, max=100.0)
 
 
 def state(context) -> BMPState:
@@ -610,6 +614,10 @@ def stop_session(context, publish: bool = True) -> None:
     settings.bundle_info = ""
     settings.bundle_sender = ""
     settings.bundle_id = ""
+    settings.transfer_active = False
+    settings.transfer_percent = 0.0
+    settings.transfer_info = ""
+    runtime["transfer_clear_at"] = 0.0
     runtime["edit_lease_uid"] = None
     runtime["last_edit"] = 0.0
     settings.rtt_ms = 0
@@ -936,6 +944,29 @@ def _handle_event(context, kind: str, body: dict) -> None:
             "system",
             f"Sent {body.get('objects', 0)} object(s) to {target or 'teammate'}",
         )
+    elif kind == "transfer_progress":
+        direction = str(body.get("direction", "receive"))
+        percent = float(body.get("percent", 0.0) or 0.0)
+        total_bytes = float(body.get("total_bytes", 0) or 0)
+        sent_bytes = float(body.get("bytes", 0) or 0)
+        settings.transfer_active = True
+        settings.transfer_percent = max(0.0, min(100.0, percent))
+        verb = "Sending" if direction == "send" else "Receiving"
+        settings.transfer_info = (
+            f"{verb} large object: {percent:.0f}% "
+            f"({sent_bytes / 1048576:.1f} / {total_bytes / 1048576:.1f} MB)"
+        )
+    elif kind == "transfer_done":
+        settings.transfer_percent = 100.0
+        runtime["transfer_clear_at"] = time.monotonic() + 2.0
+    elif kind == "transfer_expired":
+        count = int(body.get("count", 0) or 0)
+        if count:
+            _push_message(context, "system", "A partial large-object transfer expired")
+        if not runtime.get("transfer_clear_at"):
+            settings.transfer_active = False
+            settings.transfer_percent = 0.0
+            settings.transfer_info = ""
     elif kind == "image_asset":
         _apply_image(context, body)
     elif kind == "modifier_stack":
@@ -1557,9 +1588,7 @@ def _clear_action_curves(action, obj) -> None:
         pass
 
 
-def _action_snapshot(obj) -> dict | None:
-    animation = getattr(obj, "animation_data", None)
-    action = getattr(animation, "action", None) if animation is not None else None
+def _action_data(action) -> dict | None:
     if action is None:
         return None
     curves = []
@@ -1593,6 +1622,12 @@ def _action_snapshot(obj) -> dict | None:
         "range": [float(value) for value in action.frame_range],
         "curves": curves,
     }
+
+
+def _action_snapshot(obj) -> dict | None:
+    animation = getattr(obj, "animation_data", None)
+    action = getattr(animation, "action", None) if animation is not None else None
+    return _action_data(action)
 
 
 def _sync_pose(context) -> None:
@@ -1733,39 +1768,31 @@ def _sync_actions(context) -> None:
         return
     runtime["last_action"] = now
     for obj in context.scene.objects:
-        if obj.type != "ARMATURE" or not (uid := obj.get("bmp_uuid")):
+        if not (uid := obj.get("bmp_uuid")):
             continue
         owner = runtime["lease_owners"].get(uid)
         if owner is not None and owner != settings.name:
             continue
-        snapshot = _action_snapshot(obj)
+        has_animation = getattr(obj, "animation_data", None) is not None
+        if not has_animation and obj.type != "ARMATURE" and uid not in runtime["action_shadow"]:
+            continue
+        action = _action_snapshot(obj)
+        nla = _nla_snapshot(obj)
+        snapshot = {"action": action, "nla": nla}
         signature = json.dumps(snapshot, sort_keys=True, default=str)
         if runtime["action_shadow"].get(uid) == signature:
             continue
+        if not settings.is_host and uid not in runtime["owned_leases"]:
+            runtime["action_shadow"][uid] = signature
+            continue
         runtime["action_shadow"][uid] = signature
         _note_rev(uid)
-        session.send_action(uid, snapshot)
+        session.send_action(uid, action, nla)
 
 
-def _apply_action(context, body: dict) -> None:
-    obj = obj_sync.find(body.get("uuid"))
-    snapshot = body.get("action")
-    if obj is None or obj.type != "ARMATURE":
-        return
-    uid = obj.get("bmp_uuid")
-    if snapshot is None:
-        animation = getattr(obj, "animation_data", None)
-        if animation is not None:
-            animation.action = None
-        if uid:
-            runtime["action_shadow"][uid] = "null"
-        return
+def _write_action_data(action, snapshot: dict, obj) -> bool:
     if not isinstance(snapshot, dict):
-        return
-    name = str(snapshot.get("name", "Action"))[:64] or "Action"
-    action = bpy.data.actions.get(name)
-    if action is None:
-        action = bpy.data.actions.new(name)
+        return False
     try:
         _clear_action_curves(action, obj)
         channelbag = _action_channelbag(action, obj)
@@ -1791,6 +1818,41 @@ def _apply_action(context, body: dict) -> None:
                     target.handle_left = (float(item[2]), float(item[3]))
                     target.handle_right = (float(item[4]), float(item[5]))
                     target.interpolation = str(item[6])[:16]
+        return True
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        traceback.print_exc()
+        return False
+
+
+def _apply_action(context, body: dict) -> None:
+    obj = obj_sync.find(body.get("uuid"))
+    snapshot = body.get("action")
+    if obj is None:
+        return
+    uid = obj.get("bmp_uuid")
+    has_nla = "nla" in body
+    nla = body.get("nla")
+    if snapshot is None:
+        animation = getattr(obj, "animation_data", None)
+        if animation is not None:
+            animation.action = None
+        if has_nla:
+            if isinstance(nla, dict):
+                _apply_nla(obj, nla)
+            else:
+                _clear_nla(obj)
+        if uid:
+            runtime["action_shadow"][uid] = json.dumps(
+                {"action": None, "nla": nla if has_nla else None}, sort_keys=True, default=str
+            )
+        return
+    if not isinstance(snapshot, dict):
+        return
+    name = str(snapshot.get("name", "Action"))[:64] or "Action"
+    action = bpy.data.actions.get(name)
+    if action is None:
+        action = bpy.data.actions.new(name)
+    if _write_action_data(action, snapshot, obj):
         animation = obj.animation_data_create()
         animation.action = action
         if hasattr(animation, "action_slot") and len(action.slots):
@@ -1798,9 +1860,123 @@ def _apply_action(context, body: dict) -> None:
                 animation.action_slot = action.slots[0]
             except (AttributeError, TypeError, RuntimeError):
                 pass
+        if nla is not None:
+            _apply_nla(obj, nla)
+        elif has_nla:
+            _clear_nla(obj)
         if uid:
-            runtime["action_shadow"][uid] = json.dumps(snapshot, sort_keys=True, default=str)
-    except (AttributeError, TypeError, ValueError, RuntimeError):
+            runtime["action_shadow"][uid] = json.dumps(
+                {"action": snapshot, "nla": nla if has_nla else None}, sort_keys=True, default=str
+            )
+
+
+def _nla_snapshot(obj) -> dict | None:
+    animation = getattr(obj, "animation_data", None)
+    tracks = getattr(animation, "nla_tracks", None) if animation is not None else None
+    if not tracks:
+        return None
+    result = []
+    for track in list(tracks)[:16]:
+        strips = []
+        for strip in list(getattr(track, "strips", []))[:32]:
+            item = {
+                "name": str(getattr(strip, "name", "Strip"))[:64],
+                "frame_start": float(getattr(strip, "frame_start", 0.0)),
+                "frame_end": float(getattr(strip, "frame_end", 0.0)),
+                "action_frame_start": float(getattr(strip, "action_frame_start", 0.0)),
+                "action_frame_end": float(getattr(strip, "action_frame_end", 0.0)),
+                "repeat": float(getattr(strip, "repeat", 1.0)),
+                "scale": float(getattr(strip, "scale", 1.0)),
+                "blend_type": str(getattr(strip, "blend_type", "REPLACE"))[:16],
+                "extrapolation": str(getattr(strip, "extrapolation", "HOLD"))[:16],
+                "influence": float(getattr(strip, "influence", 1.0)),
+                "mute": bool(getattr(strip, "mute", False)),
+                "use_auto_blend": bool(getattr(strip, "use_auto_blend", False)),
+                "use_sync_length": bool(getattr(strip, "use_sync_length", False)),
+            }
+            action = getattr(strip, "action", None)
+            if action is not None:
+                data = _action_data(action)
+                if data is not None:
+                    item["action"] = data
+            strips.append(item)
+        result.append(
+            {
+                "name": str(getattr(track, "name", "Track"))[:64],
+                "mute": bool(getattr(track, "mute", False)),
+                "is_solo": bool(getattr(track, "is_solo", False)),
+                "strips": strips,
+            }
+        )
+    return {"tracks": result} if result else None
+
+
+def _clear_nla(obj) -> None:
+    animation = getattr(obj, "animation_data", None)
+    if animation is None:
+        return
+    try:
+        for track in list(animation.nla_tracks):
+            animation.nla_tracks.remove(track)
+    except (AttributeError, TypeError, RuntimeError):
+        pass
+
+
+def _apply_nla(obj, snapshot) -> None:
+    if not isinstance(snapshot, dict):
+        return
+    tracks = snapshot.get("tracks")
+    if not isinstance(tracks, list):
+        return
+    try:
+        animation = obj.animation_data_create()
+        for track in list(animation.nla_tracks):
+            animation.nla_tracks.remove(track)
+        for track_spec in tracks[:16]:
+            if not isinstance(track_spec, dict):
+                continue
+            track = animation.nla_tracks.new()
+            track.name = str(track_spec.get("name", "Track"))[:64] or "Track"
+            track.mute = bool(track_spec.get("mute", False))
+            try:
+                track.is_solo = bool(track_spec.get("is_solo", False))
+            except (AttributeError, TypeError, RuntimeError):
+                pass
+            for strip_spec in (track_spec.get("strips") or [])[:32]:
+                if not isinstance(strip_spec, dict):
+                    continue
+                action_spec = strip_spec.get("action")
+                action = None
+                if isinstance(action_spec, dict):
+                    name = str(action_spec.get("name", "Action"))[:64] or "Action"
+                    action = bpy.data.actions.get(name)
+                    if action is None:
+                        action = bpy.data.actions.new(name)
+                    _write_action_data(action, action_spec, obj)
+                if action is None:
+                    continue
+                try:
+                    start = int(round(float(strip_spec.get("frame_start", 0.0))))
+                    strip = track.strips.new(str(strip_spec.get("name", "Strip"))[:64], start, action)
+                    strip.action_frame_start = float(strip_spec.get("action_frame_start", 0.0))
+                    strip.action_frame_end = float(strip_spec.get("action_frame_end", 0.0))
+                    strip.repeat = max(0.01, min(1000.0, float(strip_spec.get("repeat", 1.0))))
+                    strip.scale = max(0.01, min(1000.0, float(strip_spec.get("scale", 1.0))))
+                    strip.blend_type = str(strip_spec.get("blend_type", "REPLACE"))[:16]
+                    strip.extrapolation = str(strip_spec.get("extrapolation", "HOLD"))[:16]
+                    strip.influence = max(0.0, min(1.0, float(strip_spec.get("influence", 1.0))))
+                    strip.mute = bool(strip_spec.get("mute", False))
+                    strip.use_auto_blend = bool(strip_spec.get("use_auto_blend", False))
+                    strip.use_sync_length = bool(strip_spec.get("use_sync_length", False))
+                    strip.frame_end = float(strip_spec.get("frame_end", strip.frame_end))
+                    if hasattr(strip, "action_slot") and len(action.slots):
+                        try:
+                            strip.action_slot = action.slots[0]
+                        except (AttributeError, TypeError, RuntimeError):
+                            pass
+                except (AttributeError, TypeError, ValueError, RuntimeError):
+                    traceback.print_exc()
+    except (AttributeError, TypeError, RuntimeError):
         traceback.print_exc()
 
 
@@ -2557,6 +2733,10 @@ def _object_kind(obj) -> int:
         return object_payload.KIND_LIGHT
     if obj.type == "ARMATURE":
         return object_payload.KIND_ARMATURE
+    if obj.type == "CURVE":
+        return object_payload.KIND_CURVE
+    if obj.type == "FONT":
+        return object_payload.KIND_FONT
     return object_payload.KIND_EMPTY
 
 
@@ -3445,6 +3625,202 @@ def _apply_mesh_rig(obj, meta: dict) -> None:
         traceback.print_exc()
 
 
+DRIVER_PATHS = {
+    "location",
+    "rotation_euler",
+    "rotation_quaternion",
+    "rotation_axis_angle",
+    "scale",
+    "delta_location",
+    "delta_rotation_euler",
+    "delta_rotation_quaternion",
+    "delta_scale",
+}
+DRIVER_FUNCTIONS = {
+    "frame",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "atan2",
+    "sqrt",
+    "pow",
+    "abs",
+    "min",
+    "max",
+    "floor",
+    "ceil",
+    "round",
+    "pi",
+    "e",
+    "radians",
+    "degrees",
+    "fmod",
+}
+DRIVER_CHARS = set("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_+-*/().,%<>=!&|?: ")
+SINGLE_PROP_PATHS = {
+    "location",
+    "rotation_euler",
+    "rotation_quaternion",
+    "scale",
+    "dimensions",
+    "delta_location",
+    "delta_rotation_euler",
+    "delta_scale",
+}
+
+
+def _safe_single_prop_path(value: str) -> str | None:
+    value = str(value or "")[:64]
+    match = re.fullmatch(r"([a-z_]+)(?:\[([0-3])\])?", value)
+    if not match or match.group(1) not in SINGLE_PROP_PATHS:
+        return None
+    return value
+
+
+def _safe_driver_expression(expression: str, names: set[str]) -> str | None:
+    if not isinstance(expression, str):
+        return None
+    expression = expression.strip()
+    if not expression or len(expression) > 200:
+        return None
+    if "__" in expression or any(ch not in DRIVER_CHARS for ch in expression):
+        return None
+    for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expression):
+        if token not in names and token not in DRIVER_FUNCTIONS:
+            return None
+    return expression
+
+
+def _driver_snapshot(obj) -> list:
+    animation = getattr(obj, "animation_data", None)
+    drivers = getattr(animation, "drivers", None) if animation is not None else None
+    if not drivers:
+        return []
+    result = []
+    for curve in list(drivers)[:16]:
+        path = str(getattr(curve, "data_path", ""))[:64]
+        if path not in DRIVER_PATHS:
+            continue
+        driver = getattr(curve, "driver", None)
+        if driver is None:
+            continue
+        names = {str(var.name)[:64] for var in getattr(driver, "variables", [])[:16]}
+        expression = str(getattr(driver, "expression", ""))
+        driver_type = str(getattr(driver, "type", "SCRIPTED"))[:16]
+        if driver_type == "SCRIPTED":
+            expression = _safe_driver_expression(expression, names)
+            if expression is None:
+                continue
+        variables = []
+        for var in getattr(driver, "variables", [])[:16]:
+            item = {"name": str(var.name)[:64], "type": str(var.type)[:16]}
+            targets = getattr(var, "targets", [])
+            target = targets[0] if len(targets) else None
+            if target is None:
+                continue
+            if var.type == "SINGLE_PROP":
+                target_id = getattr(target, "id", None)
+                uid = target_id.get("bmp_uuid") if target_id is not None else None
+                data_path = str(getattr(target, "data_path", ""))[:64]
+                safe_path = _safe_single_prop_path(data_path)
+                if not uid or safe_path is None:
+                    continue
+                item["id"] = uid
+                item["data_path"] = safe_path
+            elif var.type == "TRANSFORMS":
+                target_id = getattr(target, "id", None)
+                uid = target_id.get("bmp_uuid") if target_id is not None else None
+                if not uid:
+                    continue
+                item["id"] = uid
+                item["bone_target"] = str(getattr(target, "bone_target", ""))[:64]
+                item["transform_type"] = str(getattr(target, "transform_type", "LOC_X"))[:32]
+                item["transform_space"] = str(getattr(target, "transform_space", "WORLD_SPACE"))[:32]
+            else:
+                continue
+            variables.append(item)
+        result.append(
+            {
+                "path": path,
+                "index": int(getattr(curve, "array_index", 0)),
+                "type": driver_type,
+                "expression": expression[:200],
+                "variables": variables,
+            }
+        )
+    return result
+
+
+def _apply_drivers(obj, specs) -> None:
+    if not isinstance(specs, list) or not specs:
+        return
+    try:
+        animation = obj.animation_data_create()
+        for curve in list(animation.drivers):
+            try:
+                animation.drivers.remove(curve)
+            except (TypeError, RuntimeError):
+                pass
+        for spec in specs[:16]:
+            if not isinstance(spec, dict):
+                continue
+            path = str(spec.get("path", ""))[:64]
+            index = spec.get("index")
+            if path not in DRIVER_PATHS or not isinstance(index, int) or isinstance(index, bool):
+                continue
+            driver_type = str(spec.get("type", "SCRIPTED"))[:16]
+            if driver_type not in {"SCRIPTED", "AVERAGE", "SUM", "MIN", "MAX"}:
+                continue
+            names = {
+                str(item.get("name", ""))[:64]
+                for item in (spec.get("variables") or [])[:16]
+                if isinstance(item, dict)
+            }
+            expression = ""
+            if driver_type == "SCRIPTED":
+                expression = _safe_driver_expression(str(spec.get("expression", "")), names)
+                if expression is None:
+                    continue
+            try:
+                limit = 3 if path in {"rotation_quaternion", "rotation_axis_angle", "delta_rotation_quaternion"} else 2
+                curve = obj.driver_add(path, max(0, min(limit, index)))
+                driver = curve.driver
+                driver.type = driver_type
+                if driver_type == "SCRIPTED":
+                    driver.expression = expression
+                for item in (spec.get("variables") or [])[:16]:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name", ""))[:64]
+                    var_type = str(item.get("type", ""))[:16]
+                    if not name or var_type not in {"SINGLE_PROP", "TRANSFORMS"}:
+                        continue
+                    target = obj_sync.find(str(item.get("id", "")))
+                    if target is None:
+                        continue
+                    var = driver.variables.new()
+                    var.name = name
+                    var.type = var_type
+                    target_spec = var.targets[0]
+                    target_spec.id_type = "OBJECT"
+                    target_spec.id = target
+                    if var_type == "SINGLE_PROP":
+                        data_path = _safe_single_prop_path(str(item.get("data_path", "")))
+                        if data_path:
+                            target_spec.data_path = data_path
+                    else:
+                        target_spec.bone_target = str(item.get("bone_target", ""))[:64]
+                        target_spec.transform_type = str(item.get("transform_type", "LOC_X"))[:32]
+                        target_spec.transform_space = str(item.get("transform_space", "WORLD_SPACE"))[:32]
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                traceback.print_exc()
+    except (AttributeError, TypeError, RuntimeError):
+        traceback.print_exc()
+
+
 def _object_create_payload(obj) -> dict:
     uid = obj.get("bmp_uuid") or str(uuid.uuid4())
     obj["bmp_uuid"] = uid
@@ -3504,9 +3880,27 @@ def _object_create_payload(obj) -> dict:
         meta["color"] = list(obj.data.color)[:3]
     elif kind == object_payload.KIND_ARMATURE:
         meta["bones"] = _armature_bones(obj)
-        action = _action_snapshot(obj)
-        if action is not None:
-            meta["action"] = action
+    elif kind == object_payload.KIND_CURVE:
+        meta["dimensions"] = str(getattr(obj.data, "dimensions", "3D"))[:8]
+    elif kind == object_payload.KIND_FONT:
+        meta["body"] = str(getattr(obj.data, "body", ""))[:512]
+        meta["size"] = float(getattr(obj.data, "size", 1.0))
+        meta["align_x"] = str(getattr(obj.data, "align_x", "LEFT"))[:16]
+        meta["align_y"] = str(getattr(obj.data, "align_y", "TOP_BASELINE"))[:16]
+    action = _action_snapshot(obj)
+    if action is not None:
+        meta["action"] = action
+    nla = _nla_snapshot(obj)
+    if nla is not None:
+        meta["nla"] = nla
+    drivers = _driver_snapshot(obj)
+    if drivers:
+        meta["drivers"] = drivers
+    if getattr(obj, "instance_type", "NONE") == "COLLECTION":
+        collection = getattr(obj, "instance_collection", None)
+        if collection is not None:
+            meta["instance_type"] = "COLLECTION"
+            meta["instance_collection"] = collection.name[:64]
     if kind == object_payload.KIND_MESH:
         try:
             groups, shapes = _mesh_rig_payload(obj)
@@ -3716,8 +4110,24 @@ def _apply_object_create(context, body: dict) -> None:
             slot = item.get("slot")
             if isinstance(slot, int) and 0 <= slot <= 255:
                 _apply_material(context, {"uuid": uid, "slot": slot, "material": item})
-    if obj.type == "ARMATURE" and isinstance(meta.get("action"), dict):
-        _apply_action(context, {"uuid": uid, "action": meta.get("action")})
+    if isinstance(meta.get("action"), dict) or isinstance(meta.get("nla"), dict):
+        _apply_action(
+            context,
+            {
+                "uuid": uid,
+                "action": meta.get("action"),
+                "nla": meta.get("nla"),
+            },
+        )
+    _apply_drivers(obj, meta.get("drivers"))
+    if meta.get("instance_type") == "COLLECTION":
+        collection = bpy.data.collections.get(str(meta.get("instance_collection", "")))
+        if collection is not None:
+            try:
+                obj.instance_type = "COLLECTION"
+                obj.instance_collection = collection
+            except (AttributeError, TypeError, RuntimeError):
+                pass
 
 
 def _apply_object_delete(context, body: dict) -> None:
@@ -4289,7 +4699,7 @@ def _apply_bookmark(context, bookmark: dict) -> bool:
 
 
 # --------------------------------------------------------------------------- asset bundles
-BUNDLE_TYPES = {"MESH", "CAMERA", "LIGHT", "ARMATURE", "EMPTY"}
+BUNDLE_TYPES = {"MESH", "CAMERA", "LIGHT", "ARMATURE", "EMPTY", "CURVE", "FONT"}
 
 
 def _bundle_objects(context) -> list:
@@ -4322,6 +4732,13 @@ def _bundle_objects(context) -> list:
             target = getattr(constraint, "target", None)
             if target is not None:
                 queue.append(target)
+        if getattr(obj, "instance_type", "NONE") == "COLLECTION":
+            collection = getattr(obj, "instance_collection", None)
+            if collection is not None:
+                try:
+                    queue.extend(list(collection.all_objects))
+                except (AttributeError, TypeError, RuntimeError):
+                    pass
     result.sort(key=_parent_depth)
     return result
 
@@ -4329,6 +4746,9 @@ def _bundle_objects(context) -> list:
 def _bundle_manifest(context, objects) -> dict:
     payloads = []
     images = {}
+    for obj in objects[: asset_bundle.MAX_OBJECTS]:
+        if not obj.get("bmp_uuid"):
+            obj["bmp_uuid"] = str(uuid.uuid4())
     for obj in objects[: asset_bundle.MAX_OBJECTS]:
         try:
             body = _object_create_payload(obj)
@@ -4412,6 +4832,17 @@ def _remap_bundle_meta(meta: dict, mapping: dict, image_names: dict) -> dict:
                 item["target"] = mapping.get(target)
                 if item["target"] is None:
                     item.pop("target", None)
+    for spec in result.get("drivers") or []:
+        if not isinstance(spec, dict):
+            continue
+        for item in spec.get("variables") or []:
+            if not isinstance(item, dict):
+                continue
+            target = item.get("id")
+            if isinstance(target, str):
+                item["id"] = mapping.get(target)
+                if item["id"] is None:
+                    item.pop("id", None)
     return result
 
 
@@ -4492,6 +4923,22 @@ def _import_bundle(context, manifest: dict) -> int:
         obj = obj_sync.find(new_uid)
         if obj is not None:
             imported.append(obj)
+
+    for item in ordered:
+        meta = item.get("meta") or {}
+        obj = obj_sync.find(mapping.get(str(item.get("uid"))))
+        if obj is None:
+            continue
+        if meta.get("instance_type") == "COLLECTION":
+            collection = bpy.data.collections.get(str(meta.get("instance_collection", "")))
+            if collection is not None:
+                try:
+                    obj.instance_type = "COLLECTION"
+                    obj.instance_collection = collection
+                except (AttributeError, TypeError, RuntimeError):
+                    pass
+        if meta.get("drivers"):
+            _apply_drivers(obj, meta.get("drivers"))
 
     if not imported:
         _push_message(context, "system", "The bundle could not be imported")
@@ -5470,6 +5917,12 @@ def bmp_tick():
         _update_timing(session)
         inbox = runtime["inbox"]
         _expire_pings(context)
+        if runtime.get("transfer_clear_at") and time.monotonic() > runtime["transfer_clear_at"]:
+            runtime["transfer_clear_at"] = 0.0
+            settings = context.window_manager.bmp
+            settings.transfer_active = False
+            settings.transfer_percent = 0.0
+            settings.transfer_info = ""
         while True:
             try:
                 kind, body = inbox.get_nowait()
@@ -6366,7 +6819,7 @@ def export_diagnostics(context, filepath: str) -> dict:
     versions = {
         "addon": ADDON_VERSION,
         "blender": bpy.app.version_string,
-        "protocol": 2,
+        "protocol": 3,
         "app": "",
     }
     status_body = {}

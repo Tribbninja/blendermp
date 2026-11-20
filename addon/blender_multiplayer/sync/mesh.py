@@ -64,11 +64,22 @@ class MeshMirror:
 
         uv_name = ""
         uvs = np.zeros(0, dtype=np.float32)
-        layer = mesh.uv_layers.active
-        if layer is not None and len(mesh.loops):
-            uvs = np.empty(len(mesh.loops) * 2, dtype=np.float32)
-            layer.data.foreach_get("uv", uvs)
-            uv_name = layer.name
+        uv_layers = []
+        for layer in mesh.uv_layers:
+            if not len(mesh.loops):
+                uv_layers.append((layer.name, np.zeros((0, 2), dtype=np.float32)))
+                continue
+            values = np.empty(len(mesh.loops) * 2, dtype=np.float32)
+            layer.data.foreach_get("uv", values)
+            uv_layers.append((layer.name, values.reshape(-1, 2)))
+        try:
+            active_uv = int(mesh.uv_layers.active_index)
+        except (AttributeError, TypeError, ValueError):
+            active_uv = 0
+        if uv_layers:
+            active_uv = max(0, min(len(uv_layers) - 1, active_uv))
+            uv_name = uv_layers[active_uv][0]
+            uvs = uv_layers[active_uv][1].ravel()
 
         return {
             "positions": positions,
@@ -80,6 +91,8 @@ class MeshMirror:
             "materials": materials.astype(np.uint32),
             "uv_name": uv_name,
             "uvs": uvs.reshape(-1, 2),
+            "uv_layers": uv_layers,
+            "uv_active": active_uv,
         }
 
     def full_snapshot(self, mesh) -> bytes:
@@ -88,8 +101,20 @@ class MeshMirror:
         self.counts = self.counts_of(mesh)
         self.hashes = chunker.chunk_hashes(self.shadow)
         self.rev = 0
-        return chunker.pack_geometry(
-            chunker.encode_geometry(
+        if len(geometry["uv_layers"]) > 1 or (geometry["uv_layers"] and geometry["uv_active"] != 0):
+            encoded = chunker.encode_geometry_layers(
+                geometry["positions"],
+                geometry["edges"],
+                geometry["loops"],
+                geometry["loop_starts"],
+                geometry["loop_totals"],
+                geometry["smooth"],
+                geometry["materials"],
+                geometry["uv_layers"],
+                geometry["uv_active"],
+            )
+        else:
+            encoded = chunker.encode_geometry(
                 geometry["positions"],
                 geometry["edges"],
                 geometry["loops"],
@@ -100,7 +125,7 @@ class MeshMirror:
                 geometry["uv_name"] or None,
                 geometry["uvs"] if geometry["uvs"].size else None,
             )
-        )
+        return chunker.pack_geometry(encoded)
 
     def poll(self, mesh, epsilon: float = 1e-5) -> tuple[int, bytes] | None:
         if not self.matches(mesh):
@@ -184,7 +209,22 @@ class MeshMirror:
             mesh.polygons.foreach_set("loop_total", totals)
             mesh.polygons.foreach_set("use_smooth", geometry["smooth"].astype(bool))
             mesh.polygons.foreach_set("material_index", geometry["materials"].astype(np.int32))
-        if geometry["uvs"].size:
+        layers = geometry.get("uv_layers") or []
+        if layers:
+            for layer in list(mesh.uv_layers):
+                mesh.uv_layers.remove(layer)
+            created_layers = []
+            for name, layer_uvs in layers[:16]:
+                layer = mesh.uv_layers.new(name=name or "UVMap")
+                layer.data.foreach_set("uv", np.asarray(layer_uvs, dtype=np.float32).ravel())
+                created_layers.append(layer)
+            if created_layers:
+                active = max(0, min(len(created_layers) - 1, int(geometry.get("uv_active", 0))))
+                try:
+                    mesh.uv_layers.active_index = active
+                except (AttributeError, TypeError, ValueError):
+                    pass
+        elif geometry["uvs"].size:
             layer = mesh.uv_layers.active
             if layer is None:
                 layer = mesh.uv_layers.new(name=geometry["uv_name"] or "UVMap")
@@ -241,29 +281,45 @@ def snapshot_bmesh(bm) -> bytes:
         totals.append(len(face_loops))
         smooth.append(1 if face.smooth else 0)
         materials.append(int(face.material_index))
-    layer = bm.loops.layers.uv.active
-    uvs = None
-    uv_name = ""
-    if layer is not None:
-        uv_name = layer.name
-        uv_values = []
-        for face in bm.faces:
-            for loop in face.loops:
-                uv = loop[layer].uv
-                uv_values.extend((uv.x, uv.y))
-        if len(uv_values) == len(loops) * 2:
-            uvs = np.asarray(uv_values, dtype=np.float32)
-    geometry = chunker.encode_geometry(
-        positions,
-        np.asarray(edges, dtype=np.uint32),
-        np.asarray(loops, dtype=np.uint32),
-        np.asarray(starts, dtype=np.uint32),
-        np.asarray(totals, dtype=np.uint32),
-        np.asarray(smooth, dtype=np.uint8),
-        np.asarray(materials, dtype=np.uint32),
-        uv_name or None,
-        uvs,
-    )
+    uv_layers = []
+    active_uv = 0
+    try:
+        active_layer = bm.loops.layers.uv.active
+        for layer_index, layer in enumerate(bm.loops.layers.uv):
+            if layer == active_layer:
+                active_uv = layer_index
+            values = []
+            for face in bm.faces:
+                for loop in face.loops:
+                    uv = loop[layer].uv
+                    values.extend((uv.x, uv.y))
+            if len(values) == len(loops) * 2:
+                uv_layers.append((layer.name, np.asarray(values, dtype=np.float32)))
+    except (AttributeError, TypeError, RuntimeError):
+        uv_layers = []
+        active_uv = 0
+    if uv_layers:
+        geometry = chunker.encode_geometry_layers(
+            positions,
+            np.asarray(edges, dtype=np.uint32),
+            np.asarray(loops, dtype=np.uint32),
+            np.asarray(starts, dtype=np.uint32),
+            np.asarray(totals, dtype=np.uint32),
+            np.asarray(smooth, dtype=np.uint8),
+            np.asarray(materials, dtype=np.uint32),
+            uv_layers,
+            active_uv,
+        )
+    else:
+        geometry = chunker.encode_geometry(
+            positions,
+            np.asarray(edges, dtype=np.uint32),
+            np.asarray(loops, dtype=np.uint32),
+            np.asarray(starts, dtype=np.uint32),
+            np.asarray(totals, dtype=np.uint32),
+            np.asarray(smooth, dtype=np.uint8),
+            np.asarray(materials, dtype=np.uint32),
+        )
     return chunker.pack_geometry(geometry)
 
 

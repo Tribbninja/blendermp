@@ -53,8 +53,27 @@ def create_asset():
     texture.image = image
     material.node_tree.links.new(texture.outputs["Color"], bsdf.inputs["Base Color"])
     obj.data.materials.append(material)
+
+    collection = bpy.data.collections.new("InstancedSet")
+    mesh = bpy.data.meshes.new("InstCubeMesh")
+    mesh.from_pydata(
+        [(-0.5, -0.5, -0.5), (0.5, -0.5, -0.5), (0.5, 0.5, -0.5), (-0.5, 0.5, -0.5),
+         (-0.5, -0.5, 0.5), (0.5, -0.5, 0.5), (0.5, 0.5, 0.5), (-0.5, 0.5, 0.5)],
+        [],
+        [(0, 1, 2, 3), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)],
+    )
+    mesh.update()
+    cube = bpy.data.objects.new("InstCube", mesh)
+    collection.objects.link(cube)
+    bpy.ops.object.empty_add(location=(4, 1, 0))
+    instance = context.active_object
+    instance.name = "BundleInstance"
+    instance.instance_type = "COLLECTION"
+    instance.instance_collection = collection
+
     bpy.ops.object.select_all(action="DESELECT")
     obj.select_set(True)
+    instance.select_set(True)
     context.view_layer.objects.active = obj
 
 

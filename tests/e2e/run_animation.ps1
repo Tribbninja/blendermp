@@ -61,6 +61,10 @@ if ($null -ne $initial) {
     Check ($initial.action -eq 'RigAction') "action was $($initial.action)"
     Check ($initial.curves -eq 1) "action had $($initial.curves) curves"
     Check ($initial.points -eq 2) "action had $($initial.points) points"
+    Check (($initial.uv_layers -join ',') -match 'Second') "UV layers were $($initial.uv_layers -join ',')"
+    Check ($initial.uv_active -eq 1) "active UV layer was $($initial.uv_active)"
+    Check (($initial.drivers | ConvertTo-Json -Compress) -match 'frame \* 0.1') "drivers were $($initial.drivers | ConvertTo-Json -Compress)"
+    Check (($initial.nla | ConvertTo-Json -Compress) -match 'Track1' -and ($initial.nla | ConvertTo-Json -Compress) -match 'NlaAction') "NLA was $($initial.nla | ConvertTo-Json -Compress)"
 }
 if ($null -ne $changed) {
     Check ([math]::Abs($changed.smile - 0.75) -le 0.01) "changed Smile value was $($changed.smile)"
