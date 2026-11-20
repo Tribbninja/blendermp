@@ -489,6 +489,20 @@ class SessionService:
     def _emit(self, kind: str, body: dict[str, Any]) -> None:
         self.inbox.put((kind, body))
 
+    def _emit_leases(self, extra: dict | None = None) -> None:
+        """Mirror the authoritative lease map into the host's own addon.
+
+        ``_broadcast`` only reaches peers, so without this the host's UI and
+        sync loops never learned that a client owned an object.
+        """
+        body: dict[str, Any] = {
+            "action": "sync",
+            "leases": self._leases.snapshot(time.monotonic()),
+        }
+        if extra:
+            body.update(extra)
+        self._emit("lease", body)
+
     def _identity_body(self) -> dict:
         if not self.identity_public or not self.identity_signature:
             return {}
@@ -1465,6 +1479,7 @@ class SessionService:
                     MessageType.LEASE, {"key": key, "owner": requester, "action": "grant", "leases": snapshot}
                 )
             )
+            self._emit_leases()
             return
         elif action == "deny":
             requester = clean_name(body.get("requester"), "")
@@ -1483,6 +1498,7 @@ class SessionService:
                     },
                 )
             )
+            self._emit_leases()
             return
         elif action == "release":
             self._leases.release(key, peer.name)
@@ -1497,6 +1513,7 @@ class SessionService:
         if action != "release":
             body["owner"] = peer.name
         self._broadcast(protocol.json_frame(MessageType.LEASE, body))
+        self._emit_leases()
 
     def _may_edit(self, peer: Peer, key: str, now: float) -> bool:
         owner = self._leases.owner_of(key, now)
@@ -1508,6 +1525,7 @@ class SessionService:
                     {"key": key, "owner": peer.name, "action": "acquire", "leases": self._leases.snapshot(now)},
                 )
             )
+            self._emit_leases()
             return True
         if owner == peer.name:
             self._leases.renew(key, peer.name, now)
@@ -1796,6 +1814,7 @@ class SessionService:
                         {"action": "release", "leases": self._leases.snapshot(now)},
                     )
                 )
+                self._emit_leases()
         self._broadcast(
             protocol.json_frame(MessageType.ROLE, {"name": name, "role": role})
         )
@@ -1866,6 +1885,7 @@ class SessionService:
                             {"action": "release", "leases": self._leases.snapshot(now)},
                         )
                     )
+                    self._emit_leases()
             self._emit("peer_leave", {"name": peer.name, "temporary": retain})
             self._broadcast(protocol.json_frame(MessageType.BYE, {"name": peer.name}))
         try:
@@ -2451,6 +2471,7 @@ class SessionService:
                             {"action": "released", "leases": self._leases.snapshot(now)},
                         )
                     )
+                    self._emit_leases()
                 snapshot = self._leases.snapshot(now)
                 if result.released:
                     self._expiry_notified.difference_update(result.released)
@@ -2464,6 +2485,7 @@ class SessionService:
                             },
                         )
                     )
+                    self._emit_leases()
                 for key in result.expiring:
                     if key in self._expiry_notified:
                         continue
@@ -2580,6 +2602,7 @@ class SessionService:
         self._broadcast(
             protocol.json_frame(MessageType.LEASE, {"action": "released", "leases": {}})
         )
+        self._emit_leases()
 
     def bump_rev(self, uid: str) -> int:
         if not uid:

@@ -66,7 +66,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 8, 8),
+    "version": (0, 8, 9),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -140,6 +140,7 @@ runtime: dict = {
     "selection": set(),
     "hidden_objects": set(),
     "deselected": {},
+    "lock_notified": set(),
     "owned_leases": set(),
     "last_selection": 0.0,
     "remote_batches": [],
@@ -668,6 +669,7 @@ def stop_session(context, publish: bool = True) -> None:
     runtime["selection"].clear()
     runtime["hidden_objects"].clear()
     runtime["deselected"].clear()
+    runtime["lock_notified"].clear()
     runtime["last_selection"] = 0.0
     runtime["lease_renew"] = 0.0
     runtime["bootstraps"].clear()
@@ -3472,6 +3474,7 @@ def _clear_scene(context, body: dict | None = None) -> None:
     runtime["selection"].clear()
     runtime["hidden_objects"].clear()
     runtime["deselected"].clear()
+    runtime["lock_notified"].clear()
     runtime["owned_leases"].clear()
     runtime["lease_requests"].clear()
     runtime["lease_request"] = None
@@ -4309,15 +4312,21 @@ def _sync_selection(context) -> None:
             if granted and session.is_host:
                 owners[uid] = settings.name
                 owned.add(uid)
-            owner = owners.get(uid)
-        if owner not in (None, settings.name):
-            obj = obj_sync.find(uid)
-            if obj is not None:
-                try:
-                    obj.select_set(False)
-                except Exception:  # noqa: BLE001
-                    pass
-                _push_message(context, "system", f"{obj.name} is being edited by {owner}")
+    for uid in selected:
+        owner = owners.get(uid)
+        if owner in (None, settings.name):
+            runtime["lock_notified"].discard(uid)
+            continue
+        obj = obj_sync.find(uid)
+        if obj is None:
+            continue
+        try:
+            obj.select_set(False)
+        except Exception:  # noqa: BLE001
+            pass
+        if uid not in runtime["lock_notified"]:
+            runtime["lock_notified"].add(uid)
+            _push_message(context, "system", f"{obj.name} is being edited by {owner}")
 
     if now - runtime["lease_renew"] > LEASE_RENEW:
         runtime["lease_renew"] = now
@@ -4390,19 +4399,11 @@ def _sync_transforms(context) -> None:
             obj["bmp_uuid"] = uid
         seen.add(uid)
         owner = runtime["lease_owners"].get(uid)
-        if owner is not None and owner != settings.name:
-            if settings.is_host:
-                # The host is authoritative. Take the lease so the client stops
-                # echoing transforms and the host's own drag is not overwritten.
-                session.force_lease(uid)
-                runtime["lease_owners"][uid] = settings.name
-                runtime["owned_leases"].add(uid)
-            else:
-                continue
-        if not settings.is_host and uid not in runtime["owned_leases"]:
-            # Only the host broadcasts unleased objects. A client that does
-            # not hold the lease must not send idle/echo transforms, or it
-            # silently takes ownership and fights the host.
+        if not settings.is_host and (
+            owner not in (None, settings.name) or uid not in runtime["owned_leases"]
+        ):
+            # A client may only broadcast objects it holds the lease for. Keep
+            # the shadow current so a remote-applied matrix is never echoed.
             matrix = obj.matrix_world
             shadow[uid] = tuple(round(v, 6) for row in matrix for v in row)
             continue
@@ -4415,6 +4416,14 @@ def _sync_transforms(context) -> None:
             shadow[uid] = current
             continue
         if current != previous:
+            if settings.is_host and owner not in (None, settings.name):
+                # The host is authoritative, but it only takes the lease when
+                # it actually changes the object. Taking it for every
+                # client-owned object on every tick stole leases continuously
+                # and made locks flap.
+                session.force_lease(uid)
+                runtime["lease_owners"][uid] = settings.name
+                runtime["owned_leases"].add(uid)
             shadow[uid] = current
             runtime["transform_smoothers"].pop(uid, None)
             runtime["local_transform"][uid] = time.monotonic()
