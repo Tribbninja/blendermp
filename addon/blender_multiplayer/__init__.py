@@ -48,7 +48,7 @@ from .sync.mesh import EditMirror, MeshMirror
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 1, 10),
+    "version": (0, 1, 11),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -798,15 +798,10 @@ def _handle_event(context, kind: str, body: dict) -> None:
         obj = obj_sync.find(uid)
         if obj is None:
             return
-        current = tuple(round(float(value), 6) for row in obj.matrix_world for value in row)
-        runtime["transform_smoothers"][uid] = {
-            "obj": obj,
-            "start": current,
-            "target": tuple(values),
-            "t0": time.monotonic(),
-            "duration": runtime.get("transform_smooth", TRANSFORM_SMOOTH),
-        }
-        # Remember the final target so the next local sync does not echo it.
+        if not obj_sync.apply(uid, values):
+            return
+        # Exact application: no display interpolation. Remember the applied
+        # matrix so the next local sync does not echo it back.
         runtime["object_shadow"][uid] = tuple(round(float(value), 6) for value in values)
     elif kind == "mesh_delta":
         _apply_mesh_delta(context, body)
@@ -860,35 +855,10 @@ def _apply_mesh_delta(context, body: dict) -> None:
     mirror = runtime["mirrors"].get(uid)
     if mirror is None or not mirror.matches(obj.data):
         return
-    if indices.size > 2000:
-        try:
-            mirror.apply_delta(obj.data, bytes(payload))
-        except Exception:  # noqa: BLE001
-            traceback.print_exc()
-        runtime["mesh_smoothers"].pop(uid, None)
-        return
     try:
-        chunker.apply_positions(mirror.shadow, indices, values)
-        mirror.hashes = chunker.chunk_hashes(mirror.shadow)
-        mirror.rev = rev
+        mirror.apply_delta(obj.data, bytes(payload))
     except Exception:  # noqa: BLE001
         traceback.print_exc()
-        return
-    smoother = runtime["mesh_smoothers"].get(uid)
-    if smoother is None or smoother.get("obj") is not obj:
-        smoother = {"obj": obj, "entries": {}, "duration": runtime.get("mesh_smooth", MESH_SMOOTH)}
-        runtime["mesh_smoothers"][uid] = smoother
-    mesh = obj.data
-    now = time.monotonic()
-    for index, value in zip(indices, values):
-        vertex_index = int(index)
-        if 0 <= vertex_index < len(mesh.vertices):
-            current = mesh.vertices[vertex_index].co
-            smoother["entries"][vertex_index] = (
-                (float(current.x), float(current.y), float(current.z)),
-                (float(value[0]), float(value[1]), float(value[2])),
-                now,
-            )
 
 
 def _apply_edit_delta(context, obj, uid: str, payload: bytes) -> None:
@@ -2415,7 +2385,7 @@ def _build_remote_point_batches(points: list) -> list:
 
 
 def _smooth_view(name: str, values, now: float):
-    """Interpolate a remote camera between 20 Hz presence updates."""
+    """Return the remote camera pose exactly; no interpolation."""
     from mathutils import Matrix
 
     try:
@@ -2426,37 +2396,7 @@ def _smooth_view(name: str, values, now: float):
     if rigid is None:
         return None
     location, rotation = rigid
-    key = tuple(round(float(value), 4) for value in (*location, *rotation))
-    states = runtime["view_smoothers"]
-    state = states.get(name)
-    if state is None:
-        state = {
-            "location": location.copy(),
-            "rotation": rotation.copy(),
-            "start_location": location.copy(),
-            "start_rotation": rotation.copy(),
-            "target_location": location.copy(),
-            "target_rotation": rotation.copy(),
-            "started": now,
-            "key": key,
-        }
-        states[name] = state
-    elif key != state["key"]:
-        state["start_location"] = state["location"].copy()
-        state["start_rotation"] = state["rotation"].copy()
-        state["target_location"] = location
-        state["target_rotation"] = rotation
-        state["started"] = now
-        state["key"] = key
-    duration = max(0.001, float(runtime.get("view_smooth", VIEW_SMOOTH)))
-    t = min(1.0, max(0.0, (now - state["started"]) / duration))
-    state["location"] = state["start_location"].lerp(state["target_location"], t)
-    target_rotation = state["target_rotation"].copy()
-    if state["start_rotation"].dot(target_rotation) < 0.0:
-        target_rotation.negate()
-    state["rotation"] = state["start_rotation"].slerp(target_rotation, t)
-    return Matrix.Translation(state["location"]) @ state["rotation"].to_matrix().to_4x4()
-
+    return Matrix.Translation(location) @ rotation.to_matrix().to_4x4()
 
 def _sync_remote_visuals(context) -> None:
     session: SessionService | None = runtime.get("session")
@@ -3421,8 +3361,6 @@ def register() -> None:
     ui.register()
     runtime["started"] = time.monotonic()
     bpy.app.timers.register(bmp_tick, first_interval=0.5, persistent=True)
-    if not bpy.app.timers.is_registered(bmp_smooth_tick):
-        bpy.app.timers.register(bmp_smooth_tick, first_interval=1.0 / 60.0, persistent=True)
     _register_remote_draw()
     bpy.app.handlers.frame_change_post.append(on_frame_change)
 
@@ -3434,10 +3372,6 @@ def unregister() -> None:
     _unregister_remote_draw()
     try:
         bpy.app.timers.unregister(bmp_tick)
-    except ValueError:
-        pass
-    try:
-        bpy.app.timers.unregister(bmp_smooth_tick)
     except ValueError:
         pass
     session = runtime.get("session")

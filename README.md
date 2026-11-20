@@ -38,8 +38,8 @@ surface that cross-process re-parenting causes on some GPUs).
 * **Remote presence in the viewport**: each player's viewport camera is drawn as
   a colored view pyramid with a look-direction ray and their name above it, and
   their selected objects are wireframed in their color with a name tag. Camera
-  poses stream at up to 30 Hz on low-latency links, interpolate at 60 Hz display
-  rate, and are normalized so orthographic zoom cannot distort the widget. Name
+  poses stream at up to 30 Hz on low-latency links, apply immediately, and are
+  normalized so orthographic zoom cannot distort the widget. Name
   tags use a DPI-scaled
   outlined font so they stay crisp. Each user gets a stable color derived from
   their name if they have not chosen one.
@@ -66,10 +66,9 @@ surface that cross-process re-parenting causes on some GPUs).
   tombstone. Transforms stream at up to 60 Hz on low-latency/LAN links (30 Hz
   otherwise) and multiple tracked meshes round-robin at 20 Hz. A LAN-discovered
   host advertises a direct code that bypasses the relay.
-* **Smooth remote motion**: received transforms and vertex deltas are linearly
-  eased to their exact target over ~35-45 ms at 60 Hz on the receiving side.
-  Network state stays exact; only the local display interpolates, so remote
-  drags slide instead of stepping and the sender keeps zero added latency.
+* **Immediate remote application**: received transforms and vertex deltas are
+  applied exactly at network rate (up to 60 Hz on LAN). There is no display
+  interpolation, so the remote view never lags behind the authoritative state.
 * **Basic material sync**: Principled BSDF base colour, metallic, roughness and
   emission, plus the viewport colour, for the active object. Node graphs and
   textures are not replicated yet.
@@ -298,8 +297,8 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   debounce so mode switches do not release accidentally.
 * Remote camera widgets and selection wireframes are viewport overlays in the
   local Blender; they are not scene objects, are not rendered, and are not
-  synced back to other clients. Camera poses update at 20 Hz, are smoothed at
-  30 Hz, and their zoom scale is stripped so orthographic views cannot stretch
+  synced back to other clients. Camera poses update at up to 30 Hz and are
+  applied immediately; their zoom scale is stripped so orthographic views cannot stretch
   them into stray lines. Selection outlines skip oversized/corrupt edges and
   fall back to a bounding box above 2,500 edges.
 * Edit Mode streams vertex positions live. Structural changes (extrude,

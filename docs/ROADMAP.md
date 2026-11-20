@@ -3,7 +3,7 @@
 Living implementation plan. Last updated: 2026-11-20.
 Baseline: **0.1.10** (public directory, authenticated relay, TLS pinning, scene
 bootstrap, object/transform sync, chunked mesh deltas, live Edit Mode vertex
-streaming, edit leases, presence 2.0, display interpolation, durable settings,
+streaming, edit leases, presence 2.0, exact remote application, durable settings,
 strict version gate, lease request UX, server-enforced roles, optional LAN direct).
 
 Progress log:
@@ -14,7 +14,8 @@ Progress log:
 - [x] 2026-11-20: Phase 1 lock reliability: lease sweep broadcasts `expiring`/`released`, snapshot-driven owner cleanup, expiry auto-renew, request queue, host-side grant/deny, lock status in the N-panel.
 - [x] 2026-11-20: Phase 1 presence 2.0: edit-mode vertex selection relay/points, 3D cursor, follow-user camera, overlay toggles. Laser pointer removed after poor reliability.
 - [x] 2026-11-20: Phase 1 roles: host assigns viewer/commenter/editor/admin, server-enforced mutating-frame guard, downgrade releases leases, role UI in the desktop member list.
-- [x] 2026-11-20: 0.1.10: LAN direct path (dual listener + local directory `direct_code`), 60 Hz transforms/presence on low latency, 18-25 ms smoothing, client-reported ping, total data stat, stable dock bounds (no scrollbar flash).
+- [x] 2026-11-20: 0.1.11: removed all display interpolation; transforms/mesh/camera apply immediately at network rate. 60 Hz LAN streaming, client-reported ping, total data stat, stable dock bounds.
+- [x] 2026-11-20: 0.1.10: LAN direct path (dual listener + local directory `direct_code`), 60 Hz transforms/presence on low latency, client-reported ping, total data stat, stable dock bounds (no scrollbar flash).
 - [ ] Phase 2: live topology, material graphs/textures, object details.
 - [ ] Phase 0 backlog: checked-in e2e harness, diagnostics bundle, error codes, perf baseline, crash marker.
 
@@ -28,8 +29,9 @@ Do not start the next phase until the gate passes.
 
 1. **Host authoritative.** Clients propose edits; the host validates, assigns
    identities, owns leases and relays state.
-2. **Exact network state, interpolated display only.** Never send interpolated
-   values; never let a smoother write back to the authoritative shadow.
+2. **Exact network state and exact application.** Never send interpolated
+   values, and do not interpolate the received view; apply authoritative state
+   immediately.
 3. **One editor per object.** Structural/topology edits use the same lease as
    transforms. No parallel structural merges.
 4. **Additive protocol.** Keep the 20-byte header (`MAGIC=BMP1`,
@@ -402,7 +404,7 @@ Receiver/rendering:
     AABB check; fade elements older than 2 s.
 - Cursor: crosshair + small name tag; "jump to cursor" action.
 - Laser: polyline with fading alpha; draw last 1.5 s; smooth between packets.
-- Follow user: local operator `bmp.follow_user(name)` reads the already-smoothed
+- Follow user: local operator `bmp.follow_user(name)` reads the current
   presence matrix, sets `region_3d.view_matrix`, exits on user input. No network.
 - Split draw rates: camera frustums + labels at 30-60 Hz, selection at 10 Hz,
   static label dimensions cached. One `batch_for_shader` per user/kind.
