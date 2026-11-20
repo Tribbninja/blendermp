@@ -65,7 +65,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 8, 0),
+    "version": (0, 8, 1),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -298,6 +298,7 @@ class BMPState(PropertyGroup):
     last_error_code: StringProperty()
     fingerprint: StringProperty()
     verify_code: StringProperty()
+    pending_fingerprint: StringProperty()
     chat_text: StringProperty()
     sync_mesh: BoolProperty(name="Sync active mesh", default=True)
     sync_materials: BoolProperty(name="Sync materials", default=True)
@@ -503,7 +504,12 @@ def start_host(
     _ensure_timer()
 
 
-def start_join(context, code: str, relay_url: str | None = None) -> None:
+def start_join(
+    context,
+    code: str,
+    relay_url: str | None = None,
+    fingerprint: str | None = None,
+) -> None:
     settings = context.window_manager.bmp
     stop_session(context, publish=False)
     inbox = queue.Queue()
@@ -519,6 +525,12 @@ def start_join(context, code: str, relay_url: str | None = None) -> None:
     settings.show_labels = True
     settings.last_error = ""
     settings.last_error_code = ""
+    settings.pending_fingerprint = ""
+    runtime["last_join"] = {
+        "code": settings.code,
+        "relay_url": relay_url or "",
+        "fingerprint": fingerprint or "",
+    }
     runtime["session_started"] = time.monotonic()
     runtime["bootstrapping"] = True
     runtime["bootstrap_deadline"] = time.monotonic() + 20.0
@@ -540,7 +552,7 @@ def start_join(context, code: str, relay_url: str | None = None) -> None:
             name=name,
             color=tuple(settings.color),
             port=settings.port,
-            fingerprint=settings.fingerprint or None,
+            fingerprint=fingerprint or None,
             pin=settings.pin,
             relay=relay,
         )
@@ -675,6 +687,21 @@ def _handle_event(context, kind: str, body: dict) -> None:
         settings.fingerprint = body.get("fingerprint", "")
         settings.verify_code = body.get("short", "")
         _push_message(context, "system", f"Verify host code: {settings.verify_code}")
+    elif kind == "cert_changed":
+        actual = body.get("fingerprint", "")
+        if not isinstance(actual, str) or len(actual) != 64:
+            actual = ""
+        settings.pending_fingerprint = actual
+        settings.verify_code = body.get("short", "")
+        settings.last_error_code = "CERT_CHANGED"
+        settings.last_error = "Host certificate changed"
+        _push_message(
+            context,
+            "system",
+            "Host certificate changed. Compare the new code "
+            f"{settings.verify_code or '?'} with the host, then click "
+            "'Trust new certificate' in the Blendermp panel.",
+        )
     elif kind == "welcome":
         settings.state = "connected"
         settings.host_name = body.get("name", "")
@@ -2694,7 +2721,12 @@ def _poll_control(context) -> None:
         elif action == "join":
             code = request.get("code", "")
             if code:
-                start_join(context, code, request.get("relay_url"))
+                start_join(
+                    context,
+                    code,
+                    request.get("relay_url"),
+                    request.get("fingerprint"),
+                )
         elif action == "chat":
             text = request.get("text", "")
             session = runtime.get("session")
@@ -6410,6 +6442,38 @@ class BMP_OT_laser(Operator):
             pass
 
 
+class BMP_OT_trust_host(Operator):
+    bl_idname = "bmp.trust_host"
+    bl_label = "Trust new certificate"
+    bl_description = (
+        "Replace the pinned certificate for this room with the one the host "
+        "presented, then reconnect. Only do this after comparing the code with "
+        "the host out of band"
+    )
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        pending = settings.pending_fingerprint
+        if not pending or len(pending) != 64:
+            self.report({"ERROR"}, "No new certificate to trust")
+            return {"CANCELLED"}
+        last = runtime.get("last_join") or {}
+        code = last.get("code") or settings.code
+        if not code:
+            self.report({"ERROR"}, "Join a room first")
+            return {"CANCELLED"}
+        from .core import tls
+
+        tls.remember_fingerprint(control.data_dir(), code, pending)
+        settings.pending_fingerprint = ""
+        settings.last_error = ""
+        settings.last_error_code = ""
+        relay_url = last.get("relay_url") or ""
+        start_join(context, code, relay_url or None, pending)
+        self.report({"INFO"}, "Trusted the new host certificate; rejoining")
+        return {"FINISHED"}
+
+
 class BMP_OT_ping(Operator):
     bl_idname = "bmp.ping"
     bl_label = "Ping"
@@ -7078,6 +7142,7 @@ classes = (
     BMP_OT_untrack_mesh,
     BMP_OT_ping,
     BMP_OT_laser,
+    BMP_OT_trust_host,
     BMP_OT_ping_mark,
     BMP_OT_follow_user,
     BMP_OT_share_images,

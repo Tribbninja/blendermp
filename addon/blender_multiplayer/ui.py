@@ -32,6 +32,16 @@ class BMP_PT_main(bpy.types.Panel):
         header.label(text=settings.role.title() if settings.role else "")
         header.label(text=f"{settings.rtt_ms} ms" if settings.rtt_ms else "")
 
+        if settings.pending_fingerprint:
+            warning = layout.box()
+            warning.alert = True
+            warning.label(text="Host certificate changed", icon="ERROR")
+            warning.label(text=f"New code: {settings.verify_code or '?'}")
+            warning.label(text="Compare it with the host before trusting")
+            warning.operator(
+                "bmp.trust_host", text="Trust new certificate", icon="CHECKMARK"
+            )
+
         if settings.state in {"hosting", "connected"}:
             box = layout.box()
             box.label(text="Server", icon="WORLD")

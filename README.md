@@ -168,7 +168,7 @@ surface that cross-process re-parenting causes on some GPUs).
   same animated transition. Blender is hidden while arranging and returns to the
   viewport when you press Done or Escape.
 
-The protocol and engine have **160 passing tests**, including a real TLS
+The protocol and engine have **169 passing tests**, including a real TLS
 host/client session, certificate-mismatch rejection, relay chat, password
 rejection and host kick over a multiplexed tunnel, the public directory API, and
 1,000-vertex delta round-trips under loss/reordering. The Cloudflare Worker hub
@@ -232,8 +232,10 @@ scripts/dev.ps1 -Autohost
 
 Joining: click **Browse servers**, search by name, and press **Join**. If the
 server has a password, enter it in the prompt. The first connection pins the
-host certificate and shows a verification code; compare it with the host's. The
-host can kick anyone from the member list.
+host certificate and shows a verification code; compare it with the host's. If
+the host's certificate changed (reinstall or the 30-day rotation), the panel
+shows the new short code and a **Trust new certificate** button; compare it with
+the host before trusting. The host can kick anyone from the member list.
 
 ### Packaged build
 

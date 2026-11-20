@@ -1886,6 +1886,14 @@ class SessionService:
         if expected:
             if not tls.verify_fingerprint(actual, expected):
                 writer.close()
+                self._emit(
+                    "cert_changed",
+                    {
+                        "fingerprint": actual or "",
+                        "expected": expected,
+                        "short": tls.short_fingerprint(actual or ""),
+                    },
+                )
                 self._fail("host certificate changed; refusing to connect")
                 return
         elif actual:

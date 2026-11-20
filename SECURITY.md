@@ -89,8 +89,11 @@ The desktop app drives the addon through two JSON files in
   are visible to the relay operator. Run your own relay if that matters.
 * **LAN discovery leaks the code and display name to the local subnet.** That is
   inherent to zero-config discovery; use a non-LAN room if that matters.
-* **No certificate rotation UI.** Certificates rotate automatically after 30
-  days; peers must re-verify the new code.
+* **Certificate changes need a manual trust step.** Certificates rotate
+  automatically after 30 days, and a reinstall can create a new one. A client
+  with a pinned certificate sees the new short code and must compare it with the
+  host before pressing **Trust new certificate**; the old pin is never replaced
+  automatically.
 * **No independent security audit.** Do not use this for sensitive production
   work yet.
 
