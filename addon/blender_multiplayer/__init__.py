@@ -72,7 +72,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 9, 7),
+    "version": (0, 9, 8),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -298,6 +298,8 @@ class BMPUser(PropertyGroup):
     active: StringProperty()
     view: FloatVectorProperty(size=16)
     has_view: BoolProperty()
+    view_corners: FloatVectorProperty(size=21)
+    has_corners: BoolProperty()
     view_aspect: FloatProperty(default=1.6)
     view_persp: StringProperty()
     view_distance: FloatProperty(default=7.0)
@@ -1050,6 +1052,20 @@ def _handle_event(context, kind: str, body: dict) -> None:
                             user.has_view = False
                     else:
                         user.has_view = False
+                if "view_corners" in body:
+                    corners = body.get("view_corners")
+                    if isinstance(corners, list) and len(corners) == 21:
+                        try:
+                            values = [float(value) for value in corners]
+                        except (TypeError, ValueError):
+                            values = []
+                        if len(values) == 21:
+                            user.view_corners = values
+                            user.has_corners = True
+                        else:
+                            user.has_corners = False
+                    else:
+                        user.has_corners = False
                 if "aspect" in body:
                     aspect = body.get("aspect")
                     if isinstance(aspect, (int, float)) and not isinstance(aspect, bool):
@@ -5629,6 +5645,56 @@ def _viewport_view(context):
     }
 
 
+def _viewport_corners(context):
+    """Seven world-space points matching Multi-User's camera representation.
+
+    Order: bottom-left, top-right, top-left, bottom-right, centre,
+    view_location, apex. The four corners are the viewport edges projected one
+    unit into the scene, the centre is the same at the centre pixel, the view
+    location is the orbit pivot, and the apex sits 0.8 units behind the camera.
+    """
+    from bpy_extras import view3d_utils
+
+    screen = getattr(context, "screen", None)
+    if screen is None:
+        return None
+    area = next((item for item in screen.areas if item.type == "VIEW_3D"), None)
+    if area is None or area.spaces.active is None:
+        return None
+    region = next((item for item in area.regions if item.type == "WINDOW"), None)
+    region_3d = area.spaces.active.region_3d
+    if region is None or region_3d is None:
+        return None
+
+    def project(x: float, y: float, distance: float = 1.0):
+        view_vector = view3d_utils.region_2d_to_vector_3d(
+            region, region_3d, (x, y)
+        )
+        ray_origin = view3d_utils.region_2d_to_origin_3d(
+            region, region_3d, (x, y)
+        )
+        target = ray_origin + view_vector * distance
+        return [float(target.x), float(target.y), float(target.z)]
+
+    width = float(region.width)
+    height = float(region.height)
+    try:
+        v1 = project(0.0, 0.0)
+        v3 = project(0.0, height)
+        v2 = project(width, height)
+        v4 = project(width, 0.0)
+        v5 = project(width * 0.5, height * 0.5)
+        v6 = [float(value) for value in region_3d.view_location]
+        v7 = project(width * 0.5, height * 0.5, distance=-0.8)
+    except Exception:  # noqa: BLE001
+        return None
+    points = [v1, v2, v3, v4, v5, v6, v7]
+    for point in points:
+        if not all(math.isfinite(value) and abs(value) < 1e7 for value in point):
+            return None
+    return points
+
+
 def _selected_uids(context) -> list:
     objects = list(context.selected_objects)
     active = context.active_object
@@ -6066,62 +6132,6 @@ def _handle_bundle_offer(context, manifest: dict) -> None:
     )
 
 
-def _camera_segments(matrix, aspect: float, distance: float = 7.0, scale: float = 1.0) -> list:
-    """A camera-shaped wire model that shows both position and gaze.
-
-    The widget is a compact body plus a lens pyramid, sized from the remote
-    orbit distance so it stays readable at any zoom level. The centre ray makes
-    the look direction obvious.
-    """
-    from mathutils import Vector
-
-    try:
-        orbit = float(distance)
-    except (TypeError, ValueError):
-        orbit = 7.0
-    if not math.isfinite(orbit) or orbit <= 0.0:
-        orbit = 7.0
-    size = 0.3 * max(0.5, min(2.0, float(scale or 1.0)))
-    zoom = max(0.4, min(3.0, math.sqrt(orbit / 7.0)))
-    size = max(0.08, min(2.4, size * zoom))
-    forward = size * 2.4
-    height = size * 0.55
-    width = height * max(0.6, min(2.6, float(aspect or 1.6)))
-
-    # Camera body: a compact box centred on the remote view position.
-    half = size * 0.55
-    bx = half * 0.9
-    by = half * 0.65
-    bz = half * 0.5
-    local_body = [
-        (-bx, -by, bz), (bx, -by, bz), (bx, by, bz), (-bx, by, bz),
-        (-bx, -by, -bz), (bx, -by, -bz), (bx, by, -bz), (-bx, by, -bz),
-    ]
-    body = [matrix @ Vector(point) for point in local_body]
-    pairs = (
-        (0, 1), (1, 2), (2, 3), (3, 0),
-        (4, 5), (5, 6), (6, 7), (7, 4),
-        (0, 4), (1, 5), (2, 6), (3, 7),
-    )
-    segments = [(body[first], body[second]) for first, second in pairs]
-
-    # Lens pyramid from the front of the body to the image plane.
-    apex = matrix @ Vector((0.0, 0.0, -bz))
-    corners = [
-        matrix @ Vector((-width, -height, -forward)),
-        matrix @ Vector((width, -height, -forward)),
-        matrix @ Vector((width, height, -forward)),
-        matrix @ Vector((-width, height, -forward)),
-    ]
-    segments.extend((apex, corner) for corner in corners)
-    segments.extend(
-        (corners[index], corners[(index + 1) % 4]) for index in range(4)
-    )
-    # A centre look ray makes the gaze direction unmistakable.
-    segments.append((apex, matrix @ Vector((0.0, 0.0, -forward * 1.25))))
-    return segments
-
-
 def _object_segments(obj, max_edges: int = 2500) -> list:
     from mathutils import Vector
 
@@ -6194,7 +6204,8 @@ def _build_remote_batches(lines: list) -> list:
             continue
         coords = []
         for first, second in segments:
-            coords.extend((first.x, first.y, first.z, second.x, second.y, second.z))
+            coords.append((first.x, first.y, first.z))
+            coords.append((second.x, second.y, second.z))
         try:
             batch = batch_for_shader(shader, "LINES", {"pos": coords})
         except Exception:  # noqa: BLE001
@@ -6335,32 +6346,37 @@ def _sync_remote_visuals(context) -> None:
             continue
         seen_users.add(user.name)
         color = _with_opacity(effective_color(user.name, user.color, colorblind), opacity)
-        if user.has_view:
-            matrix = _smooth_view(user.name, list(user.view), now)
-            if matrix is not None:
-                origin = matrix.translation
-                if show_cameras:
-                    segments = _camera_segments(
-                        matrix,
-                        float(user.view_aspect or 1.6),
-                        float(user.view_distance or 7.0),
-                        overlay_scale,
-                    )
-                    if segments:
-                        lines.append((color, segments))
-                        labels.append(
-                            (
-                                origin
-                                + Vector((0.0, 0.0, 0.3 * overlay_scale)),
-                                user.name,
-                                color,
-                            )
+        if show_cameras and user.has_corners:
+            corners = list(user.view_corners)
+            if len(corners) == 21:
+                camera_points = [
+                    Vector(
+                        (
+                            corners[index * 3],
+                            corners[index * 3 + 1],
+                            corners[index * 3 + 2],
                         )
-                        total += len(segments)
-                        for first, second in segments:
-                            max_segment = max(
-                                max_segment, float((second - first).length)
-                            )
+                    )
+                    for index in range(7)
+                ]
+                # Multi-User's exact camera widget indices.
+                indices = (
+                    (1, 3), (2, 1), (3, 0),
+                    (2, 0), (4, 5), (1, 6),
+                    (2, 6), (3, 6), (0, 6),
+                )
+                segments = [
+                    (camera_points[first], camera_points[second])
+                    for first, second in indices
+                ]
+                lines.append((color, segments))
+                # The name sits on the top-right corner, like Multi-User.
+                labels.append((camera_points[1], user.name, color))
+                total += len(segments)
+                for first, second in segments:
+                    max_segment = max(
+                        max_segment, float((second - first).length)
+                    )
         if show_selections:
             uids = [uid for uid in str(user.selected or "").split(",") if uid]
             for uid in uids[:6]:
@@ -7031,6 +7047,11 @@ def _send_presence(context) -> None:
             full["aspect"] = round(float(view["aspect"]), 3)
             full["persp"] = view["persp"]
             full["dist"] = round(float(view["distance"]), 3)
+        corners = _viewport_corners(context)
+        if corners:
+            full["view_corners"] = [
+                round(float(value), 3) for point in corners for value in point
+            ]
 
     # Delta-encode presence. While the user is idle this sends nothing except a
     # small full snapshot every 30 seconds. The old code sent the full view

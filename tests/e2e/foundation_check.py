@@ -302,6 +302,16 @@ try:
     user.view = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
     user.view_aspect = 1.6
     user.view_distance = 7.0
+    user.view_corners = [
+        -1.0, -1.0, 1.0,
+        1.0, 1.0, 1.0,
+        -1.0, 1.0, 1.0,
+        1.0, -1.0, 1.0,
+        0.0, 0.0, 1.0,
+        0.0, 0.0, 0.0,
+        0.0, 0.0, -0.8,
+    ]
+    user.has_corners = True
     user.selected = ""
     user.has_cursor = False
     bm.runtime["session"] = FakeSession()
@@ -314,13 +324,9 @@ try:
     user.selected = uid
     bm._sync_remote_visuals(bpy.context)
     debug = bm.runtime.get("remote_debug", {})
-    from mathutils import Matrix
-
-    camera_segments = bm._camera_segments(Matrix.Identity(4), 1.6, 7.0, 1.0)
-    check("camera_segments", len(camera_segments) == 21, len(camera_segments))
     check(
         "camera_widget",
-        int(debug.get("segments", 0)) >= len(camera_segments),
+        int(debug.get("segments", 0)) >= 9,
         debug,
     )
     check(
@@ -349,7 +355,7 @@ try:
     debug = bm.runtime.get("remote_debug", {})
     check(
         "selection_lines_opt_in",
-        int(debug.get("segments", 0)) > len(camera_segments),
+        int(debug.get("segments", 0)) > 9,
         debug,
     )
     settings.users.remove(len(settings.users) - 1)

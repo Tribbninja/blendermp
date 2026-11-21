@@ -821,6 +821,14 @@ class SessionService:
                     values = []
                 if len(values) == 16 and all(math.isfinite(value) and abs(value) < 1e12 for value in values):
                     presence["view"] = values
+            corners = body.get("view_corners")
+            if isinstance(corners, list) and len(corners) == 21:
+                try:
+                    values = [float(value) for value in corners]
+                except (TypeError, ValueError):
+                    values = []
+                if len(values) == 21 and all(math.isfinite(value) and abs(value) < 1e7 for value in values):
+                    presence["view_corners"] = values
             aspect = body.get("aspect")
             if isinstance(aspect, (int, float)) and not isinstance(aspect, bool):
                 presence["aspect"] = max(0.1, min(10.0, float(aspect)))
@@ -2288,6 +2296,14 @@ class SessionService:
                     values = []
                 if len(values) == 16 and all(math.isfinite(value) and abs(value) < 1e12 for value in values):
                     presence["view"] = values
+            corners = body.get("view_corners")
+            if isinstance(corners, list) and len(corners) == 21:
+                try:
+                    values = [float(value) for value in corners]
+                except (TypeError, ValueError):
+                    values = []
+                if len(values) == 21 and all(math.isfinite(value) and abs(value) < 1e7 for value in values):
+                    presence["view_corners"] = values
             aspect = body.get("aspect")
             if isinstance(aspect, (int, float)) and not isinstance(aspect, bool):
                 presence["aspect"] = max(0.1, min(10.0, float(aspect)))
@@ -2776,6 +2792,14 @@ class SessionService:
                 values = []
             if len(values) == 16 and all(math.isfinite(value) and abs(value) < 1e12 for value in values):
                 payload["view"] = values
+        corners = body.get("view_corners")
+        if isinstance(corners, list) and len(corners) == 21:
+            try:
+                values = [float(value) for value in corners]
+            except (TypeError, ValueError):
+                values = []
+            if len(values) == 21 and all(math.isfinite(value) and abs(value) < 1e7 for value in values):
+                payload["view_corners"] = values
         aspect = body.get("aspect")
         if isinstance(aspect, (int, float)) and not isinstance(aspect, bool):
             payload["aspect"] = max(0.1, min(10.0, float(aspect)))

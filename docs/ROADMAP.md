@@ -7,6 +7,7 @@ streaming, edit leases, presence 2.0, exact remote application, durable settings
 strict version gate, lease request UX, server-enforced roles, optional LAN direct).
 
 Progress log:
+- [x] 2026-11-21: 0.9.8: replaced the custom camera widget with the exact Multi-User seven-point frustum (`view_corners`): four viewport corners and centre one unit into the scene, the orbit pivot, and an apex 0.8 units behind the camera, with Multi-User's line indices and the username on the top-right corner in the peer's colour. Fixed line batches to pass coordinate tuples, so camera and selection lines now render in Blender 5.3.
 - [x] 2026-11-21: 0.9.7: collaborator overlays: per-peer wire camera widgets (body + lens pyramid + look ray) in the peer's colour, peer-coloured selection outlines, and a hover tooltip that names who is editing or has the object selected. Overlays are on by default with individual toggles; viewport camera sharing defaults on.
 - [x] 2026-11-21: 0.9.6: direct LAN fast path: private-LAN peers bypass interest/quality rate limiting so transforms and presence run at the sender rate; relay peers stay on the low-bandwidth profile; presence state changes are never dropped by the relay camera throttle; host shows LAN fast path vs Internet mode.
 - [x] 2026-11-21: 0.9.5: removed all notification beeps and their toggles; fixed host-to-client smoothness by reporting real tick FPS instead of scene.render.fps, relaxing quality thresholds, and keeping a 5-20 Hz transform floor even for off-screen/low-quality peers.
