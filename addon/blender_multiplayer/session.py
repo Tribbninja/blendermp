@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import math
 import queue
@@ -137,6 +138,19 @@ def clean_name(value: Any, fallback: str = "user") -> str:
     return name or fallback
 
 
+def _is_lan_ip(value: str) -> bool:
+    """True for a private LAN address, not loopback or a public internet IP.
+
+    Relay-bridge peers arrive from 127.0.0.1, so they stay on the bandwidth
+    profile. Direct LAN peers get the unthrottled fast path.
+    """
+    try:
+        address = ipaddress.ip_address(str(value))
+    except ValueError:
+        return False
+    return bool(address.is_private and not address.is_loopback)
+
+
 def _local_ip() -> str:
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -249,6 +263,7 @@ class Peer:
     last_sent: dict[tuple[str, int], float] = field(default_factory=dict)
     stats: dict = field(default_factory=dict)
     quality: int = 0
+    lan: bool = False
     byte_window: deque = field(default_factory=deque)
     pending: dict[tuple[str, int], tuple[bytes, float, bool]] = field(default_factory=dict)
     dropped: bool = False
@@ -368,6 +383,7 @@ class SessionService:
         self._outbox: queue.Queue = queue.Queue()
         self._server: asyncio.AbstractServer | None = None
         self._peers: dict[str, Peer] = {}
+        self._lan_peer_count = 0
         self._peer_id: str | None = None
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -453,6 +469,7 @@ class SessionService:
         for peer in list(self._peers.values()):
             await self._close_peer(peer)
         self._peers.clear()
+        self._lan_peer_count = 0
         if self._writer:
             try:
                 self._writer.close()
@@ -639,8 +656,14 @@ class SessionService:
         )
 
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        address = "%s:%s" % writer.get_extra_info("peername", ("?", 0))[:2]
-        peer = Peer(peer_id=secrets.token_hex(8), writer=writer, address=address)
+        peername = writer.get_extra_info("peername") or ("?", 0)
+        address = "%s:%s" % peername[:2]
+        peer = Peer(
+            peer_id=secrets.token_hex(8),
+            writer=writer,
+            address=address,
+            lan=_is_lan_ip(str(peername[0])),
+        )
         peer.writer_task = asyncio.create_task(peer.drain_writes())
         try:
             while True:
@@ -1373,6 +1396,8 @@ class SessionService:
                 peer.role = int(entry.get("role", int(Role.EDITOR)))
                 peer.resume_token = token
                 peer.authenticated = True
+                if peer.lan:
+                    self._lan_peer_count += 1
                 self._peers[peer.peer_id] = peer
                 entry["last_seen"] = now
                 entry["peer_id"] = peer.peer_id
@@ -1419,6 +1444,8 @@ class SessionService:
             peer.name = f"{peer.name[:40]}-{peer.peer_id[:4]}"
         peer.color = clean_color(body.get("color"))
         peer.authenticated = True
+        if peer.lan:
+            self._lan_peer_count += 1
         self._peers[peer.peer_id] = peer
         peer.resume_token = secrets.token_urlsafe(24)
         self._recent[peer.resume_token] = {
@@ -1789,11 +1816,48 @@ class SessionService:
         return None
 
     def _peer_accepts(self, peer: Peer, frame: Frame, now: float) -> bool:
+        if frame.type == MessageType.PRESENCE:
+            # Presence has no object UID. LAN peers get every delta. Relay
+            # peers get camera-only deltas at 5 Hz, but state changes (frame,
+            # selection, active object, cursor, mode) go through immediately so
+            # a real update is never dropped by the throttle.
+            if peer.lan:
+                return True
+            try:
+                body = json.loads(frame.payload.decode("utf-8"))
+                sender = str(body.get("name", ""))[:48]
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                sender = ""
+                body = {}
+            if any(
+                key in body
+                for key in (
+                    "frame",
+                    "playing",
+                    "selected",
+                    "active",
+                    "mode",
+                    "scene",
+                    "scene_hash",
+                    "cursor",
+                )
+            ):
+                return True
+            key = ("presence", sender)
+            if now - peer.last_sent.get(key, 0.0) < 0.2:
+                return False
+            peer.last_sent[key] = now
+            return True
         uid = self._frame_uid(frame)
         if uid is None:
             return True
         if peer.subscriptions.get(uid) == "mute":
             return False
+        if peer.lan:
+            # Direct LAN: never rate-limit by interest or quality. Send every
+            # transform/mesh frame the sender produces, as fast as the socket
+            # allows.
+            return True
         if frame.type in (MessageType.OBJECT_CREATE, MessageType.OBJECT_DELETE, MessageType.SCENE_RESET):
             return True
         priority = int(peer.priorities.get(uid, 0))
@@ -1909,6 +1973,8 @@ class SessionService:
 
     async def _drop_peer(self, peer: Peer) -> None:
         was_authenticated = peer.authenticated
+        if was_authenticated and peer.lan:
+            self._lan_peer_count = max(0, self._lan_peer_count - 1)
         peer.authenticated = False
         peer.closed = True
         if peer.writer_task:
@@ -3033,6 +3099,10 @@ class SessionService:
         self._broadcast(protocol.json_frame(MessageType.LEASE, body))
         self._emit("lease", body)
         return True
+
+    def has_lan_peer(self) -> bool:
+        """True when at least one authenticated peer arrived over a LAN IP."""
+        return self._lan_peer_count > 0
 
     def stats(self) -> dict[str, Any]:
         peers = []

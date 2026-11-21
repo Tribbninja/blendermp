@@ -5,7 +5,7 @@ Blender and **docks the live window over the app viewport** (a native owned
 window, not video capture, so it keeps full GPU performance and avoids the black
 surface that cross-process re-parenting causes on some GPUs).
 
-> **Status: 0.9.5 collaboration foundation.** Hosting, the public server
+> **Status: 0.9.6 collaboration foundation.** Hosting, the public server
 > browser, TLS pinning, presence, chat, object transforms, mesh streaming, live
 > Edit Mode topology, animation, sculpt, materials/textures, asset bundles,
 > roles, checkpoints, an Ollama copilot, session recording/replay, a live
@@ -201,7 +201,7 @@ surface that cross-process re-parenting causes on some GPUs).
   same animated transition. Blender is hidden while arranging and returns to the
   viewport when you press Done or Escape.
 
-The protocol and engine have **213 passing unit tests** and **12 two-Blender or
+The protocol and engine have **216 passing unit tests** and **12 two-Blender or
 headless e2e suites**, including a real TLS host/client session,
 certificate-mismatch rejection, relay chat, password rejection and host kick
 over a multiplexed tunnel, the public directory API, 1,000-vertex delta
@@ -285,6 +285,11 @@ Internet sessions use a deliberately different profile from direct LAN sessions:
   rate, not `scene.render.fps`. A 24 fps scene no longer tricks the host into the
   lowest quality tier. Transform updates keep a 5–20 Hz floor even for
   off-screen or low-quality peers; mesh updates are the part that drops.
+* **Direct LAN fast path:** peers connecting from a private LAN address bypass
+  interest/quality rate limiting completely. Transforms and presence go at the
+  sender’s full rate, as fast as the socket allows. Relay peers keep the reduced
+  internet profile, and state-changing presence updates are never dropped by the
+  relay camera throttle.
 * **Silent by default:** notification beeps and their toggles were removed from
   the app and dashboard.
 

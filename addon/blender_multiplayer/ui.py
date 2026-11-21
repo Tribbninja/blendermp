@@ -66,6 +66,11 @@ class BMP_PT_main(bpy.types.Panel):
                     text="Internet mode: reduced presence/interest updates",
                     icon="WORLD",
                 )
+            elif settings.lan_fast:
+                box.label(
+                    text="LAN fast path: full transform/presence rate",
+                    icon="SORTTIME",
+                )
             row = box.row(align=True)
             row.prop(settings, "edit_locks")
             row.operator("bmp.release_locks", text="Release locks", icon="UNLOCKED")

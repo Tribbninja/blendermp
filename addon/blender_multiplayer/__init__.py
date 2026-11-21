@@ -72,7 +72,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 9, 5),
+    "version": (0, 9, 6),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -419,6 +419,7 @@ class BMPState(PropertyGroup):
     lease_requester: StringProperty()
     role: StringProperty(default="editor")
     internet_mode: BoolProperty(name="Internet mode", default=False)
+    lan_fast: BoolProperty(name="LAN fast path", default=False)
     overlay_info: StringProperty()
     direct_code: StringProperty()
     direct_codes: StringProperty()
@@ -6876,6 +6877,7 @@ def _write_status(context, force: bool = False) -> None:
             "farm_progress": settings.farm_progress,
             "farm_active": settings.farm_active,
             "internet_mode": settings.internet_mode,
+            "lan_fast": settings.lan_fast,
             "scene_hash": runtime.get("scene_hash", ""),
             "scene_mismatch": settings.scene_mismatch,
             "perf": runtime["perf"].snapshot(),
@@ -7080,11 +7082,16 @@ def _update_timing(session: SessionService | None) -> None:
         except Exception:  # noqa: BLE001
             rtt = 0.0
             relay = False
-    fast = not relay
+    lan_peer = bool(
+        session is not None and session.is_host and session.has_lan_peer()
+    )
+    fast = not relay or lan_peer
     runtime["fast_mode"] = fast
+    runtime["lan_fast"] = lan_peer if (session is not None and session.is_host) else (not relay)
     settings = bpy.context.window_manager.bmp if bpy.context.window_manager else None
     if settings is not None:
         settings.internet_mode = not fast
+        settings.lan_fast = bool(runtime.get("lan_fast"))
     runtime["transform_interval"] = 1.0 / 60.0 if fast else 1.0 / 30.0
     # Presence is delta-encoded, so this is the maximum update rate while the
     # user is moving. Relay sessions send far fewer packets; an idle session

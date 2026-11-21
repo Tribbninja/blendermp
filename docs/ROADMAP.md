@@ -7,6 +7,7 @@ streaming, edit leases, presence 2.0, exact remote application, durable settings
 strict version gate, lease request UX, server-enforced roles, optional LAN direct).
 
 Progress log:
+- [x] 2026-11-21: 0.9.6: direct LAN fast path: private-LAN peers bypass interest/quality rate limiting so transforms and presence run at the sender rate; relay peers stay on the low-bandwidth profile; presence state changes are never dropped by the relay camera throttle; host shows LAN fast path vs Internet mode.
 - [x] 2026-11-21: 0.9.5: removed all notification beeps and their toggles; fixed host-to-client smoothness by reporting real tick FPS instead of scene.render.fps, relaxing quality thresholds, and keeping a 5-20 Hz transform floor even for off-screen/low-quality peers.
 - [x] 2026-11-21: 0.9.4: viewport is model-only by default (name tags, lasers and selection wireframes are off and no longer forced on; remote selected-object lines obey Show selections); crash notices ignore markers from older builds; LAN farm host rendering is opt-in; animated-transform detection is cached.
 - [x] 2026-11-21: 0.9.3: bandwidth saver: delta-encoded presence, no viewport matrix unless Share my viewport position is on, relay presence at 3-5 Hz, interest updates every 5 s, client stats every 2 s, PING every 5 s; idle traffic is roughly 0.1 KB/s per client.
@@ -840,7 +841,7 @@ This release turns the Phase 6 scaffolds into working features:
   clears the local lock mirror, per-object lock messages are no longer written
   to chat, and the panel has **Release locks** plus an **Edit locks** off
   switch. `force_release_all` clears every host lease.
-* **Tests**: 213 unit tests and 12 two-Blender/headless e2e suites, including
+* **Tests**: 216 unit tests and 12 two-Blender/headless e2e suites, including
   `run_foundation.ps1` for AI tools, mesh export, bridge, broadcast and the
   recording tap.
 
