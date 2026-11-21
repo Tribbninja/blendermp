@@ -5,7 +5,7 @@ Blender and **docks the live window over the app viewport** (a native owned
 window, not video capture, so it keeps full GPU performance and avoids the black
 surface that cross-process re-parenting causes on some GPUs).
 
-> **Status: 0.9.2 collaboration foundation.** Hosting, the public server
+> **Status: 0.9.3 collaboration foundation.** Hosting, the public server
 > browser, TLS pinning, presence, chat, object transforms, mesh streaming, live
 > Edit Mode topology, animation, sculpt, materials/textures, asset bundles,
 > roles, checkpoints, an Ollama copilot, session recording/replay, a live
@@ -200,7 +200,7 @@ surface that cross-process re-parenting causes on some GPUs).
   same animated transition. Blender is hidden while arranging and returns to the
   viewport when you press Done or Escape.
 
-The protocol and engine have **211 passing unit tests** and **12 two-Blender or
+The protocol and engine have **212 passing unit tests** and **12 two-Blender or
 headless e2e suites**, including a real TLS host/client session,
 certificate-mismatch rejection, relay chat, password rejection and host kick
 over a multiplexed tunnel, the public directory API, 1,000-vertex delta
@@ -255,6 +255,25 @@ manual edit. A slow first load is normal; raise the timeout if the GPU is busy.
 
 Fluid/simulation caches are not distributed yet: Blender keeps point caches
 local, so a shared-cache workflow is a separate feature.
+
+## Bandwidth
+
+Internet sessions use a deliberately different profile from direct LAN sessions:
+
+* **Presence is delta-encoded.** Only changed fields are sent. An idle session
+  sends no presence at all except a small full snapshot every 30 seconds.
+* **Viewport position is opt-in.** `Share my viewport position` is off by
+  default, so the 16-float camera matrix and cursor are not transmitted. Turn it
+  on only if you want remote view tags.
+* **Relay profile:** presence at 5 Hz while moving (3 Hz on high RTT), interest
+  updates every 5 s, client stats every 2 s, PING every 5 s. Direct LAN keeps
+  30 Hz presence and 60 Hz transforms.
+* **Idle cost:** roughly 0.1 KB/s per client (stats, an occasional ping and the
+  30 s presence snapshot), instead of the old 10–20 KB/s from 20–30 Hz full
+  presence.
+* **Edits still use data:** transforms, mesh deltas, materials, textures and
+  asset bundles are sent when they change. Large assets and chunked transfers
+  are the dominant cost during real work, not idle time.
 
 ## Cross-network
 

@@ -76,8 +76,8 @@ MAX_VERTICES = 20_000_000
 MAX_CHAT = 2_000
 MAX_NAME = 48
 MAX_TEXT = 256
-PING_INTERVAL = 2.0
-PEER_TIMEOUT = 12.0
+PING_INTERVAL = 5.0
+PEER_TIMEOUT = 20.0
 DISCONNECT_STRIKES = 6
 CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 MUTATING_TYPES = {
@@ -757,16 +757,9 @@ class SessionService:
 
         if frame.type == MessageType.PRESENCE:
             body = self._json(frame)
-            presence = {
+            presence: dict[str, Any] = {
                 "name": peer.name,
                 "color": list(peer.color),
-                "scene": clean_text(body.get("scene"), 64),
-                "frame": int(body.get("frame", 0)) if isinstance(body.get("frame"), (int, float)) else 0,
-                "playing": bool(body.get("playing", False)),
-                "fps": max(1, min(240, int(body.get("fps", 24)))) if isinstance(body.get("fps"), (int, float)) else 24,
-                "mode": clean_text(body.get("mode"), 32),
-                "active": clean_text(body.get("active"), 64),
-                "selected": clean_text(body.get("selected"), 512),
                 "role": int(peer.role),
                 "ping_ms": (
                     max(0.0, min(5000.0, float(body["ping_ms"])))
@@ -774,6 +767,21 @@ class SessionService:
                     else round(max(0.0, float(peer.rtt_ms)), 1)
                 ),
             }
+            for key, limit in (
+                ("scene", 64),
+                ("mode", 32),
+                ("active", 64),
+                ("selected", 512),
+                ("scene_hash", 32),
+            ):
+                if key in body:
+                    presence[key] = clean_text(body.get(key), limit)
+            if "frame" in body and isinstance(body.get("frame"), (int, float)) and not isinstance(body.get("frame"), bool):
+                presence["frame"] = int(body["frame"])
+            if "playing" in body:
+                presence["playing"] = bool(body.get("playing"))
+            if "fps" in body and isinstance(body.get("fps"), (int, float)) and not isinstance(body.get("fps"), bool):
+                presence["fps"] = max(1, min(240, int(body["fps"])))
             cursor = body.get("cursor")
             if isinstance(cursor, list) and len(cursor) == 3:
                 try:
@@ -2171,17 +2179,25 @@ class SessionService:
 
         if frame.type == MessageType.PRESENCE:
             body = self._json(frame, 8192)
-            presence = {
+            presence: dict[str, Any] = {
                 "name": clean_text(body.get("name"), MAX_NAME),
                 "color": clean_color(body.get("color")),
-                "scene": clean_text(body.get("scene"), 64),
-                "frame": int(body.get("frame", 0)) if isinstance(body.get("frame"), (int, float)) else 0,
-                "playing": bool(body.get("playing", False)),
-                "fps": max(1, min(240, int(body.get("fps", 24)))) if isinstance(body.get("fps"), (int, float)) else 24,
-                "mode": clean_text(body.get("mode"), 32),
-                "active": clean_text(body.get("active"), 64),
-                "selected": clean_text(body.get("selected"), 512),
             }
+            for key, limit in (
+                ("scene", 64),
+                ("mode", 32),
+                ("active", 64),
+                ("selected", 512),
+                ("scene_hash", 32),
+            ):
+                if key in body:
+                    presence[key] = clean_text(body.get(key), limit)
+            if "frame" in body and isinstance(body.get("frame"), (int, float)) and not isinstance(body.get("frame"), bool):
+                presence["frame"] = int(body["frame"])
+            if "playing" in body:
+                presence["playing"] = bool(body.get("playing"))
+            if "fps" in body and isinstance(body.get("fps"), (int, float)) and not isinstance(body.get("fps"), bool):
+                presence["fps"] = max(1, min(240, int(body["fps"])))
             role_value = body.get("role")
             if isinstance(role_value, int) and not isinstance(role_value, bool) and 0 <= role_value <= 4:
                 presence["role"] = role_value
@@ -2665,15 +2681,25 @@ class SessionService:
         return self._revs[uid]
 
     def send_presence(self, body: dict[str, Any]) -> None:
-        payload = {
-            "scene": clean_text(body.get("scene"), 64),
-            "frame": int(body.get("frame", 0)) if isinstance(body.get("frame"), (int, float)) else 0,
-            "playing": bool(body.get("playing", False)),
-            "fps": max(1, min(240, int(body.get("fps", 24)))) if isinstance(body.get("fps"), (int, float)) else 24,
-            "mode": clean_text(body.get("mode"), 32),
-            "active": clean_text(body.get("active"), 64),
-            "selected": clean_text(body.get("selected"), 512),
-        }
+        # Presence is delta-encoded by the addon. Only copy the keys that were
+        # actually supplied; filling defaults here would make every small
+        # update a full snapshot and waste internet bandwidth.
+        payload: dict[str, Any] = {}
+        for key, limit in (
+            ("scene", 64),
+            ("mode", 32),
+            ("active", 64),
+            ("selected", 512),
+            ("scene_hash", 32),
+        ):
+            if key in body:
+                payload[key] = clean_text(body.get(key), limit)
+        if "frame" in body and isinstance(body.get("frame"), (int, float)) and not isinstance(body.get("frame"), bool):
+            payload["frame"] = int(body["frame"])
+        if "playing" in body:
+            payload["playing"] = bool(body.get("playing"))
+        if "fps" in body and isinstance(body.get("fps"), (int, float)) and not isinstance(body.get("fps"), bool):
+            payload["fps"] = max(1, min(240, int(body["fps"])))
         view = body.get("view")
         if isinstance(view, list) and len(view) == 16:
             try:
@@ -2696,8 +2722,6 @@ class SessionService:
                 values = []
             if len(values) == 3 and all(math.isfinite(value) and abs(value) < 1e7 for value in values):
                 payload["cursor"] = values
-        if not self.is_host and self._rtt_ms > 0:
-            payload["ping_ms"] = round(max(0.0, min(5000.0, self._rtt_ms)), 1)
         distance = body.get("dist")
         if isinstance(distance, (int, float)) and not isinstance(distance, bool):
             payload["dist"] = max(0.01, min(100000.0, float(distance)))
@@ -2709,7 +2733,8 @@ class SessionService:
                     "role": int(self.role),
                 }
             )
-        self._enqueue(protocol.json_frame(MessageType.PRESENCE, payload))
+        if payload:
+            self._enqueue(protocol.json_frame(MessageType.PRESENCE, payload))
 
     def send_selection(self, uid: str, mask: bytes, count: int, kind: int = 0) -> None:
         if not isinstance(mask, (bytes, bytearray)) or not 0 <= count <= 200_000:

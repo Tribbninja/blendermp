@@ -198,6 +198,7 @@ try:
 
         def __init__(self):
             self.actions = []
+            self.presences = []
 
         def local_lease(self, key, action):
             self.actions.append((key, action))
@@ -205,6 +206,9 @@ try:
 
         def send_lease(self, key, action):
             self.actions.append((key, action))
+
+        def send_presence(self, body):
+            self.presences.append(body)
 
     target = bpy.data.objects.get("AI_Renamed") or bpy.data.objects[0]
     target.hide_viewport = False
@@ -242,6 +246,27 @@ try:
     finally:
         bm.LEASE_IDLE, bm.LEASE_RENEW, bm.SELECTION_POLL = old_idle, old_renew, old_poll
         bm.runtime["session"] = None
+
+    # Presence is delta-encoded: an idle tick sends nothing.
+    fake = FakeSession()
+    bm.runtime["session"] = fake
+    bm.runtime["presence_shadow"].clear()
+    bm.runtime["presence_full_at"] = 0.0
+    bm.runtime["last_presence"] = 0.0
+    bm.runtime["presence_interval"] = 0.0
+    bpy.context.scene.frame_current = 3
+    bm._send_presence(bpy.context)
+    first = len(fake.presences)
+    bm.runtime["last_presence"] = 0.0
+    bm._send_presence(bpy.context)
+    idle = len(fake.presences)
+    bpy.context.scene.frame_current = 4
+    bm.runtime["last_presence"] = 0.0
+    bm._send_presence(bpy.context)
+    delta = fake.presences[-1] if fake.presences else {}
+    check("presence_idle", first == 1 and idle == 1, (first, idle))
+    check("presence_delta", "frame" in delta and "scene" not in delta, delta)
+    bm.runtime["session"] = None
 
     # Overlay cleanup: a remote view tag may be drawn, but no camera lines.
     settings.show_cameras = True

@@ -332,6 +332,11 @@
       text.textContent = `Farm: ${status.farm_url} (${Number(status.farm_workers) || 0} worker(s)) ${status.farm_progress || ""}`;
       rows.push(text);
     }
+    if (status.internet_mode) {
+      const text = document.createElement("span");
+      text.textContent = "Internet mode: reduced presence and interest updates";
+      rows.push(text);
+    }
     const budgets = status.perf && status.perf.budgets;
     if (budgets && typeof budgets === "object") {
       const parts = Object.entries(budgets)

@@ -72,7 +72,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 9, 2),
+    "version": (0, 9, 3),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -265,6 +265,8 @@ runtime: dict = {
     "received_images": {},
     "last_image": 0.0,
     "last_presence": 0.0,
+    "presence_shadow": {},
+    "presence_full_at": 0.0,
     "control_checked": 0.0,
     "started": 0.0,
     "session_started": 0.0,
@@ -342,6 +344,7 @@ class BMPState(PropertyGroup):
     follow_user: StringProperty()
     show_cameras: BoolProperty(name="Show remote view tag", default=False)
     show_selections: BoolProperty(name="Show selections", default=False)
+    share_view: BoolProperty(name="Share my viewport position", default=False)
     show_labels: BoolProperty(name="Show name tags", default=True)
     show_lasers: BoolProperty(name="Show laser pointers", default=True)
     overlay_opacity: FloatProperty(name="Overlay opacity", default=0.85, min=0.2, max=1.0)
@@ -411,6 +414,7 @@ class BMPState(PropertyGroup):
     lease_info: StringProperty()
     lease_requester: StringProperty()
     role: StringProperty(default="editor")
+    internet_mode: BoolProperty(name="Internet mode", default=False)
     overlay_info: StringProperty()
     direct_code: StringProperty()
     direct_codes: StringProperty()
@@ -629,6 +633,8 @@ def start_host(
     runtime["object_shadow"].clear()
     _prime_objects(context)
     runtime["last_selection"] = 0.0
+    runtime["presence_shadow"].clear()
+    runtime["presence_full_at"] = 0.0
     _sync_selection(context)
     _upsert_user(context, name, tuple(settings.color), host=True)
     _push_message(context, "system", f"Hosting room {code}")
@@ -783,6 +789,8 @@ def stop_session(context, publish: bool = True) -> None:
     runtime["deselected"].clear()
     runtime["lock_notified"].clear()
     runtime["last_selection"] = 0.0
+    runtime["presence_shadow"].clear()
+    runtime["presence_full_at"] = 0.0
     runtime["lease_renew"] = 0.0
     runtime["bootstraps"].clear()
     runtime["bootstrapping"] = False
@@ -877,6 +885,8 @@ def _handle_event(context, kind: str, body: dict) -> None:
         )
     elif kind == "welcome":
         settings.state = "connected"
+        runtime["presence_shadow"].clear()
+        runtime["presence_full_at"] = 0.0
         settings.host_name = body.get("name", "")
         if body.get("you"):
             settings.name = body["you"]
@@ -935,6 +945,8 @@ def _handle_event(context, kind: str, body: dict) -> None:
         settings.last_error = str(body.get("message", "relay error"))[:180]
     elif kind == "peer_join":
         name = body.get("name", "?")
+        runtime["presence_shadow"].clear()
+        runtime["presence_full_at"] = 0.0
         _upsert_user(context, name, body.get("color", (1, 1, 1, 1)))
         _push_message(context, "system", f"{name} joined")
         if settings.is_host:
@@ -995,54 +1007,68 @@ def _handle_event(context, kind: str, body: dict) -> None:
         _upsert_user(context, body.get("name", "?"), body.get("color", (1, 1, 1, 1)), role=role)
         for user in settings.users:
             if user.name == body.get("name"):
-                user.scene = body.get("scene", "")
-                user.frame = int(body.get("frame", 0))
-                user.playing = bool(body.get("playing", False))
-                user.fps = int(body.get("fps", 24) or 24)
-                user.mode = body.get("mode", "")
-                user.active = str(body.get("active", ""))[:64]
+                if "scene" in body:
+                    user.scene = str(body.get("scene", ""))[:64]
+                if "frame" in body:
+                    user.frame = int(body.get("frame", 0) or 0)
+                if "playing" in body:
+                    user.playing = bool(body.get("playing"))
+                if "fps" in body:
+                    user.fps = int(body.get("fps", 24) or 24)
+                if "mode" in body:
+                    user.mode = str(body.get("mode", ""))[:32]
+                if "active" in body:
+                    user.active = str(body.get("active", ""))[:64]
                 if role:
                     user.role = role
                     if body.get("name") == settings.name:
                         settings.role = role
-                view = body.get("view")
-                if isinstance(view, list) and len(view) == 16:
-                    try:
-                        values = [float(value) for value in view]
-                    except (TypeError, ValueError):
-                        values = []
-                    if len(values) == 16:
-                        user.view = values
-                        user.has_view = True
+                if "view" in body:
+                    view = body.get("view")
+                    if isinstance(view, list) and len(view) == 16:
+                        try:
+                            values = [float(value) for value in view]
+                        except (TypeError, ValueError):
+                            values = []
+                        if len(values) == 16:
+                            user.view = values
+                            user.has_view = True
+                        else:
+                            user.has_view = False
                     else:
                         user.has_view = False
-                else:
-                    user.has_view = False
-                aspect = body.get("aspect")
-                if isinstance(aspect, (int, float)) and not isinstance(aspect, bool):
-                    user.view_aspect = max(0.1, min(10.0, float(aspect)))
-                user.view_persp = str(body.get("persp", ""))[:16]
-                distance = body.get("dist")
-                if isinstance(distance, (int, float)) and not isinstance(distance, bool):
-                    user.view_distance = max(0.05, min(100000.0, float(distance)))
-                cursor = body.get("cursor")
-                if isinstance(cursor, list) and len(cursor) == 3:
-                    try:
-                        values = [float(value) for value in cursor]
-                    except (TypeError, ValueError):
-                        values = []
-                    if len(values) == 3:
-                        user.cursor = values
-                        user.has_cursor = True
+                if "aspect" in body:
+                    aspect = body.get("aspect")
+                    if isinstance(aspect, (int, float)) and not isinstance(aspect, bool):
+                        user.view_aspect = max(0.1, min(10.0, float(aspect)))
+                if "persp" in body:
+                    user.view_persp = str(body.get("persp", ""))[:16]
+                if "dist" in body:
+                    distance = body.get("dist")
+                    if isinstance(distance, (int, float)) and not isinstance(distance, bool):
+                        user.view_distance = max(0.05, min(100000.0, float(distance)))
+                if "cursor" in body:
+                    cursor = body.get("cursor")
+                    if isinstance(cursor, list) and len(cursor) == 3:
+                        try:
+                            values = [float(value) for value in cursor]
+                        except (TypeError, ValueError):
+                            values = []
+                        if len(values) == 3:
+                            user.cursor = values
+                            user.has_cursor = True
+                        else:
+                            user.has_cursor = False
                     else:
                         user.has_cursor = False
-                else:
-                    user.has_cursor = False
-                user.selected = str(body.get("selected", ""))[:512]
-                user.scene_hash = str(body.get("scene_hash", ""))[:32]
-                ping_value = body.get("ping_ms")
-                if isinstance(ping_value, (int, float)) and not isinstance(ping_value, bool):
-                    user.ping_ms = max(0, min(5000, int(round(float(ping_value)))))
+                if "selected" in body:
+                    user.selected = str(body.get("selected", ""))[:512]
+                if "scene_hash" in body:
+                    user.scene_hash = str(body.get("scene_hash", ""))[:32]
+                if "ping_ms" in body:
+                    ping_value = body.get("ping_ms")
+                    if isinstance(ping_value, (int, float)) and not isinstance(ping_value, bool):
+                        user.ping_ms = max(0, min(5000, int(round(float(ping_value)))))
                 if body.get("name") == settings.name:
                     user.ping_ms = settings.rtt_ms
         if (
@@ -3637,6 +3663,8 @@ def _clear_scene(context, body: dict | None = None) -> None:
     runtime["remote_points"] = []
     runtime["selection_digest"].clear()
     runtime["last_selection"] = 0.0
+    runtime["presence_shadow"].clear()
+    runtime["presence_full_at"] = 0.0
     runtime["lease_renew"] = 0.0
 
 
@@ -6471,7 +6499,7 @@ def _send_subscription(context) -> None:
     if session is None or settings.is_host:
         return
     now = time.monotonic()
-    if now - runtime.get("last_subscription", 0.0) < 0.5:
+    if now - runtime.get("last_subscription", 0.0) < runtime.get("subscription_interval", 0.5):
         return
     runtime["last_subscription"] = now
     view = _viewport_view(context)
@@ -6500,10 +6528,10 @@ def _send_subscription(context) -> None:
             distance = (point - camera).length
             local = inverse @ point
             depth = max(0.001, -float(local.z))
-            visible = float(local.z) < 0.0 and abs(float(local.x)) / depth <= aspect and abs(float(local.y)) / depth <= 1.0
-            if visible and distance < 50.0:
+            visible = float(local.z) < 0.0 and abs(float(local.x)) / depth <= aspect * 1.15 and abs(float(local.y)) / depth <= 1.15
+            if visible and distance < 55.0:
                 priority = 0
-            elif distance < 150.0:
+            elif distance < 165.0:
                 priority = 1
         uids.append(uid)
         priorities[uid] = priority
@@ -6525,7 +6553,7 @@ def _send_client_stats(context) -> None:
     if session is None or session.is_host:
         return
     now = time.monotonic()
-    if now - runtime.get("last_client_stats", 0.0) < 1.0:
+    if now - runtime.get("last_client_stats", 0.0) < runtime.get("stats_interval", 1.0):
         return
     runtime["last_client_stats"] = now
     stats = session.stats()
@@ -6614,24 +6642,46 @@ def _send_presence(context) -> None:
     if now - runtime["last_presence"] < runtime.get("presence_interval", PRESENCE_POLL):
         return
     runtime["last_presence"] = now
-    body = {
-        "scene": context.scene.name,
-        "frame": context.scene.frame_current,
+    full = {
+        "scene": str(context.scene.name)[:64],
+        "frame": int(context.scene.frame_current),
         "playing": bool(getattr(context.scene, "is_animation_playing", False)),
         "fps": int(context.scene.render.fps),
-        "mode": context.mode,
-        "active": context.active_object.name if context.active_object is not None else "",
-        "selected": ",".join(_selected_uids(context)),
-        "cursor": [float(value) for value in context.scene.cursor.location],
+        "mode": str(context.mode)[:32],
+        "active": (
+            str(context.active_object.name)[:64]
+            if context.active_object is not None
+            else ""
+        ),
+        "selected": ",".join(sorted(_selected_uids(context))),
         "scene_hash": runtime.get("scene_hash", ""),
     }
-    view = _viewport_view(context)
-    if view:
-        body["view"] = view["matrix"]
-        body["aspect"] = view["aspect"]
-        body["persp"] = view["persp"]
-        body["dist"] = view["distance"]
-    session.send_presence(body)
+    if getattr(context.window_manager.bmp, "share_view", False):
+        full["cursor"] = [
+            round(float(value), 4) for value in context.scene.cursor.location
+        ]
+        view = _viewport_view(context)
+        if view:
+            full["view"] = [round(float(value), 3) for value in view["matrix"]]
+            full["aspect"] = round(float(view["aspect"]), 3)
+            full["persp"] = view["persp"]
+            full["dist"] = round(float(view["distance"]), 3)
+
+    # Delta-encode presence. While the user is idle this sends nothing except a
+    # small full snapshot every 30 seconds. The old code sent the full view
+    # matrix at 20-30 Hz even when nothing had changed, which dominated internet
+    # usage.
+    shadow = runtime.setdefault("presence_shadow", {})
+    changed = {
+        key: value for key, value in full.items() if shadow.get(key) != value
+    }
+    if not changed:
+        return
+    if now - runtime.get("presence_full_at", 0.0) > 30.0:
+        changed = dict(full)
+        runtime["presence_full_at"] = now
+    shadow.update(changed)
+    session.send_presence(changed)
 
 
 def _scene_stats(context) -> dict:
@@ -6799,6 +6849,7 @@ def _write_status(context, force: bool = False) -> None:
             "farm_workers": settings.farm_workers,
             "farm_progress": settings.farm_progress,
             "farm_active": settings.farm_active,
+            "internet_mode": settings.internet_mode,
             "scene_hash": runtime.get("scene_hash", ""),
             "scene_mismatch": settings.scene_mismatch,
             "perf": runtime["perf"].snapshot(),
@@ -7003,10 +7054,23 @@ def _update_timing(session: SessionService | None) -> None:
         except Exception:  # noqa: BLE001
             rtt = 0.0
             relay = False
-    fast = not relay or rtt <= 0.0 or rtt <= 60.0
+    fast = not relay
     runtime["fast_mode"] = fast
+    settings = bpy.context.window_manager.bmp if bpy.context.window_manager else None
+    if settings is not None:
+        settings.internet_mode = not fast
     runtime["transform_interval"] = 1.0 / 60.0 if fast else 1.0 / 30.0
-    runtime["presence_interval"] = 1.0 / 30.0 if fast else 1.0 / 20.0
+    # Presence is delta-encoded, so this is the maximum update rate while the
+    # user is moving. Relay sessions send far fewer packets; an idle session
+    # sends only a small full snapshot every 30 s.
+    if fast:
+        runtime["presence_interval"] = 1.0 / 30.0
+        runtime["subscription_interval"] = 0.5
+        runtime["stats_interval"] = 1.0
+    else:
+        runtime["presence_interval"] = 1.0 / (3.0 if rtt > 150.0 else 5.0)
+        runtime["subscription_interval"] = 5.0
+        runtime["stats_interval"] = 2.0
     runtime["transform_smooth"] = 0.018 if fast else 0.035
     runtime["mesh_smooth"] = 0.025 if fast else 0.045
     runtime["view_smooth"] = 0.045 if fast else 0.075

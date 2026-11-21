@@ -61,6 +61,11 @@ class BMP_PT_main(bpy.types.Panel):
                 box.label(text=f"Verify: {settings.verify_code}", icon="LOCKED")
             if settings.code:
                 box.operator("bmp.copy_invite", text="Copy invite link", icon="URL")
+            if settings.internet_mode:
+                box.label(
+                    text="Internet mode: reduced presence/interest updates",
+                    icon="WORLD",
+                )
             row = box.row(align=True)
             row.prop(settings, "edit_locks")
             row.operator("bmp.release_locks", text="Release locks", icon="UNLOCKED")
@@ -279,6 +284,7 @@ class BMP_PT_main(bpy.types.Panel):
         box.operator("bmp.toggle_mute", text="Mute active object", icon="HIDE_ON")
         box.prop(settings, "paused")
         box.prop(settings, "show_cameras")
+        box.prop(settings, "share_view")
         box.prop(settings, "show_selections")
         box.prop(settings, "show_labels")
         box.prop(settings, "show_lasers")

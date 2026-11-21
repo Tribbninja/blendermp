@@ -301,7 +301,7 @@ def write_status(data: dict[str, Any]) -> None:
             for key in ("objects", "meshes", "vertices", "materials", "images", "collections")
             if isinstance(scene.get(key, 0), int) and not isinstance(scene.get(key, 0), bool)
         }
-    for key in ("is_host", "relay", "fast_mode", "farm_active"):
+    for key in ("is_host", "relay", "fast_mode", "farm_active", "internet_mode"):
         value = data.get(key)
         if isinstance(value, bool):
             safe[key] = value
