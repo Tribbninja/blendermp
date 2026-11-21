@@ -5,7 +5,7 @@ Blender and **docks the live window over the app viewport** (a native owned
 window, not video capture, so it keeps full GPU performance and avoids the black
 surface that cross-process re-parenting causes on some GPUs).
 
-> **Status: 0.9.6 collaboration foundation.** Hosting, the public server
+> **Status: 0.9.7 collaboration foundation.** Hosting, the public server
 > browser, TLS pinning, presence, chat, object transforms, mesh streaming, live
 > Edit Mode topology, animation, sculpt, materials/textures, asset bundles,
 > roles, checkpoints, an Ollama copilot, session recording/replay, a live
@@ -34,10 +34,13 @@ surface that cross-process re-parenting causes on some GPUs).
   snapshot after the operation settles. The receiver rebuilds the mesh while
   remaining in Object Mode. Large snapshots use a C-side read and a cheaper
   compression pass.
-* **Clean viewport**: remote camera widgets, look rays and cursor lines are gone.
-  Name tags, lasers and selection wireframes are **off by default and no longer
-  forced on at session start**. Remote view tags, when enabled, use one crisp
-  drop shadow and a single fill. The viewport is model-only by default.
+* **Collaborator overlays**: each peer's viewport camera is drawn as a compact
+  wire camera in their own colour, complete with a lens pyramid and look ray, so
+  you can see where everyone is looking. Objects selected by a peer get a
+  wireframe outline in that peer's colour. Hover any outlined object to see who
+  is editing or has it selected. Name tags stay crisp, and every overlay has its
+  own toggle (Show remote cameras, Show remote selections, Show name tags, Show
+  who is editing on hover).
 * **Independent timelines**: animated object transforms, pose and shape values
   are evaluated locally from the shared action, so each user can scrub to a
   different frame. Turn on **Sync live pose/shape values** only if you want

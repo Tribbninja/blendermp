@@ -291,6 +291,7 @@ class BMP_PT_main(bpy.types.Panel):
         box.prop(settings, "show_cameras")
         box.prop(settings, "share_view")
         box.prop(settings, "show_selections")
+        box.prop(settings, "show_hover_info")
         box.prop(settings, "show_labels")
         box.prop(settings, "show_lasers")
         box.prop(settings, "overlay_opacity")

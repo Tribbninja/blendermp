@@ -72,7 +72,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 9, 6),
+    "version": (0, 9, 7),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -154,6 +154,7 @@ runtime: dict = {
     "remote_point_batches": [],
     "remote_labels": [],
     "remote_shader": None,
+    "tooltip_shader": None,
     "last_remote": 0.0,
     "view_smoothers": {},
     "remote_debug": {},
@@ -197,6 +198,12 @@ runtime: dict = {
     "create_errors": set(),
     "draw_lines": None,
     "draw_labels": None,
+    "draw_hover": None,
+    "hover_info": None,
+    "hover_mouse": None,
+    "hover_op_active": False,
+    "hover_op_try": 0.0,
+    "hover_last_update": 0.0,
     "transform_smoothers": {},
     "mesh_smoothers": {},
     "lease_renew": 0.0,
@@ -346,10 +353,11 @@ class BMPState(PropertyGroup):
     paused: BoolProperty(name="Pause sync", default=False)
     follow_host: BoolProperty(name="Follow host frame", default=False)
     follow_user: StringProperty()
-    show_cameras: BoolProperty(name="Show remote view tag", default=False)
-    show_selections: BoolProperty(name="Show selections", default=False)
-    share_view: BoolProperty(name="Share my viewport position", default=False)
-    show_labels: BoolProperty(name="Show name tags", default=False)
+    show_cameras: BoolProperty(name="Show remote cameras", default=True)
+    show_selections: BoolProperty(name="Show remote selections", default=True)
+    share_view: BoolProperty(name="Share my viewport camera", default=True)
+    show_labels: BoolProperty(name="Show name tags", default=True)
+    show_hover_info: BoolProperty(name="Show who is editing on hover", default=True)
     show_lasers: BoolProperty(name="Show laser pointers", default=False)
     overlay_opacity: FloatProperty(name="Overlay opacity", default=0.85, min=0.2, max=1.0)
     overlay_scale: FloatProperty(name="Overlay scale", default=1.0, min=0.5, max=2.0)
@@ -602,11 +610,6 @@ def start_host(
     settings.is_host = True
     settings.state = "hosting"
     settings.role = "owner"
-    # The viewport is model-only by default. Remote overlays are opt-in; forcing
-    # them on at session start was why name tags kept coming back.
-    settings.show_cameras = False
-    settings.show_selections = False
-    settings.show_labels = False
     settings.show_lasers = False
     settings.last_error = ""
     settings.last_error_code = ""
@@ -670,9 +673,6 @@ def start_join(
     settings.is_host = False
     settings.state = "joining"
     settings.role = "editor"
-    settings.show_cameras = False
-    settings.show_selections = False
-    settings.show_labels = False
     settings.show_lasers = False
     settings.last_error = ""
     settings.last_error_code = ""
@@ -771,6 +771,8 @@ def stop_session(context, publish: bool = True) -> None:
         except Exception:  # noqa: BLE001
             traceback.print_exc()
     runtime["session"] = None
+    runtime["hover_op_active"] = False
+    runtime["hover_info"] = None
     bridge = runtime.pop("relay_bridge", None)
     if bridge is not None:
         try:
@@ -1297,8 +1299,12 @@ def _should_ignore_remote_transform(context, uid: str) -> bool:
     window = getattr(context, "window", None)
     if window is not None:
         try:
-            if window.modal_operators:
-                return True
+            for operator in window.modal_operators:
+                ident = str(getattr(operator, "bl_idname", ""))
+                # The passive hover watcher is always modal while a session is
+                # active; it must not count as "the user is transforming".
+                if ident not in {"BMP_OT_hover", "bmp.hover"}:
+                    return True
         except Exception:  # noqa: BLE001
             pass
     return False
@@ -6061,10 +6067,11 @@ def _handle_bundle_offer(context, manifest: dict) -> None:
 
 
 def _camera_segments(matrix, aspect: float, distance: float = 7.0, scale: float = 1.0) -> list:
-    """A camera-shaped wire pyramid that shows both position and gaze.
+    """A camera-shaped wire model that shows both position and gaze.
 
-    The widget is sized from the remote orbit distance so it stays readable at
-    any zoom level, and the centre ray makes the look direction obvious.
+    The widget is a compact body plus a lens pyramid, sized from the remote
+    orbit distance so it stays readable at any zoom level. The centre ray makes
+    the look direction obvious.
     """
     from mathutils import Vector
 
@@ -6075,20 +6082,43 @@ def _camera_segments(matrix, aspect: float, distance: float = 7.0, scale: float 
     if not math.isfinite(orbit) or orbit <= 0.0:
         orbit = 7.0
     size = 0.3 * max(0.5, min(2.0, float(scale or 1.0)))
-    forward = size
-    height = size * 0.35
+    zoom = max(0.4, min(3.0, math.sqrt(orbit / 7.0)))
+    size = max(0.08, min(2.4, size * zoom))
+    forward = size * 2.4
+    height = size * 0.55
     width = height * max(0.6, min(2.6, float(aspect or 1.6)))
-    apex = matrix @ Vector((0.0, 0.0, 0.0))
+
+    # Camera body: a compact box centred on the remote view position.
+    half = size * 0.55
+    bx = half * 0.9
+    by = half * 0.65
+    bz = half * 0.5
+    local_body = [
+        (-bx, -by, bz), (bx, -by, bz), (bx, by, bz), (-bx, by, bz),
+        (-bx, -by, -bz), (bx, -by, -bz), (bx, by, -bz), (-bx, by, -bz),
+    ]
+    body = [matrix @ Vector(point) for point in local_body]
+    pairs = (
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    )
+    segments = [(body[first], body[second]) for first, second in pairs]
+
+    # Lens pyramid from the front of the body to the image plane.
+    apex = matrix @ Vector((0.0, 0.0, -bz))
     corners = [
         matrix @ Vector((-width, -height, -forward)),
         matrix @ Vector((width, -height, -forward)),
         matrix @ Vector((width, height, -forward)),
         matrix @ Vector((-width, height, -forward)),
     ]
-    segments = [(apex, corner) for corner in corners]
+    segments.extend((apex, corner) for corner in corners)
     segments.extend(
         (corners[index], corners[(index + 1) % 4]) for index in range(4)
     )
+    # A centre look ray makes the gaze direction unmistakable.
+    segments.append((apex, matrix @ Vector((0.0, 0.0, -forward * 1.25))))
     return segments
 
 
@@ -6255,7 +6285,7 @@ def _sync_remote_visuals(context) -> None:
     settings = context.window_manager.bmp
     from mathutils import Vector
 
-    show_view_tags = bool(getattr(settings, "show_cameras", False))
+    show_cameras = bool(getattr(settings, "show_cameras", False))
     show_selections = bool(getattr(settings, "show_selections", False))
     show_lasers = bool(getattr(settings, "show_lasers", False))
     colorblind = bool(getattr(settings, "colorblind_safe", False))
@@ -6309,16 +6339,33 @@ def _sync_remote_visuals(context) -> None:
             matrix = _smooth_view(user.name, list(user.view), now)
             if matrix is not None:
                 origin = matrix.translation
-                widget = 0.2
-                if show_view_tags:
-                    labels.append(
-                        (origin + Vector((0.0, 0.0, widget * 0.5)), user.name, color)
+                if show_cameras:
+                    segments = _camera_segments(
+                        matrix,
+                        float(user.view_aspect or 1.6),
+                        float(user.view_distance or 7.0),
+                        overlay_scale,
                     )
+                    if segments:
+                        lines.append((color, segments))
+                        labels.append(
+                            (
+                                origin
+                                + Vector((0.0, 0.0, 0.3 * overlay_scale)),
+                                user.name,
+                                color,
+                            )
+                        )
+                        total += len(segments)
+                        for first, second in segments:
+                            max_segment = max(
+                                max_segment, float((second - first).length)
+                            )
         if show_selections:
             uids = [uid for uid in str(user.selected or "").split(",") if uid]
             for uid in uids[:6]:
                 obj = obj_sync.find(uid)
-                if obj is None or obj.get("bmp_remote"):
+                if obj is None:
                     continue
                 segments = _object_segments(obj)
                 if not segments:
@@ -6488,6 +6535,296 @@ def _draw_remote_labels() -> None:
             pass
 
 
+def _viewport_region_at(window, x: float, y: float):
+    """Return (area, region, region_data) under a window-space point."""
+    try:
+        screen = window.screen
+    except Exception:  # noqa: BLE001
+        return None, None, None
+    if screen is None:
+        return None, None, None
+    for area in screen.areas:
+        if area.type != "VIEW_3D":
+            continue
+        region = next((item for item in area.regions if item.type == "WINDOW"), None)
+        if region is None:
+            continue
+        if not (
+            region.x <= x < region.x + region.width
+            and region.y <= y < region.y + region.height
+        ):
+            continue
+        try:
+            region_data = area.spaces.active.region_3d
+        except Exception:  # noqa: BLE001
+            region_data = None
+        if region_data is not None:
+            return area, region, region_data
+    return None, None, None
+
+
+def _remote_selection_names(settings, uid: str) -> list[str]:
+    names = []
+    for user in settings.users:
+        if user.name == settings.name:
+            continue
+        selected = {item for item in str(user.selected or "").split(",") if item}
+        if uid in selected:
+            names.append(user.name)
+    return names
+
+
+def _hover_color(settings, name: str):
+    for user in settings.users:
+        if user.name == name:
+            return effective_color(
+                user.name,
+                user.color,
+                bool(getattr(settings, "colorblind_safe", False)),
+            )
+    return DEFAULT_COLOR
+
+
+def _update_hover(context) -> None:
+    """Ray-cast under the mouse and remember who is editing that object."""
+    settings = getattr(context.window_manager, "bmp", None)
+    session = runtime.get("session")
+    if (
+        settings is None
+        or session is None
+        or not getattr(settings, "show_hover_info", True)
+    ):
+        runtime["hover_info"] = None
+        return
+    mouse = runtime.get("hover_mouse")
+    if not mouse:
+        runtime["hover_info"] = None
+        return
+    try:
+        window_x, window_y, stamp = mouse
+    except (TypeError, ValueError):
+        runtime["hover_info"] = None
+        return
+    if time.monotonic() - float(stamp) > 2.0:
+        runtime["hover_info"] = None
+        return
+    window = getattr(context, "window", None)
+    if window is None:
+        runtime["hover_info"] = None
+        return
+    area, region, region_data = _viewport_region_at(window, window_x, window_y)
+    if region is None or region_data is None:
+        runtime["hover_info"] = None
+        return
+    from bpy_extras import view3d_utils
+
+    region_x = float(window_x) - float(region.x)
+    region_y = float(window_y) - float(region.y)
+    try:
+        origin = view3d_utils.region_2d_to_origin_3d(
+            region, region_data, (region_x, region_y)
+        )
+        direction = view3d_utils.region_2d_to_vector_3d(
+            region, region_data, (region_x, region_y)
+        )
+        depsgraph = context.evaluated_depsgraph_get()
+        hit, _location, _normal, _index, obj, _matrix = context.scene.ray_cast(
+            depsgraph, origin, direction
+        )
+    except Exception:  # noqa: BLE001
+        runtime["hover_info"] = None
+        return
+    if not hit or obj is None:
+        runtime["hover_info"] = None
+        return
+    uid = obj.get("bmp_uuid")
+    if not uid:
+        runtime["hover_info"] = None
+        return
+    names = _remote_selection_names(settings, uid)
+    owner = runtime.get("lease_owners", {}).get(uid, "")
+    if owner == settings.name:
+        owner = ""
+    if not names and not owner:
+        runtime["hover_info"] = None
+        return
+    parts = []
+    if owner:
+        parts.append(f"{owner} is editing")
+    others = [name for name in names if name != owner]
+    if others:
+        if len(others) == 1:
+            parts.append(f"{others[0]} has it selected")
+        else:
+            parts.append(f"{', '.join(others[:3])} have it selected")
+    text = " - ".join(parts)
+    color = _hover_color(settings, owner or (others[0] if others else ""))
+    runtime["hover_info"] = {
+        "text": text[:140],
+        "color": tuple(color),
+        "object": str(obj.name)[:64],
+        "region": region.as_pointer(),
+        "area": area.as_pointer(),
+        "mouse": (window_x, window_y),
+        "stamp": time.monotonic(),
+    }
+
+
+def _draw_hover_tooltip() -> None:
+    info = runtime.get("hover_info")
+    if not info:
+        return
+    if time.monotonic() - float(info.get("stamp", 0.0)) > 2.0:
+        runtime["hover_info"] = None
+        return
+    try:
+        import blf
+    except ImportError:
+        return
+    context = bpy.context
+    region = getattr(context, "region", None)
+    if region is None or info.get("region") != region.as_pointer():
+        return
+    mouse = info.get("mouse")
+    text = str(info.get("text") or "")
+    if not mouse or not text:
+        return
+    scale = float(runtime.get("overlay_scale", 1.0) or 1.0)
+    font = 0
+    try:
+        blf.size(font, 14.0 * scale, 72.0)
+    except Exception:  # noqa: BLE001
+        try:
+            blf.size(font, 14)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        width, height = blf.dimensions(font, text)
+    except Exception:  # noqa: BLE001
+        width, height = 8.0 * len(text), 14.0
+    pad = 6.0 * scale
+    box_w = width + pad * 2.0
+    box_h = height + pad * 2.0
+    x = float(mouse[0]) - float(region.x)
+    y = float(mouse[1]) - float(region.y)
+    left = x + 16.0 * scale
+    bottom = y + 18.0 * scale
+    if left + box_w > region.width - 4.0:
+        left = x - 16.0 * scale - box_w
+    if bottom + box_h > region.height - 4.0:
+        bottom = y - 18.0 * scale - box_h
+    left = max(4.0, left)
+    bottom = max(4.0, bottom)
+    color = info.get("color") or (1.0, 1.0, 1.0)
+    accent_color = _readable_label(color)
+    try:
+        import gpu
+        from gpu_extras.batch import batch_for_shader
+
+        try:
+            shader = runtime.get("tooltip_shader")
+            if shader is None:
+                try:
+                    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+                except Exception:  # noqa: BLE001
+                    try:
+                        shader = gpu.shader.from_builtin("2D_UNIFORM_COLOR")
+                    except Exception:  # noqa: BLE001
+                        shader = gpu.shader.from_builtin("3D_UNIFORM_COLOR")
+                runtime["tooltip_shader"] = shader
+        except Exception:  # noqa: BLE001
+            return
+        quad = batch_for_shader(
+            shader,
+            "TRI_FAN",
+            {
+                "pos": [
+                    (left, bottom),
+                    (left + box_w, bottom),
+                    (left + box_w, bottom + box_h),
+                    (left, bottom + box_h),
+                ]
+            },
+        )
+        gpu.state.blend_set("ALPHA")
+        shader.uniform_float("color", (0.03, 0.03, 0.04, 0.9))
+        quad.draw(shader)
+        accent = batch_for_shader(
+            shader,
+            "LINES",
+            {
+                "pos": [
+                    (left + 1.0, bottom + 1.0),
+                    (left + 1.0, bottom + box_h - 1.0),
+                ]
+            },
+        )
+        try:
+            gpu.state.line_width_set(max(2.0, 3.0 * scale))
+        except Exception:  # noqa: BLE001
+            pass
+        shader.uniform_float(
+            "color", (accent_color[0], accent_color[1], accent_color[2], 1.0)
+        )
+        accent.draw(shader)
+        try:
+            gpu.state.line_width_set(1.0)
+        except Exception:  # noqa: BLE001
+            pass
+        gpu.state.blend_set("NONE")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        blf.color(font, 0.0, 0.0, 0.0, 0.9)
+        blf.position(font, left + pad + 1.0, bottom + pad - 1.0, 0.0)
+        blf.draw(font, text)
+        blf.color(font, 1.0, 1.0, 1.0, 1.0)
+        blf.position(font, left + pad, bottom + pad, 0.0)
+        blf.draw(font, text)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _ensure_hover_operator(context) -> None:
+    """Start the passive hover watcher when a session is active."""
+    if runtime.get("hover_op_active"):
+        return
+    if runtime.get("session") is None:
+        return
+    settings = getattr(context.window_manager, "bmp", None)
+    if settings is None or not getattr(settings, "show_hover_info", True):
+        return
+    now = time.monotonic()
+    if now - float(runtime.get("hover_op_try", 0.0)) < 2.0:
+        return
+    runtime["hover_op_try"] = now
+    window = getattr(context, "window", None)
+    if window is None:
+        windows = list(getattr(context.window_manager, "windows", []))
+        window = windows[0] if windows else None
+    if window is None:
+        return
+    try:
+        screen = window.screen
+    except Exception:  # noqa: BLE001
+        return
+    if screen is None:
+        return
+    area = next((item for item in screen.areas if item.type == "VIEW_3D"), None)
+    if area is None:
+        return
+    region = next((item for item in area.regions if item.type == "WINDOW"), None)
+    if region is None:
+        return
+    try:
+        with context.temp_override(
+            window=window, screen=screen, area=area, region=region
+        ):
+            bpy.ops.bmp.hover("INVOKE_DEFAULT")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _register_remote_draw() -> None:
     try:
         from bpy.types import SpaceView3D
@@ -6500,12 +6837,16 @@ def _register_remote_draw() -> None:
             runtime["draw_labels"] = SpaceView3D.draw_handler_add(
                 _draw_remote_labels, (), "WINDOW", "POST_PIXEL"
             )
+        if runtime.get("draw_hover") is None:
+            runtime["draw_hover"] = SpaceView3D.draw_handler_add(
+                _draw_hover_tooltip, (), "WINDOW", "POST_PIXEL"
+            )
     except Exception:  # noqa: BLE001
         traceback.print_exc()
 
 
 def _unregister_remote_draw() -> None:
-    for key in ("draw_lines", "draw_labels"):
+    for key in ("draw_lines", "draw_labels", "draw_hover"):
         handle = runtime.pop(key, None)
         if handle is None:
             continue
@@ -6513,6 +6854,8 @@ def _unregister_remote_draw() -> None:
             bpy.types.SpaceView3D.draw_handler_remove(handle, "WINDOW")
         except Exception:  # noqa: BLE001
             pass
+    runtime["hover_op_active"] = False
+    runtime["hover_info"] = None
     runtime["remote_batches"] = []
     runtime["remote_point_batches"] = []
     runtime["remote_points"] = []
@@ -7185,6 +7528,7 @@ def bmp_tick():
         _maybe_auto_checkpoint(context)
         _pump_scene_bootstrap(context)
         _sync_remote_visuals(context)
+        _ensure_hover_operator(context)
         with runtime["perf"].measure("bridge_pump"):
             _pump_bridge(context)
         _pump_renderfarm(context)
@@ -7633,6 +7977,63 @@ class BMP_OT_laser(Operator):
         runtime["laser_active"] = False
         try:
             context.window.cursor_modal_restore()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class BMP_OT_hover(Operator):
+    bl_idname = "bmp.hover"
+    bl_label = "Collaborator hover info"
+    bl_description = "Show who is editing the object under the mouse"
+    bl_options = {"REGISTER", "INTERNAL"}
+
+    def invoke(self, context, event):
+        if context.area is None or context.area.type != "VIEW_3D":
+            return {"CANCELLED"}
+        self._window_ptr = context.window.as_pointer()
+        self._timer = context.window_manager.event_timer_add(
+            0.1, window=context.window
+        )
+        runtime["hover_op_active"] = True
+        runtime["hover_mouse"] = (event.mouse_x, event.mouse_y, time.monotonic())
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        session = runtime.get("session")
+        settings = getattr(context.window_manager, "bmp", None)
+        if (
+            not runtime.get("hover_op_active")
+            or session is None
+            or settings is None
+            or not getattr(settings, "show_hover_info", True)
+            or getattr(context, "window", None) is None
+            or context.window.as_pointer() != self._window_ptr
+        ):
+            self._finish(context)
+            return {"CANCELLED"}
+        if event.type in {"MOUSEMOVE", "INBETWEEN_MOUSEMOVE"}:
+            runtime["hover_mouse"] = (
+                event.mouse_x,
+                event.mouse_y,
+                time.monotonic(),
+            )
+            now = time.monotonic()
+            if now - float(runtime.get("hover_last_update", 0.0)) >= 0.05:
+                runtime["hover_last_update"] = now
+                _update_hover(context)
+        elif event.type == "TIMER":
+            now = time.monotonic()
+            if now - float(runtime.get("hover_last_update", 0.0)) >= 0.35:
+                runtime["hover_last_update"] = now
+                _update_hover(context)
+        return {"PASS_THROUGH"}
+
+    def _finish(self, context) -> None:
+        runtime["hover_op_active"] = False
+        runtime["hover_info"] = None
+        try:
+            context.window_manager.event_timer_remove(self._timer)
         except Exception:  # noqa: BLE001
             pass
 
@@ -9256,6 +9657,7 @@ classes = (
     BMP_OT_untrack_mesh,
     BMP_OT_ping,
     BMP_OT_laser,
+    BMP_OT_hover,
     BMP_OT_trust_host,
     BMP_OT_ai_ask,
     BMP_OT_ai_test,

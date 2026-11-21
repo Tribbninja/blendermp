@@ -290,7 +290,8 @@ try:
     check("presence_delta", "frame" in delta and "scene" not in delta, delta)
     bm.runtime["session"] = None
 
-    # Overlay cleanup: a remote view tag may be drawn, but no camera lines.
+    # Remote overlays: camera widgets are drawn in the peer's colour, and
+    # selection outlines are opt-in.
     settings.show_cameras = True
     settings.show_selections = False
     settings.show_lasers = False
@@ -313,23 +314,42 @@ try:
     user.selected = uid
     bm._sync_remote_visuals(bpy.context)
     debug = bm.runtime.get("remote_debug", {})
+    from mathutils import Matrix
+
+    camera_segments = bm._camera_segments(Matrix.Identity(4), 1.6, 7.0, 1.0)
+    check("camera_segments", len(camera_segments) == 21, len(camera_segments))
+    check(
+        "camera_widget",
+        int(debug.get("segments", 0)) >= len(camera_segments),
+        debug,
+    )
     check(
         "view_tag",
         any(label[1] == "tester" for label in bm.runtime.get("remote_labels", [])),
         bm.runtime.get("remote_labels"),
     )
     check(
-        "no_camera_lines",
+        "hover_names",
+        bm._remote_selection_names(settings, uid) == ["tester"],
+        bm._remote_selection_names(settings, uid),
+    )
+    settings.show_cameras = False
+    bm.runtime["last_remote"] = 0.0
+    bm._sync_remote_visuals(bpy.context)
+    debug = bm.runtime.get("remote_debug", {})
+    check(
+        "camera_off",
         int(debug.get("segments", 0)) == 0,
         debug,
     )
+    settings.show_cameras = True
     settings.show_selections = True
     bm.runtime["last_remote"] = 0.0
     bm._sync_remote_visuals(bpy.context)
     debug = bm.runtime.get("remote_debug", {})
     check(
         "selection_lines_opt_in",
-        int(debug.get("segments", 0)) > 0,
+        int(debug.get("segments", 0)) > len(camera_segments),
         debug,
     )
     settings.users.remove(len(settings.users) - 1)
@@ -337,6 +357,34 @@ try:
     settings.show_selections = False
     settings.show_lasers = True
     bm.runtime["session"] = None
+
+    # The passive hover watcher is modal while a session is active, but it must
+    # never count as "the user is transforming" and block remote transforms.
+    class _HoverModal:
+        bl_idname = "BMP_OT_hover"
+
+    class _TransformModal:
+        bl_idname = "TRANSFORM_OT_translate"
+
+    class _FakeWindow:
+        modal_operators = [_HoverModal()]
+
+    class _FakeContext:
+        window = _FakeWindow()
+        active_object = None
+        mode = "OBJECT"
+
+    check(
+        "hover_modal_ignored",
+        not bm._should_ignore_remote_transform(_FakeContext(), "hover-test-uid"),
+        "hover modal blocked remote transforms",
+    )
+    _FakeWindow.modal_operators = [_TransformModal()]
+    check(
+        "transform_modal_blocks",
+        bm._should_ignore_remote_transform(_FakeContext(), "hover-test-uid"),
+        "transform modal did not block remote transforms",
+    )
 
     # Scene fingerprint and mismatch warning.
     fingerprint = bm._scene_fingerprint(bpy.context)
