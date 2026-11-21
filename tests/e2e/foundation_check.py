@@ -18,10 +18,27 @@ import bpy
 
 sys.path.insert(0, os.environ["BMP_ADDON"])
 import blender_multiplayer as bm  # noqa: E402
+from blender_multiplayer.core import heartbeat  # noqa: E402
 from blender_multiplayer.core import recording  # noqa: E402
 
 RESULT = {"ok": True, "errors": [], "details": {}}
 DATA = os.environ.get("BMP_TEST_DATA", os.environ.get("TEMP", "."))
+
+# A crash marker from an older build must not show a notice after an update.
+stale = heartbeat.heartbeat_dir() / "999999.json"
+stale.write_text(
+    json.dumps(
+        {
+            "pid": 999999,
+            "stamp": time.time(),
+            "state": "hosting",
+            "session": "OLD",
+            "blender": "5.3.0",
+            "addon": "0.0.1",
+        }
+    ),
+    encoding="utf-8",
+)
 
 
 def check(name, condition, detail=None):
@@ -32,6 +49,11 @@ def check(name, condition, detail=None):
 
 
 bm.register()
+check(
+    "stale_crash_ignored",
+    not bm.runtime.get("crash_entries"),
+    bm.runtime.get("crash_entries"),
+)
 try:
     bpy.ops.mesh.primitive_cube_add(location=(0.0, 0.0, 0.0))
     cube = bpy.context.active_object
@@ -285,7 +307,12 @@ try:
     bm.runtime["last_remote"] = 0.0
     bm.runtime["remote_batches"] = []
     bm.runtime["remote_labels"] = []
+    target = bpy.data.objects.get("AI_Renamed") or bpy.data.objects[0]
+    uid = target.get("bmp_uuid") or "77777777-7777-7777-7777-777777777777"
+    target["bmp_uuid"] = uid
+    user.selected = uid
     bm._sync_remote_visuals(bpy.context)
+    debug = bm.runtime.get("remote_debug", {})
     check(
         "view_tag",
         any(label[1] == "tester" for label in bm.runtime.get("remote_labels", [])),
@@ -293,8 +320,17 @@ try:
     )
     check(
         "no_camera_lines",
-        not bm.runtime.get("remote_batches"),
-        len(bm.runtime.get("remote_batches", [])),
+        int(debug.get("segments", 0)) == 0,
+        debug,
+    )
+    settings.show_selections = True
+    bm.runtime["last_remote"] = 0.0
+    bm._sync_remote_visuals(bpy.context)
+    debug = bm.runtime.get("remote_debug", {})
+    check(
+        "selection_lines_opt_in",
+        int(debug.get("segments", 0)) > 0,
+        debug,
     )
     settings.users.remove(len(settings.users) - 1)
     settings.show_cameras = False

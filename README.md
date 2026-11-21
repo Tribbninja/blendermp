@@ -5,7 +5,7 @@ Blender and **docks the live window over the app viewport** (a native owned
 window, not video capture, so it keeps full GPU performance and avoids the black
 surface that cross-process re-parenting causes on some GPUs).
 
-> **Status: 0.9.3 collaboration foundation.** Hosting, the public server
+> **Status: 0.9.4 collaboration foundation.** Hosting, the public server
 > browser, TLS pinning, presence, chat, object transforms, mesh streaming, live
 > Edit Mode topology, animation, sculpt, materials/textures, asset bundles,
 > roles, checkpoints, an Ollama copilot, session recording/replay, a live
@@ -34,9 +34,10 @@ surface that cross-process re-parenting causes on some GPUs).
   snapshot after the operation settles. The receiver rebuilds the mesh while
   remaining in Object Mode. Large snapshots use a C-side read and a cheaper
   compression pass.
-* **Clean viewport**: remote camera widgets and cursor lines are gone. Remote
-  view tags use one crisp drop shadow and a single fill instead of a smeared
-  outline. Selections are off by default, so everyone sees the same models.
+* **Clean viewport**: remote camera widgets, look rays and cursor lines are gone.
+  Name tags, lasers and selection wireframes are **off by default and no longer
+  forced on at session start**. Remote view tags, when enabled, use one crisp
+  drop shadow and a single fill. The viewport is model-only by default.
 * **Independent timelines**: animated object transforms, pose and shape values
   are evaluated locally from the shared action, so each user can scrub to a
   different frame. Turn on **Sync live pose/shape values** only if you want
@@ -239,9 +240,15 @@ manual edit. A slow first load is normal; raise the timeout if the GPU is busy.
 ## Viewport, timeline and LAN render farm
 
 * **Same models, clean viewport.** Remote camera widgets, look rays and cursor
-  crosses are removed. Name tags use a clean single-pass shadow/fill. Selection
-  overlays are off by default. A structural scene hash warns if a client is
-  missing objects or has different mesh counts, and the host can resync.
+  crosses are removed. Name tags, lasers and selection wireframes are off by
+  default and are not forced on at session start. Remote selected-object lines
+  now obey `Show selections`, so the red stray lines are gone too. A structural
+  scene hash warns if a client is missing objects or has different mesh counts,
+  and the host can resync.
+* **Crash notice hygiene.** A crash marker from an older addon build is ignored,
+  so updating/installing no longer produces a false “closed unexpectedly”
+  notice. The LAN farm host does not render on the host PC unless
+  `This PC renders too` is explicitly enabled.
 * **Separate timelines.** Object transforms driven by actions/NLA/drivers,
   armature poses and shape-key values are evaluated locally. Everyone shares the
   same action and models but can sit on a different frame. **Follow host frame**

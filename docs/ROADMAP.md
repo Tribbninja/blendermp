@@ -7,6 +7,7 @@ streaming, edit leases, presence 2.0, exact remote application, durable settings
 strict version gate, lease request UX, server-enforced roles, optional LAN direct).
 
 Progress log:
+- [x] 2026-11-21: 0.9.4: viewport is model-only by default (name tags, lasers and selection wireframes are off and no longer forced on; remote selected-object lines obey Show selections); crash notices ignore markers from older builds; LAN farm host rendering is opt-in; animated-transform detection is cached.
 - [x] 2026-11-21: 0.9.3: bandwidth saver: delta-encoded presence, no viewport matrix unless Share my viewport position is on, relay presence at 3-5 Hz, interest updates every 5 s, client stats every 2 s, PING every 5 s; idle traffic is roughly 0.1 KB/s per client.
 - [x] 2026-11-21: 0.9.2: clean viewport (no remote camera/cursor lines, crisp name tags, selections off by default), independent timelines (animated transforms, pose and shape values evaluated locally), scene fingerprint + resync, and a token-protected LAN render farm that distributes frames and uploads PNGs.
 - [x] 2026-11-21: 0.9.1: lease reliability fix: idle selections release after 30s, renewals require actual edits, disconnect leases expire in 30s, peer-leave clears the local lock mirror, per-object lock messages no longer spam chat, and the panel has Release locks plus an Edit locks off switch.

@@ -72,7 +72,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 9, 3),
+    "version": (0, 9, 4),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -202,6 +202,7 @@ runtime: dict = {
     "lease_renew": 0.0,
     "lease_activity": {},
     "lease_suppress_until": 0.0,
+    "animated_cache": {},
     "bootstrapping": False,
     "bootstrap_deadline": 0.0,
     "bootstraps": {},
@@ -345,8 +346,8 @@ class BMPState(PropertyGroup):
     show_cameras: BoolProperty(name="Show remote view tag", default=False)
     show_selections: BoolProperty(name="Show selections", default=False)
     share_view: BoolProperty(name="Share my viewport position", default=False)
-    show_labels: BoolProperty(name="Show name tags", default=True)
-    show_lasers: BoolProperty(name="Show laser pointers", default=True)
+    show_labels: BoolProperty(name="Show name tags", default=False)
+    show_lasers: BoolProperty(name="Show laser pointers", default=False)
     overlay_opacity: FloatProperty(name="Overlay opacity", default=0.85, min=0.2, max=1.0)
     overlay_scale: FloatProperty(name="Overlay scale", default=1.0, min=0.5, max=2.0)
     colorblind_safe: BoolProperty(name="Colour-blind-safe colours", default=False)
@@ -400,7 +401,7 @@ class BMPState(PropertyGroup):
     farm_frame_end: IntProperty(name="End frame", default=250, min=0)
     farm_frame_step: IntProperty(name="Frame step", default=1, min=1)
     farm_use_scene_range: BoolProperty(name="Use scene frame range", default=True)
-    farm_host_worker: BoolProperty(name="This PC renders too", default=True)
+    farm_host_worker: BoolProperty(name="This PC renders too", default=False)
     farm_client_url: StringProperty(name="Farm URL", default="")
     farm_client_token: StringProperty(name="Farm token", default="")
     host_name: StringProperty()
@@ -597,8 +598,12 @@ def start_host(
     settings.is_host = True
     settings.state = "hosting"
     settings.role = "owner"
-    settings.show_selections = True
-    settings.show_labels = True
+    # The viewport is model-only by default. Remote overlays are opt-in; forcing
+    # them on at session start was why name tags kept coming back.
+    settings.show_cameras = False
+    settings.show_selections = False
+    settings.show_labels = False
+    settings.show_lasers = False
     settings.last_error = ""
     settings.last_error_code = ""
     settings.journal_available = False
@@ -661,8 +666,10 @@ def start_join(
     settings.is_host = False
     settings.state = "joining"
     settings.role = "editor"
-    settings.show_selections = True
-    settings.show_labels = True
+    settings.show_cameras = False
+    settings.show_selections = False
+    settings.show_labels = False
+    settings.show_lasers = False
     settings.last_error = ""
     settings.last_error_code = ""
     settings.pending_fingerprint = ""
@@ -4619,6 +4626,20 @@ def _sync_selection(context) -> None:
     runtime["selection"] = selected
 
 def _object_transform_animated(obj) -> bool:
+    """Cached wrapper: animation state changes rarely, so do not inspect the
+    action graph 60 times a second for every object."""
+    now = time.monotonic()
+    uid = str(obj.get("bmp_uuid") or obj.name)
+    cache = runtime.setdefault("animated_cache", {})
+    cached = cache.get(uid)
+    if cached is not None and now - cached[0] < 1.0:
+        return cached[1]
+    result = _object_transform_animated_uncached(obj)
+    cache[uid] = (now, result)
+    return result
+
+
+def _object_transform_animated_uncached(obj) -> bool:
     """True when an action/NLA drives this object's transform.
 
     Animated transforms are evaluated locally from the shared action, so each
@@ -6232,7 +6253,7 @@ def _sync_remote_visuals(context) -> None:
 
     show_view_tags = bool(getattr(settings, "show_cameras", False))
     show_selections = bool(getattr(settings, "show_selections", False))
-    show_lasers = bool(getattr(settings, "show_lasers", True))
+    show_lasers = bool(getattr(settings, "show_lasers", False))
     colorblind = bool(getattr(settings, "colorblind_safe", False))
     opacity = float(getattr(settings, "overlay_opacity", 0.85) or 0.85)
     overlay_scale = float(getattr(settings, "overlay_scale", 1.0) or 1.0)
@@ -6289,21 +6310,22 @@ def _sync_remote_visuals(context) -> None:
                     labels.append(
                         (origin + Vector((0.0, 0.0, widget * 0.5)), user.name, color)
                     )
-        uids = [uid for uid in str(user.selected or "").split(",") if uid]
-        for uid in uids[:6]:
-            obj = obj_sync.find(uid)
-            if obj is None or obj.get("bmp_remote"):
-                continue
-            segments = _object_segments(obj)
-            if not segments:
-                continue
-            lines.append((color, segments))
-            labels.append((_object_label(obj), user.name, color))
-            total += len(segments)
-            for first, second in segments:
-                max_segment = max(max_segment, float((second - first).length))
-            if total > 30000:
-                break
+        if show_selections:
+            uids = [uid for uid in str(user.selected or "").split(",") if uid]
+            for uid in uids[:6]:
+                obj = obj_sync.find(uid)
+                if obj is None or obj.get("bmp_remote"):
+                    continue
+                segments = _object_segments(obj)
+                if not segments:
+                    continue
+                lines.append((color, segments))
+                labels.append((_object_label(obj), user.name, color))
+                total += len(segments)
+                for first, second in segments:
+                    max_segment = max(max_segment, float((second - first).length))
+                if total > 30000:
+                    break
         if show_selections:
             selections = runtime["remote_selections"].get(user.name) or {}
             for uid, entry in list(selections.items())[:4]:
@@ -6718,7 +6740,12 @@ def _heartbeat_tick(context) -> None:
         settings.code,
         {"blender": bpy.app.version_string, "addon": ADDON_VERSION},
     )
-    entries = runtime.get("crash_entries")
+    entries = [
+        entry
+        for entry in (runtime.get("crash_entries") or [])
+        if str(entry.get("addon", "")) == ADDON_VERSION
+    ]
+    runtime["crash_entries"] = entries
     if entries and not settings.crash_notice:
         latest = entries[0]
         stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(latest.get("stamp", 0))))
@@ -7958,6 +7985,8 @@ def _stop_farm_client(settings):
 def _render_farm_frame(context, work, server=None, client=None):
     """Render one farm frame on Blender's main thread, then hand it back."""
     scene = context.scene
+    if scene.camera is None:
+        return False, "scene has no active camera"
     previous_frame = scene.frame_current
     previous_path = scene.render.filepath
     previous_format = scene.render.image_settings.file_format
@@ -9275,7 +9304,15 @@ def register() -> None:
     except Exception:  # noqa: BLE001
         traceback.print_exc()
     try:
-        runtime["crash_entries"] = heartbeat.unclean_exits()
+        entries = heartbeat.unclean_exits()
+        # A marker from an older build is not a crash of this build. Ignoring it
+        # also prevents an installer/update shutdown from showing a scary notice
+        # after the new version starts.
+        runtime["crash_entries"] = [
+            entry
+            for entry in entries
+            if str(entry.get("addon", "")) == ADDON_VERSION
+        ]
     except Exception:  # noqa: BLE001
         traceback.print_exc()
         runtime["crash_entries"] = []
