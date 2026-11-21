@@ -14,9 +14,20 @@
     contrast: "normal",
     font: "normal",
     motion: "0",
-    sound: "1",
+    sound: "0",
     dnd: "0",
   };
+
+  // Notification beeps used to default on. Turn them off once for existing
+  // installs; the sound toggle can turn them back on deliberately.
+  try {
+    if (localStorage.getItem("bmp.soundOffMigration") !== "1") {
+      localStorage.setItem("bmp.sound", "0");
+      localStorage.setItem("bmp.soundOffMigration", "1");
+    }
+  } catch {
+    /* localStorage is optional */
+  }
 
   function read(key) {
     try {

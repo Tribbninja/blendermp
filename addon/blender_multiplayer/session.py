@@ -868,9 +868,9 @@ class SessionService:
             fps = float(stats.get("fps", 60.0))
             queue_depth = float(stats.get("queue_depth", 0.0))
             quality = 0
-            if apply_ms > 25.0 or fps < 30.0 or queue_depth > 200:
+            if apply_ms > 40.0 or fps < 20.0 or queue_depth > 300:
                 quality = 2
-            elif apply_ms > 15.0 or fps < 45.0 or queue_depth > 80:
+            elif apply_ms > 20.0 or fps < 35.0 or queue_depth > 120:
                 quality = 1
             if quality < peer.quality:
                 quality = max(quality, peer.quality - 1)
@@ -1802,12 +1802,14 @@ class SessionService:
         if priority > 2:
             priority = 2
         if frame.type == MessageType.TRANSFORM:
-            base = (1.0 / 30.0, 1.0 / 10.0, 1.0 / 2.0)[priority]
+            base = (1.0 / 30.0, 1.0 / 15.0, 1.0 / 8.0)[priority]
+            scale = (1.0, 1.2, 1.5)[peer.quality]
         elif frame.type in (MessageType.MESH_DELTA, MessageType.MESH_SNAPSHOT):
             base = (1.0 / 20.0, 1.0 / 5.0, 1.0)[priority]
+            scale = (1.0, 2.0, 4.0)[peer.quality]
         else:
             base = (1.0 / 30.0, 1.0 / 10.0, 1.0 / 2.0)[priority]
-        scale = (1.0, 2.0, 4.0)[peer.quality]
+            scale = (1.0, 2.0, 4.0)[peer.quality]
         key = (uid, int(frame.type))
         if now - peer.last_sent.get(key, 0.0) < base * scale:
             return False

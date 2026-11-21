@@ -209,6 +209,37 @@ def test_presence_delta_does_not_reset_fields(tmp_path, monkeypatch):
         host_events.stop()
 
 
+def test_client_stats_quality_thresholds(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    port = free_port()
+    code = encode_room("127.0.0.1", port)
+    host_inbox = queue.Queue()
+    client_inbox = queue.Queue()
+    host_events = Events(host_inbox)
+    client_events = Events(client_inbox)
+    host = session_mod.SessionService(host_inbox, host=True, code=code, name="host", color=(1, 1, 1, 1), port=port)
+    host.start()
+    assert wait_for(lambda: host.state == "hosting")
+    client = session_mod.SessionService(client_inbox, host=False, code=code, name="alice", color=(1, 1, 1, 1))
+    client.start()
+    try:
+        assert wait_for(lambda: client.state == "connected")
+        client.send_client_stats(
+            {"apply_ms_p95": 5.0, "fps": 60.0, "rx_kbps": 1.0, "tx_kbps": 1.0, "queue_depth": 0.0}
+        )
+        assert wait_for(lambda: host_events.has("client_stats", name="alice", quality=0))
+        client.send_client_stats(
+            {"apply_ms_p95": 50.0, "fps": 10.0, "rx_kbps": 1.0, "tx_kbps": 1.0, "queue_depth": 0.0}
+        )
+        assert wait_for(lambda: host_events.has("client_stats", name="alice", quality=2))
+    finally:
+        client.stop()
+        host.stop()
+        client_events.stop()
+        host_events.stop()
+
+
 def test_role_guard_and_downgrade(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))

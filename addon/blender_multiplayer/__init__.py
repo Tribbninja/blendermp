@@ -72,7 +72,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 9, 4),
+    "version": (0, 9, 5),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -200,6 +200,9 @@ runtime: dict = {
     "transform_smoothers": {},
     "mesh_smoothers": {},
     "lease_renew": 0.0,
+    "tick_fps": 60.0,
+    "tick_count": 0,
+    "tick_fps_at": 0.0,
     "lease_activity": {},
     "lease_suppress_until": 0.0,
     "animated_cache": {},
@@ -6589,11 +6592,7 @@ def _send_client_stats(context) -> None:
     runtime["stats_time"] = now
     times = sorted(runtime.get("apply_times", [])[-120:])
     p95 = times[int(len(times) * 0.95)] if times else 0.0
-    fps = 0.0
-    try:
-        fps = float(bpy.context.scene.render.fps)
-    except Exception:  # noqa: BLE001
-        fps = 60.0
+    fps = float(runtime.get("tick_fps", 60.0) or 60.0)
     session.send_client_stats(
         {
             "apply_ms_p95": round(float(p95), 2),
@@ -7109,6 +7108,18 @@ def bmp_tick():
         return TICK
     try:
         tick_started = time.perf_counter()
+        # Measure the addon's real tick rate for CLIENT_STATS. The old code sent
+        # scene.render.fps, so a 24 fps scene made the host think the client was
+        # slow and downgrade it to the lowest quality tier.
+        runtime["tick_count"] = int(runtime.get("tick_count", 0)) + 1
+        fps_now = time.monotonic()
+        fps_at = float(runtime.get("tick_fps_at", 0.0))
+        if fps_at <= 0.0:
+            runtime["tick_fps_at"] = fps_now
+        elif fps_now - fps_at >= 1.0:
+            runtime["tick_fps"] = runtime["tick_count"] / max(0.001, fps_now - fps_at)
+            runtime["tick_count"] = 0
+            runtime["tick_fps_at"] = fps_now
         _poll_control(context)
         _ensure_bookmarks(context)
         _heartbeat_tick(context)

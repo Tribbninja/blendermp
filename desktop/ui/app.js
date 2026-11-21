@@ -140,7 +140,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.9.4";
+const APP_VERSION = "0.9.5";
 const PROTOCOL_VERSION = 3;
 const CAPABILITIES = 1 | (1 << 10) | (1 << 11) | (1 << 12); // presence, bookmarks, bundles, chunks
 const settings = {
@@ -309,25 +309,6 @@ function toast(message, kind = "") {
   setTimeout(() => item.remove(), 4200);
 }
 
-let notificationAudio = null;
-function notificationBeep() {
-  if (!window.BMPA11y?.sound || window.BMPA11y?.dnd) return;
-  try {
-    const AudioCtx = window.AudioContext || window.webkitAudioContext;
-    if (!AudioCtx) return;
-    notificationAudio = notificationAudio || new AudioCtx();
-    const oscillator = notificationAudio.createOscillator();
-    const gain = notificationAudio.createGain();
-    oscillator.frequency.value = 740;
-    gain.gain.value = 0.03;
-    oscillator.connect(gain);
-    gain.connect(notificationAudio.destination);
-    oscillator.start();
-    oscillator.stop(notificationAudio.currentTime + 0.09);
-  } catch {
-    /* sound is optional */
-  }
-}
 
 function initials(name) {
   return (name || "?").slice(0, 2).toUpperCase();
@@ -885,7 +866,7 @@ function renderMessages(status) {
   state.messagesKey = key;
   const latest = messages[messages.length - 1];
   if (previousKey && latest && latest.author && latest.author !== settings.name) {
-    notificationBeep();
+    // Notification beeps were removed; chat stays silent.
   }
 
   const host = $("messages");
@@ -1108,16 +1089,13 @@ function syncAccessibilityControls() {
   const contrast = $("setContrast");
   const font = $("setFontScale");
   const motion = $("setMotion");
-  const sound = $("setSound");
   if (contrast) contrast.value = a11y.contrast || "normal";
   if (font) font.value = a11y.font || "normal";
   if (motion) motion.checked = a11y.reducedMotion;
-  if (sound) sound.checked = a11y.sound;
   if (store.loaded) {
     store.set("contrast", a11y.contrast || "normal");
     store.set("fontScale", a11y.font || "normal");
     store.set("reducedMotion", a11y.reducedMotion ? "1" : "0");
-    store.set("sound", a11y.sound ? "1" : "0");
     store.set("dnd", a11y.dnd ? "1" : "0");
   }
 }
@@ -1814,7 +1792,6 @@ function wire() {
   $("setContrast").addEventListener("change", () => window.BMPA11y?.set("contrast", $("setContrast").value));
   $("setFontScale").addEventListener("change", () => window.BMPA11y?.set("font", $("setFontScale").value));
   $("setMotion").addEventListener("change", () => window.BMPA11y?.set("motion", $("setMotion").checked ? "1" : "0"));
-  $("setSound").addEventListener("change", () => window.BMPA11y?.set("sound", $("setSound").checked ? "1" : "0"));
   document.addEventListener("bmp-a11y", syncAccessibilityControls);
   $("saveSettings").addEventListener("click", () => {
     settings.name = $("setName").value.trim() || settings.name;

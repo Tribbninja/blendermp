@@ -68,7 +68,6 @@
         <section class="dash-card">
           <div class="section-head"><span>Notifications</span><span id="dashDndLabel">on</span></div>
           <label class="check"><input type="checkbox" id="dashDnd" /><span>Do not disturb</span></label>
-          <label class="check"><input type="checkbox" id="dashSound" /><span>Sound on new messages</span></label>
           <p class="fine">Chat, joins, leases and errors are mirrored from Blender.</p>
         </section>
         <section class="dash-card">
@@ -152,25 +151,6 @@
     host.prepend(item);
     while (host.children.length > 3) host.lastElementChild.remove();
     setTimeout(() => item.remove(), 4200);
-  }
-
-  function beep() {
-    if (!window.BMPA11y?.sound || window.BMPA11y?.dnd) return;
-    try {
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      if (!AudioCtx) return;
-      state.audio = state.audio || new AudioCtx();
-      const oscillator = state.audio.createOscillator();
-      const gain = state.audio.createGain();
-      oscillator.frequency.value = 740;
-      gain.gain.value = 0.035;
-      oscillator.connect(gain);
-      gain.connect(state.audio.destination);
-      oscillator.start();
-      oscillator.stop(state.audio.currentTime + 0.09);
-    } catch {
-      /* sound is optional */
-    }
   }
 
   function messageKey(message) {
@@ -414,7 +394,6 @@
       const last = messages[messages.length - 1];
       if (last.author && last.author !== current.name && !window.BMPA11y?.dnd) {
         toast(`${last.author}: ${String(last.text || "").slice(0, 120)}`);
-        beep();
       }
     }
     if (latest) state.lastMessage = latest;
@@ -502,13 +481,11 @@
     });
 
     const dnd = $("dashDnd");
-    const sound = $("dashSound");
     const contrast = $("dashContrast");
     const font = $("dashFont");
     const motion = $("dashMotion");
     const syncA11y = () => {
       dnd.checked = window.BMPA11y?.dnd || false;
-      sound.checked = window.BMPA11y?.sound || false;
       contrast.value = window.BMPA11y?.contrast || "normal";
       font.value = window.BMPA11y?.font || "normal";
       motion.checked = window.BMPA11y?.reducedMotion || false;
@@ -519,10 +496,6 @@
       window.BMPA11y?.set("dnd", dnd.checked ? "1" : "0");
       persistPrefs();
       syncA11y();
-    });
-    sound.addEventListener("change", () => {
-      window.BMPA11y?.set("sound", sound.checked ? "1" : "0");
-      persistPrefs();
     });
     contrast.addEventListener("change", () => {
       window.BMPA11y?.set("contrast", contrast.value);

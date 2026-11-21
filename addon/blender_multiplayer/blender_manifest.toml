@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "blender_multiplayer"
-version = "0.9.4"
+version = "0.9.5"
 name = "Blendermp"
 tagline = "Low-latency collaborative Blender sessions over TLS"
 maintainer = "Blendermp"

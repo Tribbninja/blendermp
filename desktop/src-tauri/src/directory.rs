@@ -275,7 +275,7 @@ fn read_prefs() -> Value {
         "contrast": text("contrast", "normal"),
         "fontScale": text("fontScale", "normal"),
         "reducedMotion": text("reducedMotion", "0"),
-        "sound": text("sound", "1"),
+        "sound": text("sound", "0"),
         "dnd": text("dnd", "0"),
     })
 }
