@@ -10,6 +10,7 @@ import os
 import socket
 import sys
 import threading
+import time
 import urllib.request
 
 import bpy
@@ -188,6 +189,58 @@ try:
         replay.summary(),
     )
     RESULT["details"]["recording"] = replay.summary()
+
+    # Idle leases must release themselves even while the object stays selected.
+    class FakeSession:
+        is_host = True
+        state = "hosting"
+
+        def __init__(self):
+            self.actions = []
+
+        def local_lease(self, key, action):
+            self.actions.append((key, action))
+            return True
+
+        def send_lease(self, key, action):
+            self.actions.append((key, action))
+
+    target = bpy.data.objects.get("AI_Renamed") or bpy.data.objects[0]
+    target.hide_viewport = False
+    try:
+        target.hide_set(False)
+    except Exception:  # noqa: BLE001
+        pass
+    uid = target.get("bmp_uuid") or "66666666-6666-6666-6666-666666666666"
+    target["bmp_uuid"] = uid
+    for item in bpy.context.selected_objects:
+        item.select_set(False)
+    target.select_set(True)
+    bpy.context.view_layer.update()
+    fake = FakeSession()
+    bm.runtime["session"] = fake
+    bm.runtime["lease_owners"].clear()
+    bm.runtime["owned_leases"].clear()
+    bm.runtime["lease_activity"].clear()
+    bm.runtime["hidden_objects"].clear()
+    bm.runtime["selection"].clear()
+    bm.runtime["last_selection"] = 0.0
+    bm.runtime["lease_renew"] = 0.0
+    old_idle, old_renew, old_poll = bm.LEASE_IDLE, bm.LEASE_RENEW, bm.SELECTION_POLL
+    bm.LEASE_IDLE, bm.LEASE_RENEW, bm.SELECTION_POLL = 0.8, 0.3, 0.0
+    try:
+        bm._sync_selection(bpy.context)
+        released = False
+        for _ in range(20):
+            time.sleep(0.15)
+            bm._sync_selection(bpy.context)
+            if any(action == "release" for _key, action in fake.actions):
+                released = True
+                break
+        check("lease_idle_release", released, fake.actions)
+    finally:
+        bm.LEASE_IDLE, bm.LEASE_RENEW, bm.SELECTION_POLL = old_idle, old_renew, old_poll
+        bm.runtime["session"] = None
 finally:
     bm.unregister()
 

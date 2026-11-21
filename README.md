@@ -1,4 +1,4 @@
-# Blendermp
+﻿# Blendermp
 
 Low-latency collaborative Blender sessions, with a desktop app that launches
 Blender and **docks the live window over the app viewport** (a native owned
@@ -50,7 +50,10 @@ surface that cross-process re-parenting causes on some GPUs).
   uses `BMesh.to_mesh` + `foreach_get` instead of per-element Python loops.
 * **One editor per object**: selecting an object claims an edit lease. Other
   players see it locked (unselectable) and cannot edit it until the owner
-  deselects or leaves. The active object name is shown for each player.
+  deselects, stops editing for 30 seconds, or leaves. Idle selections release
+  themselves; **Release locks** in the panel clears them immediately, and
+  **Edit locks** can be turned off entirely. The active object name is shown
+  for each player.
 * **Remote presence in the viewport**: each player's viewport camera is drawn as
   a colored view pyramid with a look-direction ray and their name above it, and
   their selected objects are wireframed in their color with a name tag. Camera
@@ -183,7 +186,7 @@ surface that cross-process re-parenting causes on some GPUs).
   same animated transition. Blender is hidden while arranging and returns to the
   viewport when you press Done or Escape.
 
-The protocol and engine have **205 passing unit tests** and **12 two-Blender or
+The protocol and engine have **206 passing unit tests** and **12 two-Blender or
 headless e2e suites**, including a real TLS host/client session,
 certificate-mismatch rejection, relay chat, password rejection and host kick
 over a multiplexed tunnel, the public directory API, 1,000-vertex delta
@@ -294,8 +297,8 @@ Produces:
   if none is found it offers to download the official Blender 5.3 MSI from
   blender.org, verifies the pinned SHA-256, installs it silently, and then
   installs Blendermp. Silent setup (`/S`) installs Blendermp only.
-* `dist/blendermp-windows-x64-<version>.zip` — portable app + addon + docs.
-* `dist/blender_multiplayer-<version>.zip` — Blender extension (validated),
+* `dist/blendermp-windows-x64-<version>.zip` â€” portable app + addon + docs.
+* `dist/blender_multiplayer-<version>.zip` â€” Blender extension (validated),
   optional if you want to launch Blender outside the app.
 
 Silent install: `Blendermp-0.1.0-Setup.exe /S`.
@@ -487,9 +490,9 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
 
 ## Diagnostics
 
-- In the app, open **Diagnostics → Export diagnostics bundle**. The redacted zip
+- In the app, open **Diagnostics â†’ Export diagnostics bundle**. The redacted zip
   is written to `%LOCALAPPDATA%\Blendermp\diagnostics\`.
-- In Blender, **N-panel → Blendermp → Export diagnostics bundle** writes the
+- In Blender, **N-panel â†’ Blendermp â†’ Export diagnostics bundle** writes the
   same kind of zip through a file picker.
 - The bundle contains versions, OS/GPU, `status.json`, heartbeats, recent
   network/scene stats and the last 500 lines of `ui.log`, `blender.log` and

@@ -51,6 +51,11 @@ class BMP_PT_main(bpy.types.Panel):
                 box.label(text=f"Verify: {settings.verify_code}", icon="LOCKED")
             if settings.code:
                 box.operator("bmp.copy_invite", text="Copy invite link", icon="URL")
+            row = box.row(align=True)
+            row.prop(settings, "edit_locks")
+            row.operator("bmp.release_locks", text="Release locks", icon="UNLOCKED")
+            if settings.lease_info:
+                box.label(text=settings.lease_info[:80], icon="LOCKED")
 
         row = layout.row(align=True)
         if settings.state == "offline":

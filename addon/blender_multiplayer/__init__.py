@@ -86,7 +86,8 @@ STATUS_WRITE = 0.5
 MESH_POLL = 1.0 / 20.0
 EDIT_POLL = 1.0 / 30.0
 SELECTION_POLL = 0.2
-LEASE_RENEW = 30.0
+LEASE_RENEW = 15.0
+LEASE_IDLE = 30.0
 PRESENCE_POLL = 1.0 / 20.0
 REMOTE_POLL = 1.0 / 30.0
 TRANSFORM_SMOOTH = 0.02
@@ -194,6 +195,8 @@ runtime: dict = {
     "transform_smoothers": {},
     "mesh_smoothers": {},
     "lease_renew": 0.0,
+    "lease_activity": {},
+    "lease_suppress_until": 0.0,
     "bootstrapping": False,
     "bootstrap_deadline": 0.0,
     "bootstraps": {},
@@ -369,6 +372,7 @@ class BMPState(PropertyGroup):
     bridge_clients: IntProperty(name="Bridge clients", default=0, min=0)
     host_name: StringProperty()
     sync_transforms: BoolProperty(name="Sync object transforms", default=True)
+    edit_locks: BoolProperty(name="Edit locks", default=True)
     users: CollectionProperty(type=BMPUser)
     messages: CollectionProperty(type=BMPMessage)
     show_users: BoolProperty(default=True)
@@ -922,7 +926,24 @@ def _handle_event(context, kind: str, body: dict) -> None:
             return
         _finish_scene_bootstrap(context, body)
     elif kind == "peer_leave":
-        _remove_user(context, body.get("name", "?"))
+        name = body.get("name", "?")
+        _remove_user(context, name)
+        # A peer that leaves (or crashes) must not leave phantom locks in the
+        # local mirror, even if a lease-release frame was missed.
+        for uid, owner in list(runtime["lease_owners"].items()):
+            if owner == name:
+                runtime["lease_owners"].pop(uid, None)
+                runtime["owned_leases"].discard(uid)
+                runtime["lease_activity"].pop(uid, None)
+        for uid in list(runtime["hidden_objects"]):
+            if uid not in runtime["lease_owners"]:
+                obj = obj_sync.find(uid)
+                if obj is not None:
+                    try:
+                        obj.hide_select = False
+                    except Exception:  # noqa: BLE001
+                        pass
+                runtime["hidden_objects"].discard(uid)
         _push_message(context, "system", f"{body.get('name', 'someone')} left")
     elif kind == "role":
         name = str(body.get("name", ""))[:48]
@@ -1063,11 +1084,9 @@ def _handle_event(context, kind: str, body: dict) -> None:
                 keys = [key] if isinstance(key, str) else []
             mine = [item for item in keys if runtime["lease_owners"].get(item) == settings.name]
             if mine:
-                _push_message(context, "system", "Your edit lock is expiring - edit the object to renew")
-                session = runtime.get("session")
-                if session is not None:
-                    for item in mine:
-                        _lease_request(session, item, "acquire")
+                # Do not auto-renew an idle selection. The transform/mesh
+                # activity hooks renew active leases; this one is about to go.
+                settings.lease_info = "Your edit lock is expiring - edit to renew"
     elif kind == "laser":
         name = str(body.get("name", ""))[:48]
         points = body.get("points")
@@ -2976,9 +2995,16 @@ def _note_rev(uid: str) -> None:
     if not uid:
         return
     runtime["scene_revs"][uid] = runtime["scene_revs"].get(uid, 0) + 1
+    _touch_lease(uid)
     session: SessionService | None = runtime.get("session")
     if session is not None:
         session.bump_rev(uid)
+
+
+def _touch_lease(uid: str) -> None:
+    """Mark a lease as actively edited so it does not idle out."""
+    if uid:
+        runtime.setdefault("lease_activity", {})[uid] = time.monotonic()
 
 
 def _start_journal(context) -> None:
@@ -4404,7 +4430,12 @@ def _drain_ai_queue(context) -> None:
 
 
 def _sync_selection(context) -> None:
-    """Claim selected objects so only one person can select/edit them."""
+    """Claim selected objects so only one person edits them at a time.
+
+    Locks are soft. A lease is renewed only while its owner is actively
+    editing; a selection left idle releases itself after ``LEASE_IDLE``. This
+    keeps a teammate who walked away from locking the scene forever.
+    """
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
     if session is None or runtime.get("bootstrapping") or runtime.get("replaying"):
@@ -4421,6 +4452,27 @@ def _sync_selection(context) -> None:
     }
     previous = runtime["selection"]
     owned = runtime["owned_leases"]
+    activity = runtime.setdefault("lease_activity", {})
+
+    if not settings.edit_locks:
+        # The user turned edit locks off: release anything we hold and make
+        # every object selectable again.
+        for uid in list(owned):
+            _lease_request(session, uid, "release")
+            owned.discard(uid)
+            owners.pop(uid, None)
+            activity.pop(uid, None)
+        hidden = runtime["hidden_objects"]
+        for uid in list(hidden):
+            obj = obj_sync.find(uid)
+            if obj is not None:
+                try:
+                    obj.hide_select = False
+                except Exception:  # noqa: BLE001
+                    pass
+            hidden.discard(uid)
+        runtime["selection"] = selected
+        return
 
     # Any lease we own that is no longer selected must be released. This also
     # covers a lease that was granted after the object was already deselected.
@@ -4435,15 +4487,21 @@ def _sync_selection(context) -> None:
             _lease_request(session, uid, "release")
             owned.discard(uid)
             owners.pop(uid, None)
+            activity.pop(uid, None)
         runtime["deselected"].pop(uid, None)
 
+    suppress = now < runtime.get("lease_suppress_until", 0.0)
     for uid in selected - previous:
+        if suppress:
+            continue
         owner = owners.get(uid)
         if owner is None or owner == settings.name:
             granted = _lease_request(session, uid, "acquire")
             if granted and session.is_host:
                 owners[uid] = settings.name
                 owned.add(uid)
+            activity[uid] = now
+
     for uid in selected:
         owner = owners.get(uid)
         if owner in (None, settings.name):
@@ -4458,13 +4516,22 @@ def _sync_selection(context) -> None:
             pass
         if uid not in runtime["lock_notified"]:
             runtime["lock_notified"].add(uid)
-            _push_message(context, "system", f"{obj.name} is being edited by {owner}")
+            # Keep the panel informative without spamming the chat log.
+            settings.lease_info = f"{obj.name} is locked by {owner}"
 
+    # Renew only actively edited leases. Idle selections release themselves so
+    # a forgotten selection cannot hold an object forever.
     if now - runtime["lease_renew"] > LEASE_RENEW:
         runtime["lease_renew"] = now
-        for uid in selected:
-            if owners.get(uid) == settings.name:
+        for uid in list(owned):
+            last = activity.get(uid, 0.0)
+            if now - last <= LEASE_IDLE:
                 _lease_request(session, uid, "acquire")
+            else:
+                _lease_request(session, uid, "release")
+                owned.discard(uid)
+                owners.pop(uid, None)
+                activity.pop(uid, None)
 
     blocked = {uid for uid, owner in owners.items() if owner and owner != settings.name}
     hidden = runtime["hidden_objects"]
@@ -4486,7 +4553,6 @@ def _sync_selection(context) -> None:
                 pass
 
     runtime["selection"] = selected
-
 
 def _sync_transforms(context) -> None:
     session: SessionService | None = runtime.get("session")
@@ -5225,7 +5291,7 @@ def _sync_edit_mesh(context, session: SessionService, obj) -> None:
     if owner is not None and owner != settings.name:
         if runtime.get("edit_lease_uid") != uid:
             runtime["edit_lease_uid"] = uid
-            _push_message(context, "system", f"Live edit locked by {owner}")
+            settings.lease_info = f"Live edit locked by {owner}"
         return
     if runtime.get("edit_lease_uid") != uid:
         runtime["edit_lease_uid"] = uid
@@ -6990,6 +7056,47 @@ class BMP_OT_join(Operator):
         return {"FINISHED"}
 
 
+class BMP_OT_release_locks(Operator):
+    bl_idname = "bmp.release_locks"
+    bl_label = "Release all locks"
+    bl_description = "Release every edit lock in this session"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        session: SessionService | None = runtime.get("session")
+        settings = context.window_manager.bmp
+        if session is None:
+            self.report({"ERROR"}, "Not connected")
+            return {"CANCELLED"}
+        hidden = runtime.get("hidden_objects", set())
+        for uid in list(hidden):
+            obj = obj_sync.find(uid)
+            if obj is not None:
+                try:
+                    obj.hide_select = False
+                except Exception:  # noqa: BLE001
+                    pass
+        hidden.clear()
+        if session.is_host:
+            session.force_release_all()
+            runtime["lease_owners"].clear()
+            runtime["owned_leases"].clear()
+            runtime["lease_activity"].clear()
+            _push_message(context, "system", "Released all edit locks")
+        else:
+            for uid in list(runtime["owned_leases"]):
+                _lease_request(session, uid, "release")
+            runtime["owned_leases"].clear()
+            for uid, owner in list(runtime["lease_owners"].items()):
+                if owner == settings.name:
+                    runtime["lease_owners"].pop(uid, None)
+            runtime["lease_activity"].clear()
+            runtime["lease_suppress_until"] = time.monotonic() + 10.0
+            _push_message(context, "system", "Released your edit locks")
+        self.report({"INFO"}, "Locks released")
+        return {"FINISHED"}
+
+
 class BMP_OT_leave(Operator):
     bl_idname = "bmp.leave"
     bl_label = "Leave Session"
@@ -8562,6 +8669,7 @@ classes = (
     BMP_OT_host,
     BMP_OT_join,
     BMP_OT_leave,
+    BMP_OT_release_locks,
     BMP_OT_copy_code,
     BMP_OT_send_chat,
     BMP_OT_track_mesh,

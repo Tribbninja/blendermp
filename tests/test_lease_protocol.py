@@ -126,6 +126,35 @@ def test_lease_expiry_is_broadcast(tmp_path, monkeypatch):
         host_events.stop()
 
 
+def test_force_release_all_clears_locks(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    port = free_port()
+    code = encode_room("127.0.0.1", port)
+    host_inbox = queue.Queue()
+    client_inbox = queue.Queue()
+    host_events = Events(host_inbox)
+    client_events = Events(client_inbox)
+    host = session_mod.SessionService(host_inbox, host=True, code=code, name="host", color=(1, 1, 1, 1), port=port)
+    host.start()
+    assert wait_for(lambda: host.state == "hosting")
+    client = session_mod.SessionService(client_inbox, host=False, code=code, name="alice", color=(1, 1, 1, 1))
+    client.start()
+    try:
+        assert wait_for(lambda: client.state == "connected")
+        key = "55555555-5555-5555-5555-555555555555"
+        client.send_lease(key, "acquire")
+        assert wait_for(lambda: host._leases.owner_of(key, time.monotonic()) == "alice")
+        host.force_release_all()
+        assert wait_for(lambda: client_events.has("lease", action="released"))
+        assert host._leases.owner_of(key, time.monotonic()) is None
+    finally:
+        client.stop()
+        host.stop()
+        client_events.stop()
+        host_events.stop()
+
+
 def test_role_guard_and_downgrade(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))

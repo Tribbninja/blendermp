@@ -1,4 +1,4 @@
-# Blendermp Master Roadmap: 0.1.7 -> 1.0
+﻿# Blendermp Master Roadmap: 0.1.7 -> 1.0
 
 Living implementation plan. Last updated: 2026-11-20.
 Baseline: **0.8.0** (public directory, authenticated relay, TLS pinning, scene
@@ -829,7 +829,13 @@ This release turns the Phase 6 scaffolds into working features:
   are detected by the transform poller, and Boolean modifiers sync their
   operation and operand UID so live booleans match on both sides. The details
   e2e suite asserts the Boolean target.
-* **Tests**: 205 unit tests and 12 two-Blender/headless e2e suites, including
+* **Lease fixes**: selecting an object no longer locks it forever. A lease is
+  renewed only while the object is actively edited; an idle selection releases
+  after 30 seconds. Disconnect leases expire after 30 seconds, peer-leave
+  clears the local lock mirror, per-object lock messages are no longer written
+  to chat, and the panel has **Release locks** plus an **Edit locks** off
+  switch. `force_release_all` clears every host lease.
+* **Tests**: 206 unit tests and 12 two-Blender/headless e2e suites, including
   `run_foundation.ps1` for AI tools, mesh export, bridge, broadcast and the
   recording tap.
 

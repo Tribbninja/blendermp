@@ -68,7 +68,7 @@ else:  # pragma: no cover - allows importing the module standalone (tests)
     from net.relay import RelayClientAgent, RelayHostAgent
     from sync.leases import LeaseManager, Role, can_edit, can_manage
 
-RESUME_TTL = 120.0
+RESUME_TTL = 30.0
 MAX_CONTROL = 64 * 1024
 MAX_MESH = 64 * 1024 * 1024
 CHUNK_THRESHOLD = 32 * 1024 * 1024
@@ -372,7 +372,7 @@ class SessionService:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._ping_task: asyncio.Task | None = None
-        self._leases = LeaseManager(ttl=120.0, grace=20.0)
+        self._leases = LeaseManager(ttl=60.0, grace=15.0)
         self._expiry_notified: set[str] = set()
         self._bytes_in = 0
         self._bytes_out = 0
@@ -503,6 +503,25 @@ class SessionService:
         if extra:
             body.update(extra)
         self._emit("lease", body)
+
+    def force_release_all(self) -> None:
+        """Host escape hatch: clear every lease and tell all peers."""
+        loop = self._loop
+        if self.is_host and loop and loop.is_running():
+            loop.call_soon_threadsafe(lambda: asyncio.create_task(self._force_release_all()))
+
+    async def _force_release_all(self) -> None:
+        now = time.monotonic()
+        for key in list(self._leases.snapshot(now)):
+            self._leases.release(key)
+        self._expiry_notified.clear()
+        self._broadcast(
+            protocol.json_frame(
+                MessageType.LEASE,
+                {"action": "released", "leases": self._leases.snapshot(now)},
+            )
+        )
+        self._emit_leases()
 
     def _identity_body(self) -> dict:
         if not self.identity_public or not self.identity_signature:
