@@ -5,7 +5,7 @@ Blender and **docks the live window over the app viewport** (a native owned
 window, not video capture, so it keeps full GPU performance and avoids the black
 surface that cross-process re-parenting causes on some GPUs).
 
-> **Status: 0.9.1 collaboration foundation.** Hosting, the public server
+> **Status: 0.9.2 collaboration foundation.** Hosting, the public server
 > browser, TLS pinning, presence, chat, object transforms, mesh streaming, live
 > Edit Mode topology, animation, sculpt, materials/textures, asset bundles,
 > roles, checkpoints, an Ollama copilot, session recording/replay, a live
@@ -34,6 +34,20 @@ surface that cross-process re-parenting causes on some GPUs).
   snapshot after the operation settles. The receiver rebuilds the mesh while
   remaining in Object Mode. Large snapshots use a C-side read and a cheaper
   compression pass.
+* **Clean viewport**: remote camera widgets and cursor lines are gone. Remote
+  view tags use one crisp drop shadow and a single fill instead of a smeared
+  outline. Selections are off by default, so everyone sees the same models.
+* **Independent timelines**: animated object transforms, pose and shape values
+  are evaluated locally from the shared action, so each user can scrub to a
+  different frame. Turn on **Sync live pose/shape values** only if you want
+  manual rig posing shared.
+* **Scene fingerprint + resync**: presence carries a cheap structural hash of
+  objects, types, mesh counts and material slots. If a client differs, the panel
+  warns and the host can press **Resync scene to everyone**.
+* **LAN render farm**: split a frame range across the room. Peers claim a frame,
+  render it from their local scene and upload the PNG back to the host. It is
+  LAN-only, token-protected, and rendering blocks Blender while a frame runs.
+  Fluid caches stay local; frame rendering is the distributed part.
 * **AI copilot (local Ollama)**: a chat panel proposes structured edits
   (transforms, primitives, materials, modifiers, booleans, scene settings) with
   a scene snapshot for context. Nothing is applied until you confirm; failed
@@ -186,7 +200,7 @@ surface that cross-process re-parenting causes on some GPUs).
   same animated transition. Blender is hidden while arranging and returns to the
   viewport when you press Done or Escape.
 
-The protocol and engine have **206 passing unit tests** and **12 two-Blender or
+The protocol and engine have **211 passing unit tests** and **12 two-Blender or
 headless e2e suites**, including a real TLS host/client session,
 certificate-mismatch rejection, relay chat, password rejection and host kick
 over a multiplexed tunnel, the public directory API, 1,000-vertex delta
@@ -221,6 +235,26 @@ manual edit. A slow first load is normal; raise the timeout if the GPU is busy.
   TCP bridge sends transforms, visibility, materials and triangle meshes.
   Reference receivers are in `integrations/` (Unity C#, Unreal Python, Godot 4
   GDScript, plus a console receiver).
+
+## Viewport, timeline and LAN render farm
+
+* **Same models, clean viewport.** Remote camera widgets, look rays and cursor
+  crosses are removed. Name tags use a clean single-pass shadow/fill. Selection
+  overlays are off by default. A structural scene hash warns if a client is
+  missing objects or has different mesh counts, and the host can resync.
+* **Separate timelines.** Object transforms driven by actions/NLA/drivers,
+  armature poses and shape-key values are evaluated locally. Everyone shares the
+  same action and models but can sit on a different frame. **Follow host frame**
+  remains optional.
+* **LAN render farm.** Start a host, copy the URL and token, and join from the
+  other PCs. The host splits the frame range into one chunk per frame. Workers
+  render their claimed frame from the synced scene and upload a PNG. Results
+  land in `render-<timestamp>/frame_XXXXX.png` on the host. The server binds the
+  LAN interface, requires a random token, caps uploads at 64 MB and rejects
+  non-PNG results. Rendering blocks that worker's Blender while a frame runs.
+
+Fluid/simulation caches are not distributed yet: Blender keeps point caches
+local, so a shared-cache workflow is a separate feature.
 
 ## Cross-network
 

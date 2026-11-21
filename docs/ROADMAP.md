@@ -7,6 +7,7 @@ streaming, edit leases, presence 2.0, exact remote application, durable settings
 strict version gate, lease request UX, server-enforced roles, optional LAN direct).
 
 Progress log:
+- [x] 2026-11-21: 0.9.2: clean viewport (no remote camera/cursor lines, crisp name tags, selections off by default), independent timelines (animated transforms, pose and shape values evaluated locally), scene fingerprint + resync, and a token-protected LAN render farm that distributes frames and uploads PNGs.
 - [x] 2026-11-21: 0.9.1: lease reliability fix: idle selections release after 30s, renewals require actual edits, disconnect leases expire in 30s, peer-leave clears the local lock mirror, per-object lock messages no longer spam chat, and the panel has Release locks plus an Edit locks off switch.
 - [x] 2026-11-21: 0.9.0: finished the collaboration foundation: Ollama copilot with 23 tools, scene context and per-edit results; send-path recording + replay + token-protected SSE live broadcast; cross-engine bridge for Unity/Unreal/Godot with transforms, materials and triangle meshes; perf registry published in `status.json`; topology snapshot fast path (`BMesh.to_mesh` + `foreach_get`) and a cheaper compression level for large meshes; object rename sync.
 - [x] 2026-11-20: `version.json` + `scripts/check_version.py` + test; build fails on drift.
@@ -836,7 +837,7 @@ This release turns the Phase 6 scaffolds into working features:
   clears the local lock mirror, per-object lock messages are no longer written
   to chat, and the panel has **Release locks** plus an **Edit locks** off
   switch. `force_release_all` clears every host lease.
-* **Tests**: 206 unit tests and 12 two-Blender/headless e2e suites, including
+* **Tests**: 211 unit tests and 12 two-Blender/headless e2e suites, including
   `run_foundation.ps1` for AI tools, mesh export, bridge, broadcast and the
   recording tap.
 

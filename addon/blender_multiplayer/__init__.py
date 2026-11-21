@@ -63,6 +63,7 @@ from .core import material as material_payload
 from .core import object_payload
 from .core import perf
 from .core import recording
+from .core import renderfarm
 from .core.version import ADDON_VERSION
 from .session import MAX_MESH, SessionService
 from .sync import objects as obj_sync
@@ -71,7 +72,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 9, 1),
+    "version": (0, 9, 2),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -167,6 +168,10 @@ runtime: dict = {
     "bridge_shadow": {},
     "bridge_last": 0.0,
     "bridge_materials_at": 0.0,
+    "farm_server": None,
+    "farm_client": None,
+    "farm_busy": False,
+    "farm_last": 0.0,
     "replaying": False,
     "replay_cancel": None,
     "perf": perf.PerfRegistry(),
@@ -290,6 +295,7 @@ class BMPUser(PropertyGroup):
     has_cursor: BoolProperty()
     playing: BoolProperty()
     fps: IntProperty(default=24)
+    scene_hash: StringProperty()
 
 
 class BMPMessage(PropertyGroup):
@@ -334,13 +340,14 @@ class BMPState(PropertyGroup):
     paused: BoolProperty(name="Pause sync", default=False)
     follow_host: BoolProperty(name="Follow host frame", default=False)
     follow_user: StringProperty()
-    show_cameras: BoolProperty(name="Show camera widgets", default=False)
-    show_selections: BoolProperty(name="Show selections", default=True)
+    show_cameras: BoolProperty(name="Show remote view tag", default=False)
+    show_selections: BoolProperty(name="Show selections", default=False)
     show_labels: BoolProperty(name="Show name tags", default=True)
     show_lasers: BoolProperty(name="Show laser pointers", default=True)
     overlay_opacity: FloatProperty(name="Overlay opacity", default=0.85, min=0.2, max=1.0)
     overlay_scale: FloatProperty(name="Overlay scale", default=1.0, min=0.5, max=2.0)
     colorblind_safe: BoolProperty(name="Colour-blind-safe colours", default=False)
+    scene_mismatch: StringProperty(name="Scene mismatch", default="")
     ai_enabled: BoolProperty(name="Enable AI copilot", default=False)
     ai_url: StringProperty(name="Ollama URL", default="http://127.0.0.1:11434")
     ai_model: StringProperty(name="Ollama model", default="qwen2.5:7b")
@@ -370,8 +377,32 @@ class BMPState(PropertyGroup):
     bridge_meshes: BoolProperty(name="Send meshes", default=True)
     bridge_url: StringProperty(name="Bridge URL", default="")
     bridge_clients: IntProperty(name="Bridge clients", default=0, min=0)
+    farm_mode: EnumProperty(
+        name="Render farm mode",
+        items=[
+            ("host", "Host", "Share this PC as the render farm host"),
+            ("client", "Join", "Render frames for another PC"),
+        ],
+        default="host",
+    )
+    farm_active: BoolProperty(name="Render farm active", default=False)
+    farm_role: StringProperty(name="Render farm role", default="")
+    farm_port: IntProperty(name="Farm port", default=7110, min=1024, max=65535)
+    farm_url: StringProperty(name="Farm URL", default="")
+    farm_token: StringProperty(name="Farm token", default="")
+    farm_workers: IntProperty(name="Farm workers", default=0, min=0)
+    farm_progress: StringProperty(name="Farm progress", default="")
+    farm_output: StringProperty(name="Output folder", default="", subtype="DIR_PATH")
+    farm_frame_start: IntProperty(name="Start frame", default=1, min=0)
+    farm_frame_end: IntProperty(name="End frame", default=250, min=0)
+    farm_frame_step: IntProperty(name="Frame step", default=1, min=1)
+    farm_use_scene_range: BoolProperty(name="Use scene frame range", default=True)
+    farm_host_worker: BoolProperty(name="This PC renders too", default=True)
+    farm_client_url: StringProperty(name="Farm URL", default="")
+    farm_client_token: StringProperty(name="Farm token", default="")
     host_name: StringProperty()
     sync_transforms: BoolProperty(name="Sync object transforms", default=True)
+    sync_animation_values: BoolProperty(name="Sync live pose/shape values", default=False)
     edit_locks: BoolProperty(name="Edit locks", default=True)
     users: CollectionProperty(type=BMPUser)
     messages: CollectionProperty(type=BMPMessage)
@@ -1008,6 +1039,7 @@ def _handle_event(context, kind: str, body: dict) -> None:
                 else:
                     user.has_cursor = False
                 user.selected = str(body.get("selected", ""))[:512]
+                user.scene_hash = str(body.get("scene_hash", ""))[:32]
                 ping_value = body.get("ping_ms")
                 if isinstance(ping_value, (int, float)) and not isinstance(ping_value, bool):
                     user.ping_ms = max(0, min(5000, int(round(float(ping_value)))))
@@ -1831,7 +1863,7 @@ def _action_snapshot(obj) -> dict | None:
 def _sync_pose(context) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
-    if session is None or settings.paused or runtime.get("bootstrapping") or runtime.get("replaying"):
+    if session is None or settings.paused or runtime.get("bootstrapping") or runtime.get("replaying") or not settings.sync_animation_values:
         return
     if not settings.is_host and session.state != "connected":
         return
@@ -1909,7 +1941,7 @@ def _apply_pose(context, body: dict) -> None:
 def _sync_shape_keys(context) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
-    if session is None or settings.paused or runtime.get("bootstrapping") or runtime.get("replaying"):
+    if session is None or settings.paused or runtime.get("bootstrapping") or runtime.get("replaying") or not settings.sync_animation_values:
         return
     if not settings.is_host and session.state != "connected":
         return
@@ -2210,6 +2242,10 @@ def _sync_materials(context) -> None:
         for index, slot in enumerate(obj.material_slots[:16]):
             material = slot.material
             if material is None:
+                continue
+            animation = getattr(material, "animation_data", None)
+            if animation is not None and getattr(animation, "action", None) is not None:
+                # Animated material values are evaluated locally per frame.
                 continue
             data = material_values(material)
             signature = _material_signature(data)
@@ -4554,6 +4590,33 @@ def _sync_selection(context) -> None:
 
     runtime["selection"] = selected
 
+def _object_transform_animated(obj) -> bool:
+    """True when an action/NLA drives this object's transform.
+
+    Animated transforms are evaluated locally from the shared action, so each
+    user can sit on a different frame without the other users' current frame
+    being streamed over the top.
+    """
+    animation = getattr(obj, "animation_data", None)
+    if animation is None:
+        return False
+    try:
+        if len(getattr(animation, "nla_tracks", ())):
+            return True
+        if len(getattr(animation, "drivers", ())):
+            return True
+        action = getattr(animation, "action", None)
+        if action is None:
+            return False
+        for curve in _action_fcurves(action):
+            path = str(getattr(curve, "data_path", ""))
+            if path.startswith(("location", "rotation_", "scale", "delta_")):
+                return True
+    except (AttributeError, TypeError, RuntimeError):
+        return False
+    return False
+
+
 def _sync_transforms(context) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
@@ -4602,6 +4665,11 @@ def _sync_transforms(context) -> None:
             uid = str(uuid.uuid4())
             obj["bmp_uuid"] = uid
         seen.add(uid)
+        if _object_transform_animated(obj):
+            # Each peer evaluates the shared action at its own frame.
+            matrix = obj.matrix_world
+            shadow[uid] = tuple(round(v, 6) for row in matrix for v in row)
+            continue
         owner = runtime["lease_owners"].get(uid)
         if not settings.is_host and (
             owner not in (None, settings.name) or uid not in runtime["owned_leases"]
@@ -6134,8 +6202,8 @@ def _sync_remote_visuals(context) -> None:
     settings = context.window_manager.bmp
     from mathutils import Vector
 
-    show_cameras = bool(getattr(settings, "show_cameras", False))
-    show_selections = bool(getattr(settings, "show_selections", True))
+    show_view_tags = bool(getattr(settings, "show_cameras", False))
+    show_selections = bool(getattr(settings, "show_selections", False))
     show_lasers = bool(getattr(settings, "show_lasers", True))
     colorblind = bool(getattr(settings, "colorblind_safe", False))
     opacity = float(getattr(settings, "overlay_opacity", 0.85) or 0.85)
@@ -6189,38 +6257,10 @@ def _sync_remote_visuals(context) -> None:
             if matrix is not None:
                 origin = matrix.translation
                 widget = 0.2
-                if show_cameras:
-                    segments = _camera_segments(
-                        matrix,
-                        user.view_aspect,
-                        user.view_distance,
-                        max(0.5, min(2.0, overlay_scale)),
+                if show_view_tags:
+                    labels.append(
+                        (origin + Vector((0.0, 0.0, widget * 0.5)), user.name, color)
                     )
-                    lines.append((color, segments))
-                    total += len(segments)
-                    for first, second in segments:
-                        max_segment = max(max_segment, float((second - first).length))
-                labels.append(
-                    (origin + Vector((0.0, 0.0, widget * 0.5)), user.name, color)
-                )
-        if show_cameras and user.has_cursor:
-            try:
-                cursor = Vector((float(user.cursor[0]), float(user.cursor[1]), float(user.cursor[2])))
-            except (TypeError, ValueError, IndexError):
-                cursor = None
-            if cursor is not None:
-                size = max(0.05, min(0.6, float(user.view_distance or 7.0) * 0.01))
-                lines.append(
-                    (
-                        color,
-                        [
-                            (cursor - Vector((size, 0.0, 0.0)), cursor + Vector((size, 0.0, 0.0))),
-                            (cursor - Vector((0.0, size, 0.0)), cursor + Vector((0.0, size, 0.0))),
-                            (cursor - Vector((0.0, 0.0, size)), cursor + Vector((0.0, 0.0, size))),
-                        ],
-                    )
-                )
-                total += 3
         uids = [uid for uid in str(user.selected or "").split(",") if uid]
         for uid in uids[:6]:
             obj = obj_sync.find(uid)
@@ -6350,10 +6390,10 @@ def _draw_remote_labels() -> None:
     overlay_scale = float(runtime.get("overlay_scale", 1.0) or 1.0)
     lift = 8.0 * overlay_scale
     try:
-        blf.size(font, 15.0 * overlay_scale, 72.0)
+        blf.size(font, 16.0 * overlay_scale, 72.0)
     except Exception:  # noqa: BLE001
         try:
-            blf.size(font, 15)
+            blf.size(font, 16)
         except Exception:  # noqa: BLE001
             pass
     drawn = []
@@ -6374,28 +6414,22 @@ def _draw_remote_labels() -> None:
         if any(other == name and abs(x - ox) < 24 and abs(y - oy) < 24 for other, ox, oy in drawn):
             continue
         try:
-            text_width, _text_height = blf.dimensions(font, name)
+            label = str(name)[:24]
+            text_width, _text_height = blf.dimensions(font, label)
             left = round(x - text_width * 0.5)
             base = round(y)
-            # A crisp 1px outline reads much better than the blurry native
-            # blf shadow, especially at small sizes on high-DPI screens.
-            outline = max(1, int(round(overlay_scale)))
-            blf.color(font, 0.0, 0.0, 0.0, 0.95)
-            for offset_x, offset_y in (
-                (-outline, 0),
-                (outline, 0),
-                (0, -outline),
-                (0, outline),
-            ):
-                blf.position(font, left + offset_x, base + offset_y, 0.0)
-                blf.draw(font, name)
+            # One clean drop shadow and one fill. The old four-way outline plus
+            # a double fill made the tag look bold and smeared on high-DPI
+            # screens.
+            shadow = max(1, int(round(overlay_scale)))
+            blf.color(font, 0.0, 0.0, 0.0, 0.85)
+            blf.position(font, left + shadow, base - shadow, 0.0)
+            blf.draw(font, label)
             red, green, blue = _readable_label(color)
             blf.color(font, red, green, blue, 1.0)
             blf.position(font, left, base, 0.0)
-            # Draw the fill twice so it fully covers the outline interior.
-            blf.draw(font, name)
-            blf.draw(font, name)
-            drawn.append((name, x, y))
+            blf.draw(font, label)
+            drawn.append((label, x, y))
         except Exception:  # noqa: BLE001
             pass
 
@@ -6521,6 +6555,57 @@ def _send_client_stats(context) -> None:
     )
 
 
+def _scene_fingerprint(context) -> str:
+    """Cheap structural fingerprint: object identities, types, counts, slots.
+
+    It deliberately ignores vertex positions and frame-dependent values, so two
+    users watching different frames still match when their models match.
+    """
+    digest = hashlib.blake2b(digest_size=8)
+    try:
+        objects = sorted(context.scene.objects, key=lambda item: item.name)
+    except Exception:  # noqa: BLE001
+        return ""
+    for obj in objects:
+        if obj.get("bmp_ping"):
+            continue
+        uid = str(obj.get("bmp_uuid") or obj.name)
+        digest.update(uid.encode("utf-8", "replace"))
+        digest.update(b"|")
+        digest.update(str(obj.type).encode("ascii", "replace"))
+        if obj.type == "MESH":
+            try:
+                digest.update(str(len(obj.data.vertices)).encode("ascii"))
+                digest.update(b":")
+                digest.update(str(len(obj.data.polygons)).encode("ascii"))
+            except (AttributeError, ReferenceError):
+                pass
+        for slot in getattr(obj, "material_slots", [])[:16]:
+            digest.update(b"|")
+            digest.update(
+                (slot.material.name if slot.material is not None else "").encode(
+                    "utf-8", "replace"
+                )
+            )
+    return digest.hexdigest()
+
+
+def _refresh_scene_hash(context) -> None:
+    now = time.monotonic()
+    if now - runtime.get("last_scene_hash", 0.0) < 2.0:
+        return
+    runtime["last_scene_hash"] = now
+    local = _scene_fingerprint(context)
+    runtime["scene_hash"] = local
+    settings = context.window_manager.bmp
+    mismatch = [
+        user.name
+        for user in settings.users
+        if user.name != settings.name and user.scene_hash and user.scene_hash != local
+    ]
+    settings.scene_mismatch = ", ".join(mismatch[:4])
+
+
 def _send_presence(context) -> None:
     session: SessionService | None = runtime.get("session")
     if session is None:
@@ -6538,6 +6623,7 @@ def _send_presence(context) -> None:
         "active": context.active_object.name if context.active_object is not None else "",
         "selected": ",".join(_selected_uids(context)),
         "cursor": [float(value) for value in context.scene.cursor.location],
+        "scene_hash": runtime.get("scene_hash", ""),
     }
     view = _viewport_view(context)
     if view:
@@ -6709,6 +6795,12 @@ def _write_status(context, force: bool = False) -> None:
             "bridge_url": settings.bridge_url,
             "bridge_clients": settings.bridge_clients,
             "recording": settings.recording_info if settings.recording_active else "",
+            "farm_url": settings.farm_url,
+            "farm_workers": settings.farm_workers,
+            "farm_progress": settings.farm_progress,
+            "farm_active": settings.farm_active,
+            "scene_hash": runtime.get("scene_hash", ""),
+            "scene_mismatch": settings.scene_mismatch,
             "perf": runtime["perf"].snapshot(),
             "blender": bpy.app.version_string,
             "addon": ADDON_VERSION,
@@ -6976,6 +7068,7 @@ def bmp_tick():
             _sync_shape_keys(context)
             _sync_actions(context)
             _process_image_queue(context)
+            _refresh_scene_hash(context)
             _send_presence(context)
             _send_subscription(context)
             _send_client_stats(context)
@@ -6985,6 +7078,7 @@ def bmp_tick():
         _sync_remote_visuals(context)
         with runtime["perf"].measure("bridge_pump"):
             _pump_bridge(context)
+        _pump_renderfarm(context)
         _apply_follow(context)
         if (
             runtime.get("bootstrapping")
@@ -6998,7 +7092,12 @@ def bmp_tick():
         # Keep writing while offline too, so the desktop app always sees the
         # current state and never stays stuck on "connected".
         runtime["perf"].record(
-            "tick", (time.perf_counter() - tick_started) * 1000.0
+            "tick",
+            max(
+                0.0,
+                (time.perf_counter() - tick_started) * 1000.0
+                - runtime.pop("farm_render_ms", 0.0),
+            ),
         )
         _write_status(context)
         if session is not None and not session.is_alive():
@@ -7053,6 +7152,35 @@ class BMP_OT_join(Operator):
         except Exception as exc:  # noqa: BLE001
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class BMP_OT_resync_scene(Operator):
+    bl_idname = "bmp.resync_scene"
+    bl_label = "Resync scene"
+    bl_description = "Send the host scene to every connected client again"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        session: SessionService | None = runtime.get("session")
+        if session is None or not session.is_host:
+            self.report({"ERROR"}, "Only the host can resync the scene")
+            return {"CANCELLED"}
+        targets = [
+            user.name
+            for user in settings.users
+            if user.name and user.name != settings.name
+        ]
+        if not targets:
+            self.report({"INFO"}, "No clients connected")
+            return {"CANCELLED"}
+        for name in targets:
+            _queue_scene_bootstrap(context, name)
+        _push_message(
+            context, "system", f"Resyncing the scene to {len(targets)} client(s)"
+        )
+        self.report({"INFO"}, f"Resyncing {len(targets)} client(s)")
         return {"FINISHED"}
 
 
@@ -7684,6 +7812,200 @@ def _pump_bridge(context) -> None:
                 pass
 
 
+def _default_farm_output() -> str:
+    return str(control.data_dir() / "renderfarm")
+
+
+def _start_farm_server(settings):
+    server = runtime.get("farm_server")
+    if server is not None:
+        return server
+    base = settings.farm_output.strip() or _default_farm_output()
+    for offset in range(0, 10):
+        candidate = renderfarm.FarmServer(
+            port=settings.farm_port + offset, output_dir=base
+        )
+        try:
+            candidate.start()
+        except OSError:
+            candidate.stop()
+            continue
+        runtime["farm_server"] = candidate
+        settings.farm_active = True
+        settings.farm_role = "host"
+        settings.farm_port = candidate.port
+        settings.farm_url = candidate.url
+        settings.farm_token = candidate.token
+        settings.farm_workers = candidate.worker_count
+        settings.farm_progress = candidate.queue.progress_text()
+        return candidate
+    return None
+
+
+def _stop_farm_server(settings):
+    server = runtime.get("farm_server")
+    runtime["farm_server"] = None
+    if server is not None:
+        server.stop()
+    if runtime.get("farm_client") is None:
+        settings.farm_active = False
+        settings.farm_role = ""
+        settings.farm_url = ""
+        settings.farm_token = ""
+        settings.farm_workers = 0
+        settings.farm_progress = ""
+
+
+def _start_farm_client(settings):
+    client = runtime.get("farm_client")
+    if client is not None:
+        return client
+    url = settings.farm_client_url.strip()
+    token = settings.farm_client_token.strip()
+    if not url or not token:
+        return None
+    client = renderfarm.FarmClient(
+        url, token, settings.name or "worker", poll_interval=0.75
+    )
+    client.start()
+    runtime["farm_client"] = client
+    settings.farm_active = True
+    settings.farm_role = "client"
+    settings.farm_url = url
+    settings.farm_token = token
+    settings.farm_progress = "waiting for work"
+    return client
+
+
+def _stop_farm_client(settings):
+    client = runtime.get("farm_client")
+    runtime["farm_client"] = None
+    if client is not None:
+        client.stop()
+    if runtime.get("farm_server") is None:
+        settings.farm_active = False
+        settings.farm_role = ""
+        settings.farm_url = ""
+        settings.farm_token = ""
+        settings.farm_workers = 0
+        settings.farm_progress = ""
+
+
+def _render_farm_frame(context, work, server=None, client=None):
+    """Render one farm frame on Blender's main thread, then hand it back."""
+    scene = context.scene
+    previous_frame = scene.frame_current
+    previous_path = scene.render.filepath
+    previous_format = scene.render.image_settings.file_format
+    if server is not None:
+        job = server.queue.get(work.job_id)
+        if job is None:
+            return False, "unknown render job"
+        output_dir = Path(job.output_dir)
+    else:
+        output_dir = Path(control.data_dir()) / "renderfarm" / "worker"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    base = output_dir / f"frame_{int(work.frame):05d}"
+    path = Path(str(base) + ".png")
+    try:
+        scene.render.image_settings.file_format = "PNG"
+        scene.frame_set(int(work.frame))
+        scene.render.filepath = str(base)
+        bpy.ops.render.render(write_still=True)
+        if not path.exists():
+            alternate = Path(str(base))
+            if alternate.exists():
+                path = alternate
+            else:
+                return False, "render produced no PNG"
+        data = path.read_bytes()
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)[:200]
+    finally:
+        try:
+            scene.frame_set(previous_frame)
+        except Exception:  # noqa: BLE001
+            pass
+        scene.render.filepath = previous_path
+        scene.render.image_settings.file_format = previous_format
+    if client is not None:
+        if not client.submit(work, data):
+            return False, client.last_error or "upload failed"
+    elif server is not None:
+        server.queue.complete(
+            work.job_id, work.frame, context.window_manager.bmp.name or "host", str(path)
+        )
+    return True, ""
+
+
+def _pump_renderfarm(context) -> None:
+    """Claim/render at most one farm frame per tick."""
+    settings = context.window_manager.bmp
+    server = runtime.get("farm_server")
+    client = runtime.get("farm_client")
+    if server is None and client is None:
+        return
+    now = time.monotonic()
+    if now - runtime.get("farm_last", 0.0) < 0.5:
+        return
+    runtime["farm_last"] = now
+    if server is not None:
+        settings.farm_workers = server.worker_count
+        settings.farm_progress = server.queue.progress_text()
+    if client is not None:
+        status = client.status()
+        settings.farm_workers = int(status.get("worker_count", 0) or 0)
+        jobs = status.get("jobs") or []
+        if jobs:
+            job = jobs[-1]
+            settings.farm_progress = (
+                f"{job.get('done', 0)}/{job.get('frames', 0)} frames "
+                f"({job.get('percent', 0)}%) · {settings.farm_workers} worker(s)"
+            )
+    if runtime.get("farm_busy"):
+        return
+    work = None
+    if client is not None:
+        work = client.poll()
+        if work is not None:
+            runtime["farm_busy"] = True
+            started = time.perf_counter()
+            try:
+                ok, error = _render_farm_frame(context, work, client=client)
+                if not ok:
+                    client.fail(work, error)
+                    _push_message(
+                        context, "system", f"Farm frame {work.frame} failed: {error[:100]}"
+                    )
+            finally:
+                runtime["farm_render_ms"] = (time.perf_counter() - started) * 1000.0
+                runtime["farm_busy"] = False
+    elif server is not None and settings.farm_host_worker:
+        claimed = server.queue.claim(settings.name or "host")
+        if claimed is not None:
+            job, chunk = claimed
+            work = renderfarm.FarmWork(
+                job_id=job.id,
+                job_name=job.name,
+                frame=chunk.frame,
+                output_name=f"frame_{chunk.frame:05d}.png",
+                width=job.width,
+                height=job.height,
+            )
+            runtime["farm_busy"] = True
+            started = time.perf_counter()
+            try:
+                ok, error = _render_farm_frame(context, work, server=server)
+                if not ok:
+                    server.queue.fail(job.id, chunk.frame, settings.name or "host", error)
+                    _push_message(
+                        context, "system", f"Farm frame {chunk.frame} failed: {error[:100]}"
+                    )
+            finally:
+                runtime["farm_render_ms"] = (time.perf_counter() - started) * 1000.0
+                runtime["farm_busy"] = False
+
+
 class BMP_OT_ai_ask(Operator):
     bl_idname = "bmp.ai_ask"
     bl_label = "Ask"
@@ -7941,6 +8263,152 @@ class BMP_OT_bridge_stop(Operator):
         settings = context.window_manager.bmp
         _stop_bridge(settings)
         _push_message(context, "system", "Cross-engine bridge stopped")
+        return {"FINISHED"}
+
+
+class BMP_OT_farm_start(Operator):
+    bl_idname = "bmp.farm_start"
+    bl_label = "Start farm host"
+    bl_description = "Host a LAN render farm on this PC"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        server = _start_farm_server(settings)
+        if server is None:
+            self.report({"ERROR"}, "Could not bind a render farm port")
+            return {"CANCELLED"}
+        _push_message(
+            context,
+            "system",
+            f"Render farm: {settings.farm_url} (use Copy farm invite for the token)",
+        )
+        self.report({"INFO"}, f"Farm: {settings.farm_url}")
+        return {"FINISHED"}
+
+
+class BMP_OT_farm_join(Operator):
+    bl_idname = "bmp.farm_join"
+    bl_label = "Join farm"
+    bl_description = "Render frames for a LAN farm host"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        client = _start_farm_client(settings)
+        if client is None:
+            self.report({"ERROR"}, "Enter the host URL and token first")
+            return {"CANCELLED"}
+        _push_message(
+            context,
+            "system",
+            f"Joined render farm as {settings.name or 'worker'}",
+        )
+        self.report({"INFO"}, "Joined render farm")
+        return {"FINISHED"}
+
+
+class BMP_OT_farm_stop(Operator):
+    bl_idname = "bmp.farm_stop"
+    bl_label = "Stop farm"
+    bl_description = "Stop hosting or working for the render farm"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        _stop_farm_server(settings)
+        _stop_farm_client(settings)
+        _push_message(context, "system", "Render farm stopped")
+        return {"FINISHED"}
+
+
+class BMP_OT_farm_render(Operator):
+    bl_idname = "bmp.farm_render"
+    bl_label = "Render range on farm"
+    bl_description = "Split the scene frame range across every connected LAN worker"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        server = runtime.get("farm_server")
+        if server is None:
+            self.report({"ERROR"}, "Start the farm host first")
+            return {"CANCELLED"}
+        scene = context.scene
+        if settings.farm_use_scene_range:
+            start = int(scene.frame_start)
+            end = int(scene.frame_end)
+            step = max(1, int(scene.frame_step))
+        else:
+            start = int(settings.farm_frame_start)
+            end = int(settings.farm_frame_end)
+            step = max(1, int(settings.farm_frame_step))
+        if end < start:
+            start, end = end, start
+        base = Path(settings.farm_output.strip() or _default_farm_output())
+        output_dir = base / f"render-{time.strftime('%Y%m%d-%H%M%S')}"
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.report({"ERROR"}, f"Could not create output folder: {exc}")
+            return {"CANCELLED"}
+        job = server.queue.create_job(
+            scene.name,
+            start,
+            end,
+            step,
+            str(output_dir),
+            width=scene.render.resolution_x,
+            height=scene.render.resolution_y,
+        )
+        settings.farm_progress = server.queue.progress_text()
+        _push_message(
+            context,
+            "system",
+            f"Farm job {job.id[:6]}: {len(job.chunks)} frame(s) to {output_dir}",
+        )
+        self.report({"INFO"}, f"Farm job {job.id[:6]} created")
+        return {"FINISHED"}
+
+
+class BMP_OT_farm_copy(Operator):
+    bl_idname = "bmp.farm_copy"
+    bl_label = "Copy farm invite"
+    bl_description = "Copy the farm URL and token to the clipboard"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        if not settings.farm_url or not settings.farm_token:
+            self.report({"ERROR"}, "Start or join a farm first")
+            return {"CANCELLED"}
+        context.window_manager.clipboard = (
+            f"{settings.farm_url} {settings.farm_token}"
+        )
+        self.report({"INFO"}, "Farm URL and token copied")
+        return {"FINISHED"}
+
+
+class BMP_OT_farm_open(Operator):
+    bl_idname = "bmp.farm_open"
+    bl_label = "Open farm page"
+    bl_description = "Open the LAN farm status page in a browser"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = context.window_manager.bmp
+        if not settings.farm_url:
+            self.report({"ERROR"}, "Start a farm first")
+            return {"CANCELLED"}
+        try:
+            import webbrowser
+
+            webbrowser.open(
+                f"{settings.farm_url}?token={settings.farm_token}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.report({"ERROR"}, f"Could not open a browser: {exc}")
+            return {"CANCELLED"}
         return {"FINISHED"}
 
 
@@ -8669,6 +9137,7 @@ classes = (
     BMP_OT_host,
     BMP_OT_join,
     BMP_OT_leave,
+    BMP_OT_resync_scene,
     BMP_OT_release_locks,
     BMP_OT_copy_code,
     BMP_OT_send_chat,
@@ -8690,6 +9159,12 @@ classes = (
     BMP_OT_broadcast_open,
     BMP_OT_bridge_start,
     BMP_OT_bridge_stop,
+    BMP_OT_farm_start,
+    BMP_OT_farm_join,
+    BMP_OT_farm_stop,
+    BMP_OT_farm_render,
+    BMP_OT_farm_copy,
+    BMP_OT_farm_open,
     BMP_OT_ping_mark,
     BMP_OT_follow_user,
     BMP_OT_share_images,

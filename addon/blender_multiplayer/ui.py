@@ -47,6 +47,16 @@ class BMP_PT_main(bpy.types.Panel):
             box.label(text="Server", icon="WORLD")
             if settings.is_host:
                 box.label(text="Public listing is managed in the desktop app")
+                box.operator("bmp.resync_scene", text="Resync scene to everyone", icon="FILE_REFRESH")
+            if settings.scene_mismatch:
+                warn = box.box()
+                warn.alert = True
+                warn.label(
+                    text=f"Scene differs: {settings.scene_mismatch[:80]}",
+                    icon="ERROR",
+                )
+                if settings.is_host:
+                    warn.operator("bmp.resync_scene", text="Resync", icon="FILE_REFRESH")
             if settings.verify_code:
                 box.label(text=f"Verify: {settings.verify_code}", icon="LOCKED")
             if settings.code:
@@ -139,6 +149,53 @@ class BMP_PT_main(bpy.types.Panel):
             )
             bridge_box.label(text="Receivers in integrations/", icon="INFO")
 
+        farm_box = layout.box()
+        farm_box.label(text="LAN Render Farm", icon="RENDER_STILL")
+        if not settings.farm_active:
+            farm_box.prop(settings, "farm_mode")
+            if settings.farm_mode == "host":
+                farm_box.prop(settings, "farm_port")
+                farm_box.prop(settings, "farm_output")
+                farm_box.prop(settings, "farm_host_worker")
+                farm_box.operator(
+                    "bmp.farm_start", text="Start farm host", icon="PLAY"
+                )
+            else:
+                farm_box.prop(settings, "farm_client_url")
+                farm_box.prop(settings, "farm_client_token")
+                farm_box.operator("bmp.farm_join", text="Join farm", icon="PLAY")
+        else:
+            farm_box.label(
+                text=f"{settings.farm_role.title()} · {settings.farm_url}",
+                icon="LINKED",
+            )
+            farm_box.label(text=settings.farm_progress or "waiting", icon="TIME")
+            farm_box.label(
+                text=f"{settings.farm_workers} worker(s)", icon="COMMUNITY"
+            )
+            if settings.farm_role == "host":
+                farm_box.prop(settings, "farm_use_scene_range")
+                if not settings.farm_use_scene_range:
+                    row = farm_box.row(align=True)
+                    row.prop(settings, "farm_frame_start")
+                    row.prop(settings, "farm_frame_end")
+                    row.prop(settings, "farm_frame_step")
+                row = farm_box.row(align=True)
+                row.operator("bmp.farm_render", text="Render range", icon="RENDER_STILL")
+                row.operator("bmp.farm_open", text="", icon="URL")
+                row.operator("bmp.farm_copy", text="", icon="COPYDOWN")
+            else:
+                farm_box.operator("bmp.farm_copy", text="Copy invite", icon="COPYDOWN")
+            farm_box.operator("bmp.farm_stop", text="Stop / leave", icon="PAUSE")
+        farm_box.label(
+            text="LAN only. Rendering blocks Blender while a frame runs.",
+            icon="INFO",
+        )
+        farm_box.label(
+            text="Frame rendering is distributed; fluid caches stay local.",
+            icon="INFO",
+        )
+
         try:
             from . import runtime as _runtime
 
@@ -221,7 +278,6 @@ class BMP_PT_main(bpy.types.Panel):
         box.prop(settings, "sync_visible_only")
         box.operator("bmp.toggle_mute", text="Mute active object", icon="HIDE_ON")
         box.prop(settings, "paused")
-        box.prop(settings, "follow_host")
         box.prop(settings, "show_cameras")
         box.prop(settings, "show_selections")
         box.prop(settings, "show_labels")
@@ -229,6 +285,14 @@ class BMP_PT_main(bpy.types.Panel):
         box.prop(settings, "overlay_opacity")
         box.prop(settings, "overlay_scale")
         box.prop(settings, "colorblind_safe")
+        timeline = layout.box()
+        timeline.label(text="Timeline", icon="TIME")
+        timeline.prop(settings, "follow_host")
+        timeline.prop(settings, "sync_animation_values")
+        if settings.sync_animation_values:
+            timeline.label(text="Live pose/shape values are shared", icon="INFO")
+        else:
+            timeline.label(text="Everyone scrubs their own frame", icon="INFO")
         row = box.row(align=True)
         row.operator("bmp.track_mesh", text="Track selected", icon="MESH_DATA")
         row.operator("bmp.untrack_mesh", text="", icon="X")

@@ -1,4 +1,4 @@
-"""Animation/rig host: armature, weights, shape keys, action and pose."""
+﻿"""Animation/rig host: armature, weights, shape keys, action and pose."""
 
 import bpy
 import json
@@ -28,6 +28,7 @@ wm.bmp.sync_mesh = True
 wm.bmp.sync_transforms = True
 wm.bmp.sync_materials = True
 wm.bmp.sync_modifiers = True
+wm.bmp.sync_animation_values = True
 
 bpy.ops.object.select_all(action="SELECT")
 bpy.ops.object.delete(use_global=False)

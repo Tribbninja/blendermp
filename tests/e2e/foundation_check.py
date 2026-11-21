@@ -9,6 +9,7 @@ import json
 import os
 import socket
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -241,6 +242,89 @@ try:
     finally:
         bm.LEASE_IDLE, bm.LEASE_RENEW, bm.SELECTION_POLL = old_idle, old_renew, old_poll
         bm.runtime["session"] = None
+
+    # Overlay cleanup: a remote view tag may be drawn, but no camera lines.
+    settings.show_cameras = True
+    settings.show_selections = False
+    settings.show_lasers = False
+    settings.show_labels = True
+    user = settings.users.add()
+    user.name = "tester"
+    user.has_view = True
+    user.view = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    user.view_aspect = 1.6
+    user.view_distance = 7.0
+    user.selected = ""
+    user.has_cursor = False
+    bm.runtime["session"] = FakeSession()
+    bm.runtime["last_remote"] = 0.0
+    bm.runtime["remote_batches"] = []
+    bm.runtime["remote_labels"] = []
+    bm._sync_remote_visuals(bpy.context)
+    check(
+        "view_tag",
+        any(label[1] == "tester" for label in bm.runtime.get("remote_labels", [])),
+        bm.runtime.get("remote_labels"),
+    )
+    check(
+        "no_camera_lines",
+        not bm.runtime.get("remote_batches"),
+        len(bm.runtime.get("remote_batches", [])),
+    )
+    settings.users.remove(len(settings.users) - 1)
+    settings.show_cameras = False
+    settings.show_selections = False
+    settings.show_lasers = True
+    bm.runtime["session"] = None
+
+    # Scene fingerprint and mismatch warning.
+    fingerprint = bm._scene_fingerprint(bpy.context)
+    mismatch_user = settings.users.add()
+    mismatch_user.name = "mismatch"
+    mismatch_user.scene_hash = "deadbeef"
+    bm.runtime["last_scene_hash"] = 0.0
+    bm._refresh_scene_hash(bpy.context)
+    check("scene_mismatch", "mismatch" in settings.scene_mismatch, settings.scene_mismatch)
+    settings.users.remove(len(settings.users) - 1)
+    settings.scene_mismatch = ""
+    bpy.ops.mesh.primitive_cube_add()
+    check(
+        "scene_hash_changes",
+        bm._scene_fingerprint(bpy.context) != fingerprint,
+    )
+
+    # Animated object transforms are evaluated locally per frame.
+    animated = bpy.data.objects.get("AI_Cutter") or bpy.data.objects[0]
+    animated.location.x = 0.0
+    animated.keyframe_insert(data_path="location", index=0, frame=1)
+    animated.location.x = 5.0
+    animated.keyframe_insert(data_path="location", index=0, frame=10)
+    check("animated_transform", bm._object_transform_animated(animated))
+    check(
+        "static_transform",
+        not bm._object_transform_animated(bpy.data.objects.get("AI_Renamed")),
+    )
+
+    # LAN render farm queue/operator smoke test (no frame is rendered here).
+    settings.farm_mode = "host"
+    settings.farm_port = 17211
+    settings.farm_output = tempfile.mkdtemp(prefix="bmp-farm-check-")
+    settings.farm_host_worker = False
+    bpy.context.scene.frame_start = 1
+    bpy.context.scene.frame_end = 2
+    bpy.context.scene.frame_step = 1
+    bpy.ops.bmp.farm_start()
+    check("farm_start", settings.farm_active and bool(settings.farm_url))
+    bpy.ops.bmp.farm_render()
+    farm_server = bm.runtime.get("farm_server")
+    check(
+        "farm_job",
+        farm_server is not None
+        and farm_server.queue.status()["jobs"][0]["frames"] == 2,
+        farm_server.queue.status() if farm_server else None,
+    )
+    bpy.ops.bmp.farm_stop()
+    check("farm_stop", not settings.farm_active)
 finally:
     bm.unregister()
 

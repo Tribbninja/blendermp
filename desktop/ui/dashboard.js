@@ -327,6 +327,11 @@
       text.textContent = `Recording: ${status.recording}`;
       rows.push(text);
     }
+    if (status.farm_url) {
+      const text = document.createElement("span");
+      text.textContent = `Farm: ${status.farm_url} (${Number(status.farm_workers) || 0} worker(s)) ${status.farm_progress || ""}`;
+      rows.push(text);
+    }
     const budgets = status.perf && status.perf.budgets;
     if (budgets && typeof budgets === "object") {
       const parts = Object.entries(budgets)

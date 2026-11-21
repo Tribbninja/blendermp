@@ -285,7 +285,7 @@ def _safe_int(value, low: int, high: int, default: int = 0) -> int:
 def write_status(data: dict[str, Any]) -> None:
     """Write a bounded, sanitised status document atomically."""
     safe: dict[str, Any] = {}
-    for key in ("state", "code", "name", "addon", "blender", "fingerprint", "verify_code", "last_error", "error_code", "role", "overlay_info", "direct_code", "identity_public", "identity_signature", "identity_descriptor", "broadcast_url", "bridge_url", "recording"):
+    for key in ("state", "code", "name", "addon", "blender", "fingerprint", "verify_code", "last_error", "error_code", "role", "overlay_info", "direct_code", "identity_public", "identity_signature", "identity_descriptor", "broadcast_url", "bridge_url", "recording", "farm_url", "farm_progress", "scene_hash", "scene_mismatch"):
         value = data.get(key)
         if isinstance(value, str):
             safe[key] = value[:512]
@@ -301,14 +301,14 @@ def write_status(data: dict[str, Any]) -> None:
             for key in ("objects", "meshes", "vertices", "materials", "images", "collections")
             if isinstance(scene.get(key, 0), int) and not isinstance(scene.get(key, 0), bool)
         }
-    for key in ("is_host", "relay", "fast_mode"):
+    for key in ("is_host", "relay", "fast_mode", "farm_active"):
         value = data.get(key)
         if isinstance(value, bool):
             safe[key] = value
     rtt = data.get("rtt_ms")
     if isinstance(rtt, (int, float)) and not isinstance(rtt, bool):
         safe["rtt_ms"] = round(max(0.0, min(5000.0, float(rtt))), 1)
-    for key in ("bytes_in", "bytes_out", "pid", "uptime", "total_bytes", "bridge_clients"):
+    for key in ("bytes_in", "bytes_out", "pid", "uptime", "total_bytes", "bridge_clients", "farm_workers"):
         value = data.get(key)
         if isinstance(value, int) and not isinstance(value, bool):
             safe[key] = max(-1, min(value, 1 << 62))
