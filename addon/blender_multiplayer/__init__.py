@@ -64,6 +64,8 @@ from .core import object_payload
 from .core import perf
 from .core import recording
 from .core import renderfarm
+from .core import renderjob
+from .core import render_payload
 from .core.version import ADDON_VERSION
 from .session import MAX_MESH, SessionService
 from .sync import objects as obj_sync
@@ -72,7 +74,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 11, 2),
+    "version": (0, 11, 3),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -284,6 +286,17 @@ runtime: dict = {
     "started": 0.0,
     "session_started": 0.0,
     "relay_bridge": None,
+    "render_manager": None,
+    "render_request": None,
+    "render_active": False,
+    "render_queue": [],
+    "render_busy": False,
+    "render_last_poll": 0.0,
+    "render_job_id": "",
+    "render_output": "",
+    "render_format": "MP4",
+    "render_error": "",
+    "render_done": 0,
 }
 
 addon_keymaps: list = []
@@ -420,6 +433,8 @@ class BMPState(PropertyGroup):
     farm_host_worker: BoolProperty(name="This PC renders too", default=False)
     farm_client_url: StringProperty(name="Farm URL", default="")
     farm_client_token: StringProperty(name="Farm token", default="")
+    render_progress: StringProperty(name="Render progress", default="")
+    render_request: StringProperty(name="Render request", default="")
     host_name: StringProperty()
     sync_transforms: BoolProperty(name="Sync object transforms", default=True)
     sync_animation_values: BoolProperty(name="Sync live pose/shape values", default=False)
@@ -782,6 +797,18 @@ def stop_session(context, publish: bool = True) -> None:
     runtime["session"] = None
     runtime["hover_op_active"] = False
     runtime["hover_info"] = None
+    manager = runtime.get("render_manager")
+    if manager is not None:
+        try:
+            manager.cancel()
+        except Exception:  # noqa: BLE001
+            pass
+    runtime["render_manager"] = None
+    runtime["render_request"] = None
+    runtime["render_active"] = False
+    runtime["render_queue"] = []
+    runtime["render_busy"] = False
+    runtime["render_job_id"] = ""
     bridge = runtime.pop("relay_bridge", None)
     if bridge is not None:
         try:
@@ -1274,6 +1301,10 @@ def _handle_event(context, kind: str, body: dict) -> None:
             settings.transfer_info = ""
     elif kind == "image_asset":
         _apply_image(context, body)
+    elif kind == "render_control":
+        _handle_render_control(context, body)
+    elif kind == "render_frame":
+        _handle_render_frame(context, body)
     elif kind == "modifier_stack":
         _apply_modifier_stack(context, body)
     elif kind == "material_update":
@@ -3060,6 +3091,30 @@ def _poll_control(context) -> None:
         elif action == "leave":
             settings.last_error = ""
             stop_session(context)
+        elif action == "render":
+            _start_session_render(
+                context,
+                request.get("start", 1),
+                request.get("end", 250),
+                request.get("step", 1),
+                request.get("format", "MP4"),
+                request.get("output", ""),
+            )
+        elif action == "render_reply":
+            session = runtime.get("session")
+            pending = runtime.get("render_request") or {}
+            job_id = request.get("job") or pending.get("job") or ""
+            accept = bool(request.get("accept"))
+            if session is not None and job_id:
+                session.send_render_control("accept" if accept else "decline", {"job": job_id})
+                if not accept:
+                    runtime["render_request"] = None
+                _push_message(
+                    context,
+                    "system",
+                    "Joined the render" if accept else "Declined the render",
+                )
+                _write_status(context, force=True)
     except Exception as exc:  # noqa: BLE001
         settings.last_error = str(exc)
         traceback.print_exc()
@@ -7233,6 +7288,16 @@ def _write_status(context, force: bool = False) -> None:
         settings.mesh_info = f"P2P mesh: {count} direct peer(s)"
     else:
         settings.mesh_info = ""
+    render_manager = runtime.get("render_manager")
+    render_status = render_manager.status() if render_manager is not None else {"active": False}
+    if not render_status.get("active"):
+        render_status = {"active": False}
+    render_status["request"] = runtime.get("render_request")
+    render_status["role"] = "host" if settings.is_host else "client"
+    if render_status.get("active"):
+        settings.render_progress = f"{render_status.get('done', 0)}/{render_status.get('total', 0)} frames ({render_status.get('percent', 0):.0f}%)"
+    else:
+        settings.render_progress = ""
     # The session object is the source of truth. Settings are updated from
     # queued events and can lag (or be overwritten by a late event), which used
     # to publish "offline" while the socket was healthy.
@@ -7336,6 +7401,7 @@ def _write_status(context, force: bool = False) -> None:
             "farm_workers": settings.farm_workers,
             "farm_progress": settings.farm_progress,
             "farm_active": settings.farm_active,
+            "render": render_status,
             "internet_mode": settings.internet_mode,
             "lan_fast": settings.lan_fast,
             "scene_hash": runtime.get("scene_hash", ""),
@@ -7670,6 +7736,7 @@ def bmp_tick():
         _safe_tick_step("hover_operator", lambda: _ensure_hover_operator(context))
         _safe_tick_step("bridge", lambda: _pump_bridge(context))
         _safe_tick_step("renderfarm", lambda: _pump_renderfarm(context))
+        _safe_tick_step("session_render", lambda: _pump_session_render(context))
         _safe_tick_step("follow", lambda: _apply_follow(context))
         if (
             runtime.get("bootstrapping")
@@ -8668,6 +8735,326 @@ def _pump_renderfarm(context) -> None:
             finally:
                 runtime["farm_render_ms"] = (time.perf_counter() - started) * 1000.0
                 runtime["farm_busy"] = False
+
+
+# --------------------------------------------------------------------------- session render
+def _render_manager():
+    manager = runtime.get("render_manager")
+    if manager is None:
+        manager = renderjob.RenderManager()
+        runtime["render_manager"] = manager
+    return manager
+
+
+def _render_progress_text(status: dict) -> str:
+    if not isinstance(status, dict):
+        return ""
+    total = int(status.get("total", 0) or 0)
+    done = int(status.get("done", 0) or 0)
+    failed = int(status.get("failed", 0) or 0)
+    if not total:
+        return ""
+    text = f"{done}/{total} frames ({status.get('percent', 0):.0f}%)"
+    if failed:
+        text += f", {failed} failed"
+    return text
+
+
+def _start_session_render(context, start, end, step, format_hint, output) -> None:
+    session: SessionService | None = runtime.get("session")
+    settings = context.window_manager.bmp
+    if session is None or not settings.is_host:
+        settings.last_error = "Only the host can start a render"
+        return
+    manager = _render_manager()
+    if manager.active():
+        settings.last_error = "A render is already running"
+        return
+    scene = context.scene
+    out_dir = output or str(control.data_dir() / "render")
+    job = manager.create(
+        name=f"Render {int(start)}-{int(end)}",
+        start=int(start),
+        end=int(end),
+        step=int(step or 1),
+        width=int(scene.render.resolution_x),
+        height=int(scene.render.resolution_y),
+        format_hint="PNG",
+        engine=str(scene.render.engine),
+        output_dir=out_dir,
+    )
+    if job is None:
+        settings.last_error = "Could not create the render job"
+        return
+    runtime["render_job_id"] = job.id
+    runtime["render_output"] = out_dir
+    runtime["render_format"] = str(format_hint or "MP4")[:8].upper()
+    runtime["render_error"] = ""
+    request = {
+        "action": "request",
+        "job": job.id,
+        "name": job.name,
+        "start": job.start,
+        "end": job.end,
+        "step": job.step,
+        "width": job.width,
+        "height": job.height,
+        "format": job.format,
+        "engine": job.engine,
+    }
+    peers = session.authenticated_peers()
+    for name in peers:
+        manager.ask(name)
+    session.send_render_control("request", request)
+    settings.render_progress = _render_progress_text(manager.status())
+    _push_message(context, "system", f"Render {job.start}-{job.end} requested from {len(peers)} peer(s)")
+    _write_status(context, force=True)
+
+
+def _handle_render_control(context, event: dict) -> None:
+    session: SessionService | None = runtime.get("session")
+    if session is None:
+        return
+    settings = context.window_manager.bmp
+    action = str(event.get("action", ""))
+    message = event.get("body") if isinstance(event.get("body"), dict) else {}
+    manager = _render_manager()
+    if settings.is_host:
+        job = manager.job()
+        if job is None:
+            return
+        name = str(event.get("name") or "peer")[:48]
+        if action == "accept":
+            manager.accept(name)
+            _push_message(context, "system", f"{name} joined the render")
+        elif action == "decline":
+            manager.decline(name)
+            _push_message(context, "system", f"{name} declined the render")
+        elif action == "need":
+            frames = manager.claim(name, renderjob.MAX_BATCH)
+            if frames:
+                session.send_render_control_to(name, "work", {"job": job.id, "frames": frames})
+        elif action == "fail":
+            frame = message.get("frame")
+            if isinstance(frame, int) and not isinstance(frame, bool):
+                manager.fail(frame, name, str(message.get("error", ""))[:200])
+        settings.render_progress = _render_progress_text(manager.status())
+        return
+    job_id = str(message.get("job", ""))
+    if action == "request":
+        runtime["render_request"] = {
+            "job": job_id,
+            "name": str(message.get("name", ""))[:80],
+            "start": message.get("start", 0),
+            "end": message.get("end", 0),
+            "step": message.get("step", 1),
+            "width": message.get("width", 0),
+            "height": message.get("height", 0),
+            "format": str(message.get("format", "PNG"))[:8],
+            "engine": str(message.get("engine", ""))[:32],
+        }
+        runtime["render_width"] = int(message.get("width", 0) or 0)
+        runtime["render_height"] = int(message.get("height", 0) or 0)
+        _push_message(context, "system", f"{message.get('name', 'Host')} asked you to join a render")
+        _write_status(context, force=True)
+    elif action == "start":
+        runtime["render_active"] = True
+        runtime["render_job_id"] = job_id
+        runtime["render_queue"] = []
+        runtime["render_last_poll"] = 0.0
+        _push_message(context, "system", "Render started")
+    elif action == "work":
+        frames = message.get("frames") or []
+        for frame in frames:
+            if isinstance(frame, int) and not isinstance(frame, bool):
+                runtime["render_queue"].append((job_id, frame))
+        runtime["render_active"] = True
+        runtime["render_job_id"] = job_id
+    elif action in {"cancel", "finish"}:
+        runtime["render_active"] = False
+        runtime["render_queue"] = []
+        runtime["render_busy"] = False
+        runtime["render_request"] = None
+        _push_message(context, "system", "Render finished" if action == "finish" else "Render cancelled")
+
+
+def _handle_render_frame(context, event: dict) -> None:
+    manager = _render_manager()
+    job = manager.job()
+    if job is None:
+        return
+    try:
+        body = render_payload.decode(event.get("payload", b""))
+    except render_payload.RenderPayloadError:
+        return
+    if body["job"] != job.id:
+        return
+    try:
+        path = renderjob.write_frame(job.output_dir, body["frame"], job.format, body["data"])
+    except OSError:
+        traceback.print_exc()
+        return
+    manager.complete(body["frame"], str(event.get("sender", "")), path)
+    context.window_manager.bmp.render_progress = _render_progress_text(manager.status())
+    _write_status(context, force=True)
+
+
+def _render_session_frame(context, frame: int, width: int = 0, height: int = 0) -> tuple[bool, str, bytes]:
+    scene = context.scene
+    old_frame = scene.frame_current
+    old_path = scene.render.filepath
+    old_format = scene.render.image_settings.file_format
+    old_x = scene.render.resolution_x
+    old_y = scene.render.resolution_y
+    old_pct = scene.render.resolution_percentage
+    handle, path = tempfile.mkstemp(suffix=".png")
+    os.close(handle)
+    try:
+        scene.frame_set(int(frame))
+        scene.render.filepath = path
+        scene.render.image_settings.file_format = "PNG"
+        if width and height:
+            scene.render.resolution_x = int(width)
+            scene.render.resolution_y = int(height)
+            scene.render.resolution_percentage = 100
+        bpy.ops.render.render(write_still=True)
+        with open(path, "rb") as reader:
+            data = reader.read()
+        if not data:
+            return False, "render produced no image", b""
+        return True, "", data
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)[:200], b""
+    finally:
+        try:
+            scene.frame_set(old_frame)
+        except Exception:  # noqa: BLE001
+            pass
+        scene.render.filepath = old_path
+        scene.render.image_settings.file_format = old_format
+        scene.render.resolution_x = old_x
+        scene.render.resolution_y = old_y
+        scene.render.resolution_percentage = old_pct
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _compile_session_video(context, job) -> str:
+    settings = context.window_manager.bmp
+    output_format = str(runtime.get("render_format", "MP4")).upper()
+    if output_format in {"NONE", "PNG", "SEQUENCE"}:
+        return ""
+    try:
+        import imageio_ffmpeg
+    except Exception:  # noqa: BLE001
+        raise RuntimeError("imageio-ffmpeg is not installed")
+    import subprocess
+
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    pattern = os.path.join(job.output_dir, "frame_%05d.png")
+    extension = "webm" if output_format == "WEBM" else "mp4"
+    output = os.path.join(job.output_dir, f"render_{job.id}.{extension}")
+    codec = ["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "30"] if extension == "webm" else ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18"]
+    command = [
+        ffmpeg,
+        "-y",
+        "-framerate",
+        "24",
+        "-i",
+        pattern,
+        *codec,
+        output,
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or "ffmpeg failed").strip()[-300:])
+    _push_message(context, "system", f"Render video saved to {output}")
+    return output
+
+
+def _pump_session_render(context) -> None:
+    session: SessionService | None = runtime.get("session")
+    if session is None:
+        return
+    settings = context.window_manager.bmp
+    manager = _render_manager()
+    now = time.time()
+    if settings.is_host:
+        job = manager.job()
+        if job is None:
+            return
+        if not job.started and not job.finished:
+            all_answered = bool(job.asked) and job.asked <= (job.accepted | job.declined)
+            timed_out = bool(job.asked) and now - job.created_at > renderjob.CONSENT_TIMEOUT
+            if all_answered or timed_out or not job.asked:
+                manager.start()
+                for name in job.accepted:
+                    session.send_render_control_to(name, "start", {"job": job.id})
+                if not job.accepted:
+                    _push_message(context, "system", "No peers joined; rendering on the host only")
+        if job.started and not job.finished and not runtime.get("render_busy"):
+            frames = manager.claim(settings.name or "host", 1)
+            if frames:
+                runtime["render_busy"] = True
+                try:
+                    ok, error, data = _render_session_frame(context, frames[0], job.width, job.height)
+                    if ok:
+                        path = renderjob.write_frame(job.output_dir, frames[0], job.format, data)
+                        manager.complete(frames[0], settings.name or "host", path)
+                    else:
+                        manager.fail(frames[0], settings.name or "host", error)
+                finally:
+                    runtime["render_busy"] = False
+                settings.render_progress = _render_progress_text(manager.status())
+                _write_status(context, force=True)
+        if job.finished:
+            if not job.error:
+                try:
+                    _compile_session_video(context, job)
+                except Exception as exc:  # noqa: BLE001
+                    job.error = str(exc)[:200]
+                    settings.last_error = job.error
+            session.send_render_control("finish", {"job": job.id})
+            settings.render_progress = _render_progress_text(manager.status())
+            _write_status(context, force=True)
+            manager.cancel()
+            runtime["render_job_id"] = ""
+        return
+    if not runtime.get("render_active") or runtime.get("render_busy"):
+        return
+    queue = runtime.get("render_queue") or []
+    if queue:
+        job_id, frame = queue.pop(0)
+        runtime["render_busy"] = True
+        try:
+            ok, error, data = _render_session_frame(
+                context,
+                frame,
+                int(runtime.get("render_width", 0) or 0),
+                int(runtime.get("render_height", 0) or 0),
+            )
+            if ok:
+                session.send_render_frame(
+                    job_id,
+                    frame,
+                    "png",
+                    int(runtime.get("render_width", 0) or 0),
+                    int(runtime.get("render_height", 0) or 0),
+                    data,
+                )
+                runtime["render_done"] = int(runtime.get("render_done", 0)) + 1
+            else:
+                session.send_render_control("fail", {"job": job_id, "frame": frame, "error": error})
+        finally:
+            runtime["render_busy"] = False
+        if not queue:
+            session.send_render_control("need", {"job": job_id})
+        return
+    if now - runtime.get("render_last_poll", 0.0) > 3.0:
+        runtime["render_last_poll"] = now
+        session.send_render_control("need", {"job": runtime.get("render_job_id", "")})
 
 
 class BMP_OT_ai_ask(Operator):

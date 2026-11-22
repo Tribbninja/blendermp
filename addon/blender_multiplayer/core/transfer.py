@@ -17,10 +17,11 @@ import struct
 import time
 
 MAGIC = b"BMT1"
-HEADER = struct.Struct("<4s16sBBHII")
+HEADER = struct.Struct("<4s16sBBHIII")  # magic, id, kind, flags, index, total, total_size, chunk_size
 KIND_OBJECT = 0
 KIND_IMAGE = 1
-KINDS = {KIND_OBJECT, KIND_IMAGE}
+KIND_RENDER = 2
+KINDS = {KIND_OBJECT, KIND_IMAGE, KIND_RENDER}
 CHUNK_SIZE = 900 * 1024  # ~900 KB; stays under Cloudflare's ~1 MiB WebSocket cap
 MAX_TRANSFER = 256 * 1024 * 1024
 MAX_CHUNKS = 8192
@@ -35,7 +36,11 @@ def transfer_id(payload: bytes) -> bytes:
     return hashlib.sha256(payload).digest()[:16]
 
 
-def split(payload: bytes, kind: int = KIND_OBJECT) -> tuple[bytes, list[bytes]]:
+def split(
+    payload: bytes,
+    kind: int = KIND_OBJECT,
+    chunk_size: int | None = None,
+) -> tuple[bytes, list[bytes]]:
     if not isinstance(payload, (bytes, bytearray)):
         raise TransferError("transfer payload must be bytes")
     if kind not in KINDS:
@@ -45,16 +50,17 @@ def split(payload: bytes, kind: int = KIND_OBJECT) -> tuple[bytes, list[bytes]]:
         raise TransferError("transfer payload is empty")
     if len(payload) > MAX_TRANSFER:
         raise TransferError("transfer payload is too large")
-    total = (len(payload) + CHUNK_SIZE - 1) // CHUNK_SIZE
+    size = max(1, int(chunk_size if chunk_size is not None else CHUNK_SIZE))
+    total = (len(payload) + size - 1) // size
     if total > MAX_CHUNKS:
         raise TransferError("transfer has too many chunks")
     identity = transfer_id(payload)
     chunks = []
     for index in range(total):
-        start = index * CHUNK_SIZE
-        data = payload[start : start + CHUNK_SIZE]
+        start = index * size
+        data = payload[start : start + size]
         chunks.append(
-            HEADER.pack(MAGIC, identity, kind, 0, index, total, len(payload)) + data
+            HEADER.pack(MAGIC, identity, kind, 0, index, total, len(payload), size) + data
         )
     return identity, chunks
 
@@ -62,7 +68,7 @@ def split(payload: bytes, kind: int = KIND_OBJECT) -> tuple[bytes, list[bytes]]:
 def decode_chunk(payload: bytes) -> dict:
     if not isinstance(payload, (bytes, bytearray)) or len(payload) < HEADER.size:
         raise TransferError("chunk is truncated")
-    magic, identity, kind, flags, index, total, total_size = HEADER.unpack_from(payload, 0)
+    magic, identity, kind, flags, index, total, total_size, chunk_size = HEADER.unpack_from(payload, 0)
     if magic != MAGIC:
         raise TransferError("bad chunk magic")
     if kind not in KINDS:
@@ -73,16 +79,17 @@ def decode_chunk(payload: bytes) -> dict:
         raise TransferError("invalid chunk index")
     if total_size <= 0 or total_size > MAX_TRANSFER:
         raise TransferError("invalid transfer size")
-    expected = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
-    if total != expected:
+    if chunk_size <= 0 or chunk_size > MAX_TRANSFER:
+        raise TransferError("invalid chunk size")
+    if total != (total_size + chunk_size - 1) // chunk_size:
         raise TransferError("chunk count does not match transfer size")
     data = payload[HEADER.size :]
     if not data:
         raise TransferError("chunk has no data")
-    if index < total - 1 and len(data) != CHUNK_SIZE:
+    if index < total - 1 and len(data) != chunk_size:
         raise TransferError("non-final chunk has the wrong size")
     if index == total - 1:
-        expected_size = total_size - index * CHUNK_SIZE
+        expected_size = total_size - index * chunk_size
         if len(data) != expected_size:
             raise TransferError("final chunk has the wrong size")
     return {

@@ -46,6 +46,7 @@ if __package__:
     from .core import material as material_payload
     from .core import object_payload, protocol, tls
     from .core import compression
+    from .core import render_payload
     from .core import transfer
     from .core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, ErrorCode, Frame, MessageType
     from .core.roomcode import FLAG_RELAY, decode_room, encode_room, normalize, room_id
@@ -62,6 +63,7 @@ else:  # pragma: no cover - allows importing the module standalone (tests)
     from core import material as material_payload
     from core import object_payload, protocol, tls
     from core import compression
+    from core import render_payload
     from core import transfer
     from core.protocol import HEADER, HEADER_SIZE, MAGIC, PROTOCOL_VERSION, Channel, ErrorCode, Frame, MessageType
     from core.roomcode import FLAG_RELAY, decode_room, encode_room, normalize, room_id
@@ -490,6 +492,9 @@ class SessionService:
         else:
             self._publish_mesh_id()
 
+    def authenticated_peers(self) -> list[str]:
+        return [peer.name for peer in self._peers.values() if peer.authenticated]
+
     def mesh_status(self) -> dict:
         if self._mesh is None:
             return {"active": False, "peers": [], "public_address": "", "error": "", "sent": 0, "received": 0}
@@ -905,6 +910,16 @@ class SessionService:
                     peer.mesh = self._mesh
                 self._emit("mesh_peer", {"name": peer.name, "peer_id": mesh_id})
                 self._send_mesh_id(peer)
+            return
+
+        if frame.type == MessageType.RENDER:
+            body = self._json(frame, 4096)
+            action = clean_text(body.get("action"), 24)
+            if action:
+                self._emit(
+                    "render_control",
+                    {"name": peer.name, "peer_id": peer.peer_id, "action": action, "body": body},
+                )
             return
 
         if frame.type in MUTATING_TYPES and not can_edit(peer.role):
@@ -1335,8 +1350,12 @@ class SessionService:
             self._emit("transfer_progress", {**progress, "direction": "receive", "sender": peer.name})
             if result is None:
                 return
-            if result.get("kind") != transfer.KIND_OBJECT and result.get("kind") != transfer.KIND_IMAGE:
+            if result.get("kind") not in {transfer.KIND_OBJECT, transfer.KIND_IMAGE, transfer.KIND_RENDER}:
                 raise Violation("unsupported chunked transfer kind")
+            if result.get("kind") == transfer.KIND_RENDER:
+                self._emit("transfer_done", {"direction": "receive", "sender": peer.name, "id": progress.get("id")})
+                self._emit("render_frame", {"sender": peer.name, "payload": result["data"]})
+                return
             if result.get("kind") == transfer.KIND_IMAGE:
                 try:
                     body = image_payload.decode(result["data"])
@@ -2481,6 +2500,13 @@ class SessionService:
                     self._mesh_ready = True
             return
 
+        if frame.type == MessageType.RENDER:
+            body = self._json(frame, 4096)
+            action = clean_text(body.get("action"), 24)
+            if action:
+                self._emit("render_control", {"action": action, "body": body})
+            return
+
         if frame.type == MessageType.PONG:
             try:
                 body = json.loads(frame.payload.decode("utf-8"))
@@ -3350,6 +3376,49 @@ class SessionService:
             critical=True,
         )
         return len(raw)
+
+    def send_render_control(self, action: str, body: dict | None = None) -> None:
+        payload = {"action": str(action)[:24]}
+        if body:
+            payload.update(body)
+        self._enqueue(protocol.json_frame(MessageType.RENDER, payload))
+
+    def send_render_control_to(self, name: str, action: str, body: dict | None = None) -> None:
+        payload = {"action": str(action)[:24]}
+        if body:
+            payload.update(body)
+        data = protocol.encode(protocol.json_frame(MessageType.RENDER, payload))
+        for peer in self._peers.values():
+            if peer.authenticated and peer.name == name:
+                try:
+                    peer.enqueue(data, critical=True)
+                except Violation:
+                    pass
+                return
+
+    def send_render_frame(
+        self,
+        job: str,
+        frame: int,
+        format_hint: str,
+        width: int,
+        height: int,
+        data: bytes,
+    ) -> bool:
+        try:
+            payload = render_payload.encode(job, frame, format_hint, width, height, data)
+        except render_payload.RenderPayloadError:
+            return False
+        chunk_size = CHUNK_THRESHOLD if self._using_relay else MAX_MESH
+        try:
+            _identity, chunks = transfer.split(
+                payload, transfer.KIND_RENDER, chunk_size=chunk_size
+            )
+        except transfer.TransferError:
+            return False
+        for chunk in chunks:
+            self._enqueue(Frame(type=MessageType.CHUNK, channel=Channel.BULK, payload=chunk))
+        return True
 
     def request_lease(self, key: str, action: str = "acquire") -> None:
         self._enqueue(protocol.json_frame(MessageType.LEASE, {"key": key, "action": action}))

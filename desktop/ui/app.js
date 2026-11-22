@@ -140,7 +140,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.11.2";
+const APP_VERSION = "0.11.3";
 const PROTOCOL_VERSION = 3;
 const CAPABILITIES = 1 | (1 << 10) | (1 << 11) | (1 << 12); // presence, bookmarks, bundles, chunks
 const settings = {
@@ -767,6 +767,37 @@ function renderState(status) {
   } else {
     $("chatSub").textContent = `${status.users?.length || 0} in the room`;
   }
+  renderFarm(status);
+}
+
+function renderFarm(status) {
+  const section = $("renderSection");
+  if (!section) return;
+  const active = isActive(status);
+  const render = status?.render && typeof status.render === "object" ? status.render : {};
+  const hosting = active && Boolean(status?.is_host);
+  const running = Boolean(render.active);
+  const request = render.request && typeof render.request === "object" ? render.request : null;
+  section.hidden = !active;
+  if (!active) return;
+  $("renderHostControls").hidden = !hosting;
+  $("renderProgressWrap").hidden = !running;
+  $("renderConsent").hidden = hosting || !request;
+  $("renderState").textContent = running
+    ? `${render.done || 0}/${render.total || 0}`
+    : request
+      ? "invite"
+      : "idle";
+  $("renderState").className = `live ${running ? "on" : request ? "busy" : ""}`;
+  if (running) {
+    const percent = Math.max(0, Math.min(100, Number(render.percent || 0)));
+    $("renderBar").style.width = `${percent}%`;
+    const failed = Number(render.failed || 0);
+    $("renderProgressText").textContent = `${render.done || 0}/${render.total || 0} frames (${percent.toFixed(0)}%)${failed ? `, ${failed} failed` : ""}`;
+  }
+  if (request) {
+    $("renderConsentText").textContent = `${request.name || "The host"} wants to render frames ${request.start}-${request.end} (step ${request.step}) at ${request.width}x${request.height}.`;
+  }
 }
 
 function renderMembers(status) {
@@ -1170,6 +1201,30 @@ async function request(request) {
   } catch (error) {
     log(`write_session ${request.action} failed: ${error}`);
     throw error;
+  }
+}
+
+async function startRender() {
+  const start = Math.max(0, Number($("renderStart").value) || 0);
+  const end = Math.max(start, Number($("renderEnd").value) || start);
+  const step = Math.max(1, Number($("renderStep").value) || 1);
+  const format = $("renderFormat").value || "MP4";
+  try {
+    await request({ action: "render", start, end, step, format });
+    toast("Render requested", "ok");
+  } catch (error) {
+    toast(String(error), "error");
+  }
+}
+
+async function replyRender(accept) {
+  const render = state.status?.render || {};
+  const job = render.request?.job || "";
+  try {
+    await request({ action: "render_reply", job, accept });
+    toast(accept ? "Joined the render" : "Declined the render", accept ? "ok" : "warn");
+  } catch (error) {
+    toast(String(error), "error");
   }
 }
 
@@ -1832,6 +1887,10 @@ function wire() {
   $("setPort").addEventListener("change", () => {
     settings.port = Math.max(1024, Math.min(65535, Number($("setPort").value) || 51999));
   });
+
+  $("renderStartBtn")?.addEventListener("click", startRender);
+  $("renderAccept")?.addEventListener("click", () => replyRender(true));
+  $("renderDecline")?.addEventListener("click", () => replyRender(false));
 
   window.addEventListener("resize", scheduleBounds);
 }

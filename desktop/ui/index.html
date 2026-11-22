@@ -136,6 +136,41 @@
           </ul>
         </section>
 
+        <section class="section" id="renderSection" hidden>
+          <div class="section-head">
+            <span>Render farm</span>
+            <span class="live" id="renderState">idle</span>
+          </div>
+          <div id="renderHostControls">
+            <div class="render-range">
+              <label>Frames <input id="renderStart" type="number" value="1" min="0" /></label>
+              <label>to <input id="renderEnd" type="number" value="250" min="0" /></label>
+              <label>step <input id="renderStep" type="number" value="1" min="1" /></label>
+            </div>
+            <div class="render-range">
+              <label>Format
+                <select id="renderFormat">
+                  <option value="MP4">MP4</option>
+                  <option value="WEBM">WebM</option>
+                  <option value="PNG">PNG sequence</option>
+                </select>
+              </label>
+              <button class="btn primary" id="renderStartBtn">Custom render</button>
+            </div>
+          </div>
+          <div id="renderProgressWrap" hidden>
+            <div class="progress"><div class="progress-bar" id="renderBar"></div></div>
+            <p class="fine" id="renderProgressText"></p>
+          </div>
+          <div id="renderConsent" hidden>
+            <p id="renderConsentText"></p>
+            <div class="actions">
+              <button class="btn primary" id="renderAccept">Join render</button>
+              <button class="btn ghost" id="renderDecline">Decline</button>
+            </div>
+          </div>
+        </section>
+
         <section class="section" id="diagnosticsSection">
           <div class="section-head">
             <span>Connection</span>
@@ -303,7 +338,7 @@
         <span id="statusLeft">Ready</span>
         <span class="grow"></span>
         <span id="statusMid"></span>
-        <span id="statusRight">v0.11.2</span>
+        <span id="statusRight">v0.11.3</span>
       </div>
     </main>
     </section>

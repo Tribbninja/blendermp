@@ -791,3 +791,14 @@ body.resizing { user-select: none; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* render farm ------------------------------------------------------------ */
+.render-range { display: flex; gap: 8px; flex-wrap: wrap; align-items: end; margin-bottom: 8px; }
+.render-range label { display: flex; flex-direction: column; gap: 3px; font-size: 10.5px; color: var(--muted); }
+.render-range input, .render-range select { width: 76px; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel-soft); color: var(--text); font-size: 12px; }
+.render-range select { width: auto; }
+.render-range .btn { margin-left: auto; }
+.progress { height: 6px; border-radius: 999px; background: var(--line-soft); overflow: hidden; margin: 10px 0 6px; }
+.progress-bar { height: 100%; width: 0; background: var(--accent); transition: width .3s ease; }
+#renderConsent { border: 1px solid var(--line); border-radius: var(--radius); padding: 10px; margin-top: 8px; background: var(--panel-soft); }
+#renderConsent p { margin: 0 0 8px; font-size: 12px; color: var(--text); }

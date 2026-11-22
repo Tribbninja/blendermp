@@ -315,6 +315,46 @@ def write_status(data: dict[str, Any]) -> None:
             "sent": max(0, min(int(mesh.get("sent", 0) or 0), 1 << 62)),
             "received": max(0, min(int(mesh.get("received", 0) or 0), 1 << 62)),
         }
+    render = data.get("render")
+    if isinstance(render, dict):
+        clean = {
+            "active": bool(render.get("active")),
+            "role": str(render.get("role", ""))[:16],
+            "id": str(render.get("id", ""))[:32],
+            "name": str(render.get("name", ""))[:80],
+            "start": max(0, min(int(render.get("start", 0) or 0), 1 << 31)),
+            "end": max(0, min(int(render.get("end", 0) or 0), 1 << 31)),
+            "step": max(1, min(int(render.get("step", 1) or 1), 1000)),
+            "total": max(0, min(int(render.get("total", 0) or 0), 1 << 31)),
+            "done": max(0, min(int(render.get("done", 0) or 0), 1 << 31)),
+            "failed": max(0, min(int(render.get("failed", 0) or 0), 1 << 31)),
+            "claimed": max(0, min(int(render.get("claimed", 0) or 0), 1 << 31)),
+            "pending": max(0, min(int(render.get("pending", 0) or 0), 1 << 31)),
+            "percent": round(max(0.0, min(100.0, float(render.get("percent", 0) or 0))), 1),
+            "workers": [
+                str(worker)[:48]
+                for worker in (render.get("workers") or [])[:64]
+                if isinstance(worker, str)
+            ],
+            "started": bool(render.get("started")),
+            "finished": bool(render.get("finished")),
+            "error": str(render.get("error", ""))[:200],
+            "output_dir": str(render.get("output_dir", ""))[:512],
+        }
+        request = render.get("request")
+        if isinstance(request, dict):
+            clean["request"] = {
+                "job": str(request.get("job", ""))[:32],
+                "name": str(request.get("name", ""))[:80],
+                "start": max(0, min(int(request.get("start", 0) or 0), 1 << 31)),
+                "end": max(0, min(int(request.get("end", 0) or 0), 1 << 31)),
+                "step": max(1, min(int(request.get("step", 1) or 1), 1000)),
+                "width": max(0, min(int(request.get("width", 0) or 0), 1 << 16)),
+                "height": max(0, min(int(request.get("height", 0) or 0), 1 << 16)),
+                "format": str(request.get("format", "PNG"))[:8],
+                "engine": str(request.get("engine", ""))[:32],
+            }
+        safe["render"] = clean
     for key in ("is_host", "relay", "fast_mode", "farm_active", "internet_mode", "lan_fast"):
         value = data.get(key)
         if isinstance(value, bool):

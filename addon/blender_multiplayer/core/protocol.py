@@ -124,6 +124,7 @@ class MessageType(IntEnum):
     OBJECT_RENAME = 46
     CHUNK = 45
     MESH = 47
+    RENDER = 48
 
 
 class Channel(IntEnum):
