@@ -74,7 +74,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 11, 5),
+    "version": (0, 11, 6),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -7290,12 +7290,13 @@ def _write_status(context, force: bool = False) -> None:
         settings.mesh_info = ""
     render_manager = runtime.get("render_manager")
     render_status = render_manager.status() if render_manager is not None else {"active": False}
-    if not render_status.get("active"):
-        render_status = {"active": False}
     render_status["request"] = runtime.get("render_request")
     render_status["role"] = "host" if settings.is_host else "client"
-    if render_status.get("active"):
-        settings.render_progress = f"{render_status.get('done', 0)}/{render_status.get('total', 0)} frames ({render_status.get('percent', 0):.0f}%)"
+    if render_status.get("active") or render_status.get("finished"):
+        settings.render_progress = (
+            f"{render_status.get('done', 0)}/{render_status.get('total', 0)} frames "
+            f"({render_status.get('percent', 0):.0f}%)"
+        )
     else:
         settings.render_progress = ""
     # The session object is the source of truth. Settings are updated from

@@ -140,7 +140,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.11.5";
+const APP_VERSION = "0.11.6";
 const PROTOCOL_VERSION = 3;
 const CAPABILITIES = 1 | (1 << 10) | (1 << 11) | (1 << 12); // presence, bookmarks, bundles, chunks
 const settings = {
@@ -777,20 +777,23 @@ function renderFarm(status) {
   const render = status?.render && typeof status.render === "object" ? status.render : {};
   const hosting = active && Boolean(status?.is_host);
   const running = Boolean(render.active);
+  const finished = Boolean(render.finished);
   const request = render.request && typeof render.request === "object" ? render.request : null;
   section.hidden = !active;
   if (!active) return;
-  $("renderHostControls").hidden = !hosting;
-  $("renderProgressWrap").hidden = !running;
+  $("renderHostControls").hidden = !hosting || running;
+  $("renderProgressWrap").hidden = !(running || finished);
   $("renderConsent").hidden = hosting || !request;
-  $("renderBadge").textContent = running
-    ? `${render.done || 0}/${render.total || 0}`
-    : request
-      ? "invite"
-      : "idle";
-  $("renderBadge").className = `live ${running ? "on" : request ? "busy" : ""}`;
-  if (running) {
-    const percent = Math.max(0, Math.min(100, Number(render.percent || 0)));
+  $("renderBadge").textContent = finished
+    ? "done"
+    : running
+      ? `${render.done || 0}/${render.total || 0}`
+      : request
+        ? "invite"
+        : "idle";
+  $("renderBadge").className = `live ${running || finished ? "on" : request ? "busy" : ""}`;
+  if (running || finished) {
+    const percent = finished ? 100 : Math.max(0, Math.min(100, Number(render.percent || 0)));
     $("renderBar").style.width = `${percent}%`;
     const failed = Number(render.failed || 0);
     $("renderProgressText").textContent = `${render.done || 0}/${render.total || 0} frames (${percent.toFixed(0)}%)${failed ? `, ${failed} failed` : ""}`;
