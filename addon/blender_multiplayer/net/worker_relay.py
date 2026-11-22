@@ -124,7 +124,7 @@ class WorkerBridge:
                 headers = {"X-BMP-Host-Token": self.token} if self.role == "host" and self.token else None
                 if self.role == "host":
                     print(f"BMP relay host connecting room={self.room}", flush=True)
-                websocket = await connect(self._url(), headers=headers)
+                websocket = await self._connect_with_retry(headers)
             except WebSocketError as exc:
                 print(f"BMP relay {self.role} failed: {exc}", flush=True)
                 writer.write(f"ERR {str(exc)[:150]}\n".encode("utf-8", "replace"))
@@ -147,6 +147,26 @@ class WorkerBridge:
             except Exception:  # noqa: BLE001
                 pass
             self._writers.discard(writer)
+
+    async def _connect_with_retry(self, headers):
+        """Retry a host connection while the room token is being announced.
+
+        The desktop app announces the host token just after launching Blender.
+        The relay can be reachable a fraction of a second earlier, so a 403
+        here usually means "the token is not in the Room yet", not "bad token".
+        """
+        last_error = None
+        attempts = 12 if self.role == "host" else 1
+        for attempt in range(attempts):
+            try:
+                return await connect(self._url(), headers=headers)
+            except WebSocketError as exc:
+                last_error = exc
+                text = str(exc)
+                if "403" not in text or attempt == attempts - 1:
+                    raise
+                await asyncio.sleep(0.5)
+        raise last_error or WebSocketError("relay connection failed")
 
     async def _pump_host(self, reader, writer, websocket) -> None:
         async def local_to_hub() -> None:

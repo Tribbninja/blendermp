@@ -7139,6 +7139,7 @@ def _write_status(context, force: bool = False) -> None:
     runtime["last_status"] = now
     settings = context.window_manager.bmp
     settings.tick_errors = "; ".join(runtime.get("tick_errors", [])[-3:])
+    stats = session.stats() if session else {}
     # The session object is the source of truth. Settings are updated from
     # queued events and can lag (or be overwritten by a late event), which used
     # to publish "offline" while the socket was healthy.
