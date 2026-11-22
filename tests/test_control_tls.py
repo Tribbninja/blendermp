@@ -250,3 +250,26 @@ def test_render_stop_request(appdir):
     write_session(appdir, {"action": "render_stop", "nonce": "r" * 16})
     request = control.read_session()
     assert request["action"] == "render_stop"
+
+
+def test_status_keeps_render_stop_state(appdir):
+    control.write_status(
+        {
+            "state": "hosting",
+            "render": {
+                "active": False,
+                "finished": True,
+                "stopped": True,
+                "total": 40,
+                "done": 10,
+                "percent": 25.0,
+                "workers": ["ada"],
+                "request": {"job": "abc123", "start": 1, "end": 40, "step": 1, "format": "MP4"},
+            },
+        }
+    )
+    body = json.loads(control.status_path().read_text(encoding="utf-8"))
+    assert body["render"]["stopped"] is True
+    assert body["render"]["finished"] is True
+    assert body["render"]["done"] == 10
+    assert body["render"]["request"]["job"] == "abc123"

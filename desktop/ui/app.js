@@ -140,7 +140,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.11.7";
+const APP_VERSION = "0.11.8";
 const PROTOCOL_VERSION = 3;
 const CAPABILITIES = 1 | (1 << 10) | (1 << 11) | (1 << 12); // presence, bookmarks, bundles, chunks
 const settings = {
@@ -785,13 +785,15 @@ function renderFarm(status) {
   $("renderProgressWrap").hidden = !(running || finished);
   $("renderStopBtn").hidden = !hosting || !running;
   $("renderConsent").hidden = hosting || !request;
-  $("renderBadge").textContent = finished
-    ? "done"
-    : running
-      ? `${render.done || 0}/${render.total || 0}`
-      : request
-        ? "invite"
-        : "idle";
+  $("renderBadge").textContent = render.stopped
+    ? "stopped"
+    : finished
+      ? "done"
+      : running
+        ? `${render.done || 0}/${render.total || 0}`
+        : request
+          ? "invite"
+          : "idle";
   $("renderBadge").className = `live ${running || finished ? "on" : request ? "busy" : ""}`;
   if (running || finished) {
     const percent = finished ? 100 : Math.max(0, Math.min(100, Number(render.percent || 0)));

@@ -366,6 +366,7 @@ def write_status(data: dict[str, Any]) -> None:
             ],
             "started": bool(render.get("started")),
             "finished": bool(render.get("finished")),
+            "stopped": bool(render.get("stopped")),
             "error": str(render.get("error", ""))[:200],
             "output_dir": str(render.get("output_dir", ""))[:512],
         }
