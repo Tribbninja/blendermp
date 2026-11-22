@@ -4642,12 +4642,24 @@ def _sync_selection(context) -> None:
             except Exception:  # noqa: BLE001
                 pass
         hidden.discard(uid)
+    active = context.active_object
     for uid in blocked:
         obj = obj_sync.find(uid)
-        if obj is not None and not obj.hide_select:
-            try:
+        if obj is None:
+            continue
+        try:
+            if obj.select_get():
+                obj.select_set(False)
+            if not obj.hide_select:
                 obj.hide_select = True
-                hidden.add(uid)
+            hidden.add(uid)
+        except Exception:  # noqa: BLE001
+            pass
+        if obj is active and context.mode != "OBJECT":
+            # A locked object must not stay in Edit/Sculpt mode; otherwise the
+            # user can keep changing it locally even though it will not sync.
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
             except Exception:  # noqa: BLE001
                 pass
 
@@ -4748,9 +4760,21 @@ def _sync_transforms(context) -> None:
             shadow[uid] = tuple(round(v, 6) for row in matrix for v in row)
             continue
         owner = runtime["lease_owners"].get(uid)
-        if not settings.is_host and (
-            owner not in (None, settings.name) or uid not in runtime["owned_leases"]
-        ):
+        if owner not in (None, settings.name):
+            # Locked by another peer. Never broadcast or steal the lease, and
+            # undo any local drift so the object cannot be moved here.
+            matrix = obj.matrix_world
+            current = tuple(round(v, 6) for row in matrix for v in row)
+            previous = shadow.get(uid)
+            if previous is not None and current != previous:
+                try:
+                    obj_sync.apply(uid, previous)
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                shadow[uid] = current
+            continue
+        if not settings.is_host and uid not in runtime["owned_leases"]:
             # A client may only broadcast objects it holds the lease for. Keep
             # the shadow current so a remote-applied matrix is never echoed.
             matrix = obj.matrix_world
@@ -4765,14 +4789,6 @@ def _sync_transforms(context) -> None:
             shadow[uid] = current
             continue
         if current != previous:
-            if settings.is_host and owner not in (None, settings.name):
-                # The host is authoritative, but it only takes the lease when
-                # it actually changes the object. Taking it for every
-                # client-owned object on every tick stole leases continuously
-                # and made locks flap.
-                session.force_lease(uid)
-                runtime["lease_owners"][uid] = settings.name
-                runtime["owned_leases"].add(uid)
             shadow[uid] = current
             runtime["transform_smoothers"].pop(uid, None)
             runtime["local_transform"][uid] = time.monotonic()
@@ -7423,6 +7439,9 @@ def _sync_edit_selection(context) -> None:
     uid = active.get("bmp_uuid")
     count = len(active.data.vertices)
     if not uid or count <= 0 or count > 200_000:
+        return
+    owner = runtime["lease_owners"].get(uid)
+    if owner not in (None, context.window_manager.bmp.name):
         return
     try:
         import bmesh
