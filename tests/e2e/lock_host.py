@@ -53,7 +53,10 @@ def tick():
         "selected": bool(cube.select_get()),
         "hide_select": bool(cube.hide_select),
     }
-    if elapsed > 24.0:
+    if elapsed > 8.0 and "deselected" not in globals():
+        globals()["deselected"] = elapsed
+        cube.select_set(False)
+    if elapsed > 16.0:
         with open(result_path, "w", encoding="utf-8") as handle:
             json.dump(data, handle)
         bpy.ops.wm.quit_blender()

@@ -63,6 +63,12 @@ def tick():
         checks["selected"] = bool(obj.select_get())
         checks["hidden"] = uid in bmp.runtime.get("hidden_objects", set()) if uid else None
         checks["before"] = [round(float(v), 3) for v in obj.location]
+        checks["remote_selected"] = {
+            user.name: str(user.selected or "")
+            for user in wm.bmp.users
+            if user.name != wm.bmp.name
+        }
+        checks["outline_segments"] = bmp.runtime.get("remote_debug", {}).get("segments", 0)
         obj.location.x = 5.0
         checks["after_move"] = [round(float(v), 3) for v in obj.location]
     if "snapshot" in checks and "settled" not in checks and elapsed > checks["snapshot"] + 2.5:
@@ -71,6 +77,14 @@ def tick():
         checks["hide_select_after"] = bool(obj.hide_select)
         checks["selected_after"] = bool(obj.select_get())
         checks["owner_after"] = bmp.runtime["lease_owners"].get(uid) if uid else None
+    if "settled" in checks and "outline_after" not in checks and elapsed > 11.0:
+        checks["remote_selected_after"] = {
+            user.name: str(user.selected or "")
+            for user in wm.bmp.users
+            if user.name != wm.bmp.name
+        }
+        checks["outline_segments_after"] = bmp.runtime.get("remote_debug", {}).get("segments", 0)
+        checks["outline_after"] = round(elapsed, 2)
         finish("done")
         return None
     if elapsed > 24.0:

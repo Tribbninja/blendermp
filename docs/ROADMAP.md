@@ -7,6 +7,7 @@ streaming, edit leases, presence 2.0, exact remote application, durable settings
 strict version gate, lease request UX, server-enforced roles, optional LAN direct).
 
 Progress log:
+- [x] 2026-11-22: 0.9.13: the remote selection outline now clears on deselect. Presence only includes actually selected objects; the active-but-unselected object was keeping the outline alive. The LOCK E2E suite now checks the outline segment count drops after the owner deselects.
 - [x] 2026-11-22: 0.9.12: locks are enforced every 50 ms, and a remote presence deselect now clears any stale lease so a mesh cannot stay locked forever after its owner stops selecting it. Selection is blocked at the source with `hide_select`, and the lock release is verified by the LOCK E2E suite.
 - [x] 2026-11-22: 0.9.11: ported Multi-User's `DynamicRightSelectTimer` lock model directly: selection locks, deselection unlocks, every object owned by another peer gets `hide_select`, locked transforms revert and Edit/Sculpt exits. Removed the per-user "Edit locks off" opt-out so locks are always enforced. Added a permanent two-Blender `LOCK E2E` suite.
 - [x] 2026-11-22: 0.9.10: edit locks now persist for as long as the object stays selected (Multi-User semantics) instead of expiring after 30 seconds of inactivity; the live status now shows the active lease. Locks still release on deselect, disconnect, explicit release, or when edit locks are turned off.

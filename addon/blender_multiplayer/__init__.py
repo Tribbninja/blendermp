@@ -72,7 +72,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 9, 12),
+    "version": (0, 9, 13),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -5703,10 +5703,9 @@ def _viewport_corners(context):
 
 
 def _selected_uids(context) -> list:
+    # Only actually selected objects. The active object can be unselected, and
+    # including it kept the remote outline drawn after the owner deselected.
     objects = list(context.selected_objects)
-    active = context.active_object
-    if active is not None and active not in objects:
-        objects.append(active)
     for obj in getattr(context, "objects_in_mode", []):
         if obj not in objects:
             objects.append(obj)

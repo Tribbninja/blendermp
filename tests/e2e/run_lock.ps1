@@ -57,13 +57,19 @@ Check ([bool]$client.hidden) 'locked cube was not tracked as hidden on the clien
 Check ($client.after_move[0] -eq 5.0) 'client test move did not apply before the revert check'
 Check ($client.settled[0] -eq 0.0) "client move was not reverted (settled x=$($client.settled[0]))"
 Check ([bool]$client.hide_select_after) 'locked cube became selectable again on the client'
+$remoteSelected = ($client.remote_selected.PSObject.Properties | ForEach-Object { $_.Value }) -join ','
+Check ($remoteSelected -ne '') 'client did not see the host selection'
+Check ([int]$client.outline_segments -gt 9) "client outline was $($client.outline_segments) segments while locked"
+$remoteSelectedAfter = ($client.remote_selected_after.PSObject.Properties | ForEach-Object { $_.Value }) -join ','
+Check ($remoteSelectedAfter -eq '') "client still saw host selection '$remoteSelectedAfter' after deselect"
+Check ([int]$client.outline_segments_after -le 9) "client outline did not clear (segments $($client.outline_segments_after))"
 if ($null -ne $hostResult) {
-    Check ($hostResult.owner -eq 'lockhost') "host owner was '$($hostResult.owner)'"
-    Check ([bool]$hostResult.selected) 'host lost its own selection'
-    Check (-not [bool]$hostResult.hide_select) 'host could not select its own locked cube'
+    Check ($null -eq $hostResult.owner) "host lease did not release (owner $($hostResult.owner))"
+    Check (-not [bool]$hostResult.selected) 'host still had the cube selected'
+    Check (-not [bool]$hostResult.hide_select) 'host could not select its own cube'
 }
 
-Write-Host ("client owner={0} hide_select={1} selected={2} settled={3} host owner={4}" -f $client.owner, $client.hide_select, $client.selected, ($client.settled -join ','), $hostResult.owner)
+Write-Host ("client owner={0} hide_select={1} selected={2} settled={3} outline={4}->{5} host owner={6}" -f $client.owner, $client.hide_select, $client.selected, ($client.settled -join ','), $client.outline_segments, $client.outline_segments_after, $hostResult.owner)
 foreach ($process in @($hostProc, $clientProc)) {
     if ($null -ne $process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
 }
