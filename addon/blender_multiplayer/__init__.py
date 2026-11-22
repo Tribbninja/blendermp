@@ -72,7 +72,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 9, 11),
+    "version": (0, 9, 12),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -86,7 +86,7 @@ CONTROL_POLL = 0.5
 STATUS_WRITE = 0.5
 MESH_POLL = 1.0 / 20.0
 EDIT_POLL = 1.0 / 30.0
-SELECTION_POLL = 0.2
+SELECTION_POLL = 0.05
 LEASE_RENEW = 15.0
 LEASE_IDLE = 30.0
 PRESENCE_POLL = 1.0 / 20.0
@@ -1092,7 +1092,22 @@ def _handle_event(context, kind: str, body: dict) -> None:
                     else:
                         user.has_cursor = False
                 if "selected" in body:
+                    old_selected = {
+                        item for item in str(user.selected or "").split(",") if item
+                    }
                     user.selected = str(body.get("selected", ""))[:512]
+                    new_selected = {
+                        item for item in str(user.selected or "").split(",") if item
+                    }
+                    # A remote deselect must free the object even if the lease
+                    # release frame was lost. Without this a mesh could stay
+                    # "locked" forever after its owner stopped selecting it.
+                    for uid in old_selected - new_selected:
+                        if runtime["lease_owners"].get(uid) == user.name:
+                            runtime["lease_owners"].pop(uid, None)
+                            runtime["owned_leases"].discard(uid)
+                            runtime["lease_activity"].pop(uid, None)
+                            runtime["hidden_objects"].discard(uid)
                 if "scene_hash" in body:
                     user.scene_hash = str(body.get("scene_hash", ""))[:32]
                 if "ping_ms" in body:
