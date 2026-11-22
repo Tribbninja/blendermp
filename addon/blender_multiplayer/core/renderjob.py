@@ -53,6 +53,7 @@ class RenderJob:
     started_at: float = 0.0
     started: bool = False
     finished: bool = False
+    stopped: bool = False
     error: str = ""
 
 
@@ -63,6 +64,7 @@ class RenderManager:
         self.max_batch = max(1, min(32, int(max_batch)))
         self._lock = threading.Lock()
         self._job: RenderJob | None = None
+        self._last: dict | None = None
 
     def active(self) -> bool:
         with self._lock:
@@ -199,6 +201,23 @@ class RenderManager:
             if self._job is not None:
                 self._job.finished = True
 
+    def stop(self) -> bool:
+        """Stop the job now and keep the frames already written to disk."""
+        with self._lock:
+            job = self._job
+            if job is None or job.finished:
+                return False
+            job.finished = True
+            job.stopped = True
+            return True
+
+    def clear(self) -> None:
+        """Retire the finished job and keep its summary for the UI."""
+        with self._lock:
+            if self._job is not None:
+                self._last = self._status_locked(self._job)
+            self._job = None
+
     def _maybe_finish(self, job: RenderJob) -> None:
         if job.finished:
             return
@@ -236,39 +255,44 @@ class RenderManager:
 
     def status(self) -> dict:
         with self._lock:
-            job = self._job
-            if job is None:
-                return {"active": False}
-            total = len(job.frames)
-            done = sum(1 for chunk in job.frames.values() if chunk.status == "done")
-            failed = sum(1 for chunk in job.frames.values() if chunk.status == "failed")
-            claimed = sum(1 for chunk in job.frames.values() if chunk.status == "claimed")
-            pending = total - done - failed - claimed
-            return {
-                "active": not job.finished,
-                "id": job.id,
-                "name": job.name,
-                "start": job.start,
-                "end": job.end,
-                "step": job.step,
-                "width": job.width,
-                "height": job.height,
-                "format": job.format,
-                "engine": job.engine,
-                "fps": job.fps,
-                "output_dir": job.output_dir,
-                "total": total,
-                "done": done,
-                "failed": failed,
-                "claimed": claimed,
-                "pending": pending,
-                "percent": round(done * 100.0 / max(1, total), 1),
-                "workers": sorted(job.accepted),
-                "declined": sorted(job.declined),
-                "started": job.started,
-                "finished": job.finished,
-                "error": job.error,
-            }
+            if self._job is not None:
+                return self._status_locked(self._job)
+            if self._last is not None:
+                return dict(self._last)
+            return {"active": False}
+
+    def _status_locked(self, job: RenderJob) -> dict:
+        total = len(job.frames)
+        done = sum(1 for chunk in job.frames.values() if chunk.status == "done")
+        failed = sum(1 for chunk in job.frames.values() if chunk.status == "failed")
+        claimed = sum(1 for chunk in job.frames.values() if chunk.status == "claimed")
+        pending = total - done - failed - claimed
+        return {
+            "active": not job.finished,
+            "id": job.id,
+            "name": job.name,
+            "start": job.start,
+            "end": job.end,
+            "step": job.step,
+            "width": job.width,
+            "height": job.height,
+            "format": job.format,
+            "engine": job.engine,
+            "fps": job.fps,
+            "output_dir": job.output_dir,
+            "total": total,
+            "done": done,
+            "failed": failed,
+            "claimed": claimed,
+            "pending": pending,
+            "percent": round(done * 100.0 / max(1, total), 1),
+            "workers": sorted(job.accepted),
+            "declined": sorted(job.declined),
+            "started": job.started,
+            "finished": job.finished,
+            "stopped": job.stopped,
+            "error": job.error,
+        }
 
 
 def frame_filename(frame: int, format_hint: str) -> str:

@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - allows importing the module standalone
 APP_DIR = "Blendermp"
 MAX_CONTROL_BYTES = 4096
 MAX_STATUS_BYTES = 64 * 1024
-ALLOWED_ACTIONS = {"host", "join", "leave", "chat", "kick", "role", "render", "render_reply"}
+ALLOWED_ACTIONS = {"host", "join", "leave", "chat", "kick", "role", "render", "render_stop", "render_reply"}
 NAME_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,48}$")
 HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 

@@ -244,3 +244,9 @@ def test_invalid_render_requests_are_ignored(appdir):
     for body in cases:
         write_session(appdir, body)
         assert control.read_session() is None, body
+
+
+def test_render_stop_request(appdir):
+    write_session(appdir, {"action": "render_stop", "nonce": "r" * 16})
+    request = control.read_session()
+    assert request["action"] == "render_stop"

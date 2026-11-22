@@ -74,7 +74,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 11, 6),
+    "version": (0, 11, 7),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -3100,6 +3100,8 @@ def _poll_control(context) -> None:
                 request.get("format", "MP4"),
                 request.get("output", ""),
             )
+        elif action == "render_stop":
+            _stop_session_render(context)
         elif action == "render_reply":
             session = runtime.get("session")
             pending = runtime.get("render_request") or {}
@@ -8813,6 +8815,19 @@ def _start_session_render(context, start, end, step, format_hint, output) -> Non
     _write_status(context, force=True)
 
 
+def _stop_session_render(context) -> None:
+    settings = context.window_manager.bmp
+    if not settings.is_host:
+        settings.last_error = "Only the host can stop the render"
+        return
+    manager = _render_manager()
+    if manager.stop():
+        _push_message(context, "system", "Stopping the render; the rendered frames are kept")
+        _write_status(context, force=True)
+    else:
+        settings.last_error = "No render is running"
+
+
 def _handle_render_control(context, event: dict) -> None:
     session: SessionService | None = runtime.get("session")
     if session is None:
@@ -9012,16 +9027,20 @@ def _pump_session_render(context) -> None:
                 settings.render_progress = _render_progress_text(manager.status())
                 _write_status(context, force=True)
         if job.finished:
-            if not job.error:
-                try:
-                    _compile_session_video(context, job)
-                except Exception as exc:  # noqa: BLE001
-                    job.error = str(exc)[:200]
-                    settings.last_error = job.error
-            session.send_render_control("finish", {"job": job.id})
+            if job.stopped:
+                session.send_render_control("cancel", {"job": job.id})
+                _push_message(context, "system", "Render stopped; the rendered frames were kept")
+            else:
+                if not job.error:
+                    try:
+                        _compile_session_video(context, job)
+                    except Exception as exc:  # noqa: BLE001
+                        job.error = str(exc)[:200]
+                        settings.last_error = job.error
+                session.send_render_control("finish", {"job": job.id})
             settings.render_progress = _render_progress_text(manager.status())
+            manager.clear()
             _write_status(context, force=True)
-            manager.cancel()
             runtime["render_job_id"] = ""
         return
     if not runtime.get("render_active") or runtime.get("render_busy"):

@@ -107,3 +107,41 @@ def test_render_payload_rejects_bad_input():
     # A single flipped byte in the image still decodes structurally; the
     # transport CRC is what rejects corruption. Ensure the header path is safe.
     assert render_payload.decode(bytes(payload))["frame"] == 1
+
+
+def test_clear_retires_the_job_and_keeps_the_summary():
+    manager = renderjob.RenderManager()
+    job = manager.create("Test", 1, 2, 1, 0, 0, "PNG", "", "out")
+    manager.start()
+    manager.claim("w", 2)
+    manager.complete(1, "w", "a.png")
+    manager.complete(2, "w", "b.png")
+    assert job.finished
+    manager.clear()
+    assert manager.job() is None
+    assert not manager.active()
+    status = manager.status()
+    assert status["finished"] is True
+    assert status["done"] == 2
+    assert status["percent"] == 100.0
+    # A second clear is harmless and a new job is allowed.
+    manager.clear()
+    assert manager.create("Next", 1, 1, 1, 0, 0, "PNG", "", "out") is not None
+
+
+def test_stop_keeps_frames_and_marks_stopped():
+    manager = renderjob.RenderManager()
+    job = manager.create("Test", 1, 5, 1, 0, 0, "PNG", "", "out")
+    manager.start()
+    manager.claim("w", 2)
+    manager.complete(1, "w", "a.png")
+    assert manager.stop() is True
+    assert job.finished and job.stopped
+    status = manager.status()
+    assert status["stopped"] is True
+    assert status["done"] == 1
+    manager.clear()
+    assert manager.status()["stopped"] is True
+    assert manager.status()["done"] == 1
+    # Stopping a finished job does nothing.
+    assert manager.stop() is False

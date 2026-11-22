@@ -140,7 +140,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.11.6";
+const APP_VERSION = "0.11.7";
 const PROTOCOL_VERSION = 3;
 const CAPABILITIES = 1 | (1 << 10) | (1 << 11) | (1 << 12); // presence, bookmarks, bundles, chunks
 const settings = {
@@ -783,6 +783,7 @@ function renderFarm(status) {
   if (!active) return;
   $("renderHostControls").hidden = !hosting || running;
   $("renderProgressWrap").hidden = !(running || finished);
+  $("renderStopBtn").hidden = !hosting || !running;
   $("renderConsent").hidden = hosting || !request;
   $("renderBadge").textContent = finished
     ? "done"
@@ -1215,6 +1216,15 @@ async function startRender() {
   try {
     await request({ action: "render", start, end, step, format });
     toast("Render requested", "ok");
+  } catch (error) {
+    toast(String(error), "error");
+  }
+}
+
+async function stopRender() {
+  try {
+    await request({ action: "render_stop" });
+    toast("Stopping the render; frames are kept", "ok");
   } catch (error) {
     toast(String(error), "error");
   }
@@ -1892,6 +1902,7 @@ function wire() {
   });
 
   $("renderStartBtn")?.addEventListener("click", startRender);
+  $("renderStopBtn")?.addEventListener("click", stopRender);
   $("renderAccept")?.addEventListener("click", () => replyRender(true));
   $("renderDecline")?.addEventListener("click", () => replyRender(false));
 
