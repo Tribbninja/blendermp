@@ -59,7 +59,7 @@ written = {"done": False}
 def tick():
     elapsed = time.monotonic() - start
     joined = [user.name for user in wm.bmp.users if user.name != wm.bmp.name]
-    if joined and not moved["at"] and elapsed > 6.0:
+    if joined and not moved["at"] and elapsed > 10.0:
         moved["at"] = elapsed
         cube.location.x = 4.0
     data = {
@@ -70,11 +70,11 @@ def tick():
         "location": [round(float(v), 3) for v in cube.location],
         "messages": [message.text for message in wm.bmp.messages][-8:],
     }
-    if elapsed > 18.0 and not written["done"]:
+    if elapsed > 22.0 and not written["done"]:
         written["done"] = True
         with open(result_path, "w", encoding="utf-8") as handle:
             json.dump(data, handle)
-    if elapsed > 28.0:
+    if elapsed > 34.0:
         bpy.ops.wm.quit_blender()
         return None
     return 0.5

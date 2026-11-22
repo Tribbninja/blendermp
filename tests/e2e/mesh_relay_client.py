@@ -58,7 +58,7 @@ def tick():
             "state": wm.bmp.state,
         }
     )
-    if elapsed > 20.0:
+    if elapsed > 26.0:
         checks["messages"] = [message.text for message in wm.bmp.messages][-12:]
         checks["last_error"] = wm.bmp.last_error
         checks["error_code"] = wm.bmp.last_error_code
