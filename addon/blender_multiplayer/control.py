@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - allows importing the module standalone
 APP_DIR = "Blendermp"
 MAX_CONTROL_BYTES = 4096
 MAX_STATUS_BYTES = 64 * 1024
-ALLOWED_ACTIONS = {"host", "join", "leave", "chat", "kick", "role"}
+ALLOWED_ACTIONS = {"host", "join", "leave", "chat", "kick", "role", "render", "render_reply"}
 NAME_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,48}$")
 HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
@@ -270,6 +270,34 @@ def read_session() -> dict[str, Any] | None:
         except RoomCodeError:
             return None
         result["code"] = normalize(code)
+
+    if action == "render":
+        for key, low, high in (("start", 0, 1_000_000), ("end", 0, 1_000_000), ("step", 1, 1000)):
+            value = body.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+                return None
+            result[key] = value
+        if result["end"] < result["start"]:
+            return None
+        fmt = body.get("format")
+        if fmt not in {"MP4", "WEBM", "PNG"}:
+            return None
+        result["format"] = fmt
+        output = body.get("output")
+        if output is not None:
+            if not isinstance(output, str) or len(output) > 512 or any(ord(ch) < 32 for ch in output):
+                return None
+            result["output"] = output
+
+    if action == "render_reply":
+        job = body.get("job")
+        if not isinstance(job, str) or not job or len(job) > 32 or not job.isalnum():
+            return None
+        accept = body.get("accept")
+        if not isinstance(accept, bool):
+            return None
+        result["job"] = job
+        result["accept"] = accept
 
     return result
 

@@ -208,3 +208,39 @@ def test_tls_loopback_and_fingerprint(appdir):
         await server.wait_closed()
 
     asyncio.run(scenario())
+
+
+def test_render_request(appdir):
+    write_session(
+        appdir,
+        {"action": "render", "nonce": "r" * 16, "start": 1, "end": 250, "step": 1, "format": "MP4"},
+    )
+    request = control.read_session()
+    assert request["action"] == "render"
+    assert request["start"] == 1
+    assert request["end"] == 250
+    assert request["format"] == "MP4"
+
+
+def test_render_reply_request(appdir):
+    write_session(
+        appdir,
+        {"action": "render_reply", "nonce": "r" * 16, "job": "abc123", "accept": True},
+    )
+    request = control.read_session()
+    assert request["action"] == "render_reply"
+    assert request["job"] == "abc123"
+    assert request["accept"] is True
+
+
+def test_invalid_render_requests_are_ignored(appdir):
+    cases = [
+        {"action": "render", "nonce": "r" * 16, "start": 5, "end": 1, "step": 1, "format": "MP4"},
+        {"action": "render", "nonce": "r" * 16, "start": 1, "end": 2, "step": 0, "format": "MP4"},
+        {"action": "render", "nonce": "r" * 16, "start": 1, "end": 2, "step": 1, "format": "EXE"},
+        {"action": "render_reply", "nonce": "r" * 16, "job": "../x", "accept": True},
+        {"action": "render_reply", "nonce": "r" * 16, "job": "abc", "accept": "yes"},
+    ]
+    for body in cases:
+        write_session(appdir, body)
+        assert control.read_session() is None, body

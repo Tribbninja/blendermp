@@ -55,6 +55,9 @@ enum Action {
     Chat,
     Kick,
     Role,
+    Render,
+    #[serde(rename = "render_reply")]
+    RenderReply,
 }
 
 #[derive(Deserialize)]
@@ -76,6 +79,13 @@ pub(crate) struct SessionRequest {
     direct_code: Option<String>,
     direct_codes: Option<Vec<String>>,
     role: Option<String>,
+    start: Option<u32>,
+    end: Option<u32>,
+    step: Option<u32>,
+    format: Option<String>,
+    job: Option<String>,
+    accept: Option<bool>,
+    output: Option<String>,
 }
 
 pub(crate) fn data_dir() -> PathBuf {
@@ -1293,9 +1303,24 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
             return Err("relay port must be 1024 or higher".into());
         }
     }
+    if let Some(format) = &request.format {
+        if !matches!(format.as_str(), "MP4" | "WEBM" | "PNG") {
+            return Err("invalid render format".into());
+        }
+    }
+    if let Some(job) = &request.job {
+        if job.len() > 32 || !job.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+            return Err("invalid render job id".into());
+        }
+    }
+    if let Some(step) = request.step {
+        if step == 0 || step > 1000 {
+            return Err("invalid render step".into());
+        }
+    }
 
     let code = match request.action {
-        Action::Leave | Action::Chat | Action::Kick | Action::Role => None,
+        Action::Leave | Action::Chat | Action::Kick | Action::Role | Action::Render | Action::RenderReply => None,
         Action::Join => Some(normalize_code(request.code.as_deref().ok_or("a room code is required to join")?)?),
         Action::Host => match request.code.as_deref() {
             Some(value) => Some(normalize_code(value)?),
@@ -1357,6 +1382,13 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
         "direct_code": request.direct_code,
         "direct_codes": request.direct_codes,
         "role": role,
+        "start": request.start,
+        "end": request.end,
+        "step": request.step,
+        "format": request.format,
+        "job": request.job,
+        "accept": request.accept,
+        "output": request.output,
         "nonce": format!("{:x}-{:x}", std::process::id(), stamp),
     });
 
