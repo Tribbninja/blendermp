@@ -13,6 +13,11 @@ $root = Split-Path -Parent $PSScriptRoot
 $dist = Join-Path $root 'dist'
 $tools = Join-Path $root '.tools'
 
+. (Join-Path $PSScriptRoot '_console.ps1')
+Set-ConsoleTitle 'Blendermp build'
+Set-AlwaysOnTop
+Write-Progress -Id 1 -Activity 'Blendermp build' -Status 'checking versions' -PercentComplete 2
+
 if (-not $Version) {
     $Version = (Get-Content (Join-Path $root 'version.json') -Raw | ConvertFrom-Json).version
 }
@@ -31,11 +36,13 @@ $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 $env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA 'Temp\bmp-target'
 
 Write-Host 'Cleaning dist...' -ForegroundColor Cyan
+Write-Progress -Id 1 -Activity 'Blendermp build' -Status 'cleaning dist' -PercentComplete 5
 if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 
 # --- Blender extension ------------------------------------------------------
 Write-Host 'Packing Blender extension...' -ForegroundColor Cyan
+Write-Progress -Id 1 -Activity 'Blendermp build' -Status 'packing Blender extension' -PercentComplete 10
 $stage = Join-Path $env:TEMP "bmp-extension-$([guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 Copy-Item (Join-Path $root 'addon\blender_multiplayer\*') $stage -Recurse
@@ -46,12 +53,51 @@ Remove-Item $stage -Recurse -Force
 
 # --- Release app ------------------------------------------------------------
 Write-Host 'Building release desktop app (this takes a few minutes)...' -ForegroundColor Cyan
-& cargo build --release --offline --manifest-path (Join-Path $root 'desktop\src-tauri\Cargo.toml')
-if ($LASTEXITCODE -ne 0) {
-    Write-Host 'Offline cargo build failed; retrying online...' -ForegroundColor Yellow
-    & cargo build --release --manifest-path (Join-Path $root 'desktop\src-tauri\Cargo.toml')
+$manifest = Join-Path $root 'desktop\src-tauri\Cargo.toml'
+
+function Invoke-CargoBuild {
+    param([bool]$Offline, [string]$Label)
+    $started = Get-Date
+    $log = Join-Path $env:TEMP 'bmp-cargo-build.log'
+    $codeFile = Join-Path $env:TEMP 'bmp-cargo-build.code'
+    Remove-Item $codeFile -ErrorAction SilentlyContinue
+    $wrapper = Join-Path $PSScriptRoot '_cargo_build.ps1'
+    $buildArgs = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $wrapper + '"'),
+        '-Manifest', ('"' + $manifest + '"'),
+        '-Log', ('"' + $log + '"'),
+        '-Code', ('"' + $codeFile + '"')
+    )
+    if ($Offline) { $buildArgs += '-Offline' }
+    $proc = Start-Process -FilePath 'powershell' -ArgumentList $buildArgs -WindowStyle Hidden -PassThru
+    while (-not $proc.HasExited) {
+        $proc.Refresh()
+        $elapsed = [int]((Get-Date) - $started).TotalSeconds
+        # Cargo has no machine-readable progress here, so ease the bar toward
+        # 78% over roughly two minutes and keep the elapsed time visible.
+        $pct = [math]::Min(78, 20 + [int]($elapsed / 3))
+        Write-Progress -Id 1 -Activity 'Blendermp build' -Status ("{0} - {1}s (release builds take a few minutes)" -f $Label, $elapsed) -PercentComplete $pct
+        Start-Sleep -Seconds 1
+    }
+    $code = 1
+    if (Test-Path $codeFile) {
+        $raw = Get-Content $codeFile -Raw -ErrorAction SilentlyContinue
+        if ($raw -match '^\s*(-?\d+)\s*$') { $code = [int]$matches[1] }
+    }
+    if ($code -ne 0) {
+        Write-Host "cargo build failed; last lines of ${log}:" -ForegroundColor Red
+        Get-Content $log -Tail 30 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" }
+    }
+    return $code
 }
-if ($LASTEXITCODE -ne 0) { throw 'release build failed' }
+
+$exit = Invoke-CargoBuild -Offline $true -Label 'compiling desktop app'
+if ($exit -ne 0) {
+    Write-Host 'Offline cargo build failed; retrying online...' -ForegroundColor Yellow
+    $exit = Invoke-CargoBuild -Offline $false -Label 'compiling desktop app (online)'
+}
+if ($exit -ne 0) { throw 'release build failed' }
+Write-Progress -Id 1 -Activity 'Blendermp build' -Status 'bundling app files' -PercentComplete 82
 
 $appDir = Join-Path $dist 'blendermp'
 New-Item -ItemType Directory -Force -Path $appDir | Out-Null
@@ -90,6 +136,7 @@ if (-not $makensisPath -and (Test-Path 'C:\Program Files (x86)\NSIS\makensis.exe
 $setup = Join-Path $dist "Blendermp-$Version-Setup.exe"
 if ($makensisPath) {
     Write-Host 'Building installer...' -ForegroundColor Cyan
+    Write-Progress -Id 1 -Activity 'Blendermp build' -Status 'building installer' -PercentComplete 92
     Push-Location $root
     try {
         & $makensisPath "/DVERSION=$Version" 'scripts\installer.nsi' | Out-Host
@@ -100,6 +147,7 @@ if ($makensisPath) {
 } else {
     Write-Host 'NSIS not found; skipping installer (winget install NSIS.NSIS)' -ForegroundColor Yellow
 }
+Write-Progress -Id 1 -Activity 'Blendermp build' -Completed
 
 Write-Host ''
 Write-Host "Extension: $extension" -ForegroundColor Green

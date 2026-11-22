@@ -6,18 +6,17 @@
 )
 $ErrorActionPreference = 'Stop'
 
-# Open a persistent console window with the live progress bar.
+# Open a persistent, always-on-top console window with the live progress bar.
 if ($Window) {
-    $script = $PSCommandPath
-    $args = @(
-        '-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-        '-File', ('"' + $script + '"'),
-        '-Blender', ('"' + $Blender + '"'),
-        '-Parallel', "$Parallel"
-    )
-    Start-Process -FilePath 'powershell' -ArgumentList $args -WindowStyle Normal
+    $launcher = Join-Path $PSScriptRoot 'run_tests.cmd'
+    $args = @('/c', ('"' + $launcher + '"'))
+    Start-Process -FilePath 'cmd.exe' -ArgumentList $args -WindowStyle Normal
     return
 }
+
+. (Join-Path $PSScriptRoot '..\..\scripts\_console.ps1')
+Set-ConsoleTitle 'Blendermp E2E'
+Set-AlwaysOnTop
 
 $suites = @(
     'run_material.ps1', 'run_details.ps1', 'run_topology.ps1', 'run_resume.ps1',
