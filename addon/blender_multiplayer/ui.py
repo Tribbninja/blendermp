@@ -31,6 +31,9 @@ class BMP_PT_main(bpy.types.Panel):
             header.label(text="host", icon="HOME")
         header.label(text=settings.role.title() if settings.role else "")
         header.label(text=f"{settings.rtt_ms} ms" if settings.rtt_ms else "")
+        peers = len([u for u in settings.users if u.name != settings.name])
+        if peers:
+            header.label(text=f"{peers} peer{'s' if peers != 1 else ''}", icon="COMMUNITY")
 
         if settings.pending_fingerprint:
             warning = layout.box()
@@ -61,6 +64,9 @@ class BMP_PT_main(bpy.types.Panel):
                 box.label(text=f"Verify: {settings.verify_code}", icon="LOCKED")
             if settings.code:
                 box.operator("bmp.copy_invite", text="Copy invite link", icon="URL")
+            if settings.direct_code:
+                box.label(text=f"Direct: {settings.direct_code}", icon="LINKED")
+                box.operator("bmp.copy_direct_code", text="Copy direct code", icon="COPY_ID")
             if settings.internet_mode:
                 box.label(
                     text="Internet mode: reduced presence/interest updates",

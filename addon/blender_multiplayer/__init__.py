@@ -7723,6 +7723,20 @@ class BMP_OT_copy_code(Operator):
         return {"FINISHED"}
 
 
+class BMP_OT_copy_direct_code(Operator):
+    bl_idname = "bmp.copy_direct_code"
+    bl_label = "Copy Direct Code"
+    bl_description = "Copy the direct LAN code to the clipboard"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        code = context.window_manager.bmp.direct_code
+        if code:
+            context.window_manager.clipboard = code
+            self.report({"INFO"}, f"Copied {code}")
+        return {"FINISHED"}
+
+
 class BMP_OT_send_chat(Operator):
     bl_idname = "bmp.send_chat"
     bl_label = "Send"
@@ -9673,6 +9687,7 @@ classes = (
     BMP_OT_resync_scene,
     BMP_OT_release_locks,
     BMP_OT_copy_code,
+    BMP_OT_copy_direct_code,
     BMP_OT_send_chat,
     BMP_OT_track_mesh,
     BMP_OT_untrack_mesh,
