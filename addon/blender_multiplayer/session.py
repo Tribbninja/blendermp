@@ -72,7 +72,7 @@ else:  # pragma: no cover - allows importing the module standalone (tests)
 RESUME_TTL = 30.0
 MAX_CONTROL = 64 * 1024
 MAX_MESH = 64 * 1024 * 1024
-CHUNK_THRESHOLD = 32 * 1024 * 1024
+CHUNK_THRESHOLD = 900 * 1024  # ~900 KB; stays under Cloudflare's ~1 MiB WebSocket cap\nRELAY_SAFE_FRAME = 900 * 1024
 MAX_VERTICES = 20_000_000
 MAX_CHAT = 2_000
 MAX_NAME = 48
@@ -1174,8 +1174,26 @@ class SessionService:
             self._emit("transfer_progress", {**progress, "direction": "receive", "sender": peer.name})
             if result is None:
                 return
-            if result.get("kind") != transfer.KIND_OBJECT:
+            if result.get("kind") != transfer.KIND_OBJECT and result.get("kind") != transfer.KIND_IMAGE:
                 raise Violation("unsupported chunked transfer kind")
+            if result.get("kind") == transfer.KIND_IMAGE:
+                try:
+                    body = image_payload.decode(result["data"])
+                except image_payload.ImagePayloadError as exc:
+                    raise Violation(str(exc)) from exc
+                body["name"] = clean_name(body.get("name"), "Image")
+                self._emit("transfer_done", {"direction": "receive", "sender": peer.name, "id": progress.get("id")})
+                try:
+                    _identity, chunks = transfer.split(result["data"], transfer.KIND_IMAGE)
+                except transfer.TransferError as exc:
+                    raise Violation(str(exc)) from exc
+                for chunk in chunks:
+                    self._broadcast(
+                        Frame(type=MessageType.CHUNK, channel=Channel.BULK, payload=chunk),
+                        exclude=peer.peer_id,
+                    )
+                self._emit("image_asset", body)
+                return
             try:
                 body = object_payload.decode_create(result["data"])
             except object_payload.ObjectPayloadError as exc:
@@ -2460,6 +2478,14 @@ class SessionService:
             self._emit("transfer_progress", {**progress, "direction": "receive", "sender": "host"})
             if result is None:
                 return
+            if result.get("kind") == transfer.KIND_IMAGE:
+                try:
+                    body = image_payload.decode(result["data"])
+                except image_payload.ImagePayloadError:
+                    return
+                self._emit("transfer_done", {"direction": "receive", "sender": "host", "id": progress.get("id")})
+                self._emit("image_asset", body)
+                return
             if result.get("kind") != transfer.KIND_OBJECT:
                 return
             try:
@@ -3026,6 +3052,29 @@ class SessionService:
             return 0
         if len(payload) > MAX_MESH:
             return 0
+        if len(payload) > CHUNK_THRESHOLD:
+            try:
+                identity, chunks = transfer.split(payload, transfer.KIND_IMAGE)
+            except transfer.TransferError:
+                return 0
+            total = len(chunks)
+            for index, chunk in enumerate(chunks):
+                self._enqueue(Frame(type=MessageType.CHUNK, channel=Channel.BULK, payload=chunk))
+                self._emit(
+                    "transfer_progress",
+                    {
+                        "id": identity.hex(),
+                        "kind": transfer.KIND_IMAGE,
+                        "direction": "send",
+                        "received": index + 1,
+                        "total": total,
+                        "bytes": min(len(payload), (index + 1) * transfer.CHUNK_SIZE),
+                        "total_bytes": len(payload),
+                        "percent": round((index + 1) * 100.0 / max(1, total), 1),
+                    },
+                )
+            self._emit("transfer_done", {"direction": "send", "id": identity.hex()})
+            return len(payload)
         self._enqueue(Frame(type=MessageType.IMAGE_ASSET, channel=Channel.BULK, payload=payload))
         return len(payload)
 

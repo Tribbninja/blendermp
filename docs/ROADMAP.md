@@ -6,7 +6,7 @@ bootstrap, object/transform sync, chunked mesh deltas, live Edit Mode vertex
 streaming, edit leases, presence 2.0, exact remote application, durable settings,
 strict version gate, lease request UX, server-enforced roles, optional LAN direct).
 
-Progress log:
+Progress log:\n- [x] 2026-11-22: 0.9.15: lowered the relay chunk threshold and chunk size to ~900 KB so no single frame exceeds Cloudflare's ~1 MiB WebSocket cap. IMAGE_ASSET frames are now split into chunks under 1 MiB using the existing transfer system (KIND_IMAGE). The Cloudflare bridge (worker_relay) now rejects oversized frames at 900 KB instead of letting them hit Cloudflare.
 - [x] 2026-11-22: 0.9.14: fixed cross-network joins being kicked during scene bootstrap. A UV layer whose data length disagreed with the loop count raised inside `_object_create_payload` and aborted the bootstrap; UV reads are now length-safe and per-object payload errors are contained. The relay host tunnel now sends a keepalive so Cloudflare does not close an idle room between joins. Edit-topology sampling also ensures the BMesh edge table first.
 - [x] 2026-11-22: 0.9.13: the remote selection outline now clears on deselect. Presence only includes actually selected objects; the active-but-unselected object was keeping the outline alive. The LOCK E2E suite now checks the outline segment count drops after the owner deselects.
 - [x] 2026-11-22: 0.9.12: locks are enforced every 50 ms, and a remote presence deselect now clears any stale lease so a mesh cannot stay locked forever after its owner stops selecting it. Selection is blocked at the source with `hide_select`, and the lock release is verified by the LOCK E2E suite.

@@ -16,7 +16,7 @@ from typing import Callable
 from .websocket import WebSocketError, connect
 
 HEADER = struct.Struct("<BII")
-MAX_FRAME = 8 * 1024 * 1024
+MAX_FRAME = 900 * 1024  # Cloudflare caps WebSocket messages at ~1 MiB
 
 
 class WorkerBridge:
