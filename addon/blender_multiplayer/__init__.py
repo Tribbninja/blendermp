@@ -74,7 +74,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 11, 3),
+    "version": (0, 11, 4),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -8782,6 +8782,7 @@ def _start_session_render(context, start, end, step, format_hint, output) -> Non
         format_hint="PNG",
         engine=str(scene.render.engine),
         output_dir=out_dir,
+        fps=int(getattr(scene.render, "fps", 24) or 24),
     )
     if job is None:
         settings.last_error = "Could not create the render job"
@@ -8961,7 +8962,7 @@ def _compile_session_video(context, job) -> str:
         ffmpeg,
         "-y",
         "-framerate",
-        "24",
+        str(max(1, int(getattr(job, "fps", 24) or 24))),
         "-i",
         pattern,
         *codec,

@@ -44,6 +44,7 @@ class RenderJob:
     format: str
     engine: str
     output_dir: str
+    fps: int = 24
     frames: dict[int, RenderFrame] = field(default_factory=dict)
     accepted: set[str] = field(default_factory=set)
     declined: set[str] = field(default_factory=set)
@@ -82,6 +83,7 @@ class RenderManager:
         format_hint: str,
         engine: str,
         output_dir: str,
+        fps: int = 24,
     ) -> RenderJob | None:
         with self._lock:
             if self._job is not None and not self._job.finished:
@@ -99,6 +101,7 @@ class RenderManager:
                 format=str(format_hint or "PNG")[:8].upper(),
                 engine=str(engine or "")[:32],
                 output_dir=str(output_dir),
+                fps=max(1, min(240, int(fps or 24))),
             )
             for frame in range(lo, hi + 1, stride):
                 job.frames[frame] = RenderFrame(frame)
@@ -252,6 +255,7 @@ class RenderManager:
                 "height": job.height,
                 "format": job.format,
                 "engine": job.engine,
+                "fps": job.fps,
                 "output_dir": job.output_dir,
                 "total": total,
                 "done": done,

@@ -89,6 +89,14 @@ def test_render_payload_roundtrip():
     assert body["data"] == data
 
 
+def test_render_payload_lossless_compression():
+    data = b"B" * 200_000
+    raw = render_payload.encode("j", 1, "png", 0, 0, data, compress=False)
+    packed = render_payload.encode("j", 1, "png", 0, 0, data, compress=True)
+    assert len(packed) < len(raw)
+    assert render_payload.decode(packed)["data"] == data
+
+
 def test_render_payload_rejects_bad_input():
     with pytest.raises(render_payload.RenderPayloadError):
         render_payload.encode("j", 1, "png", 0, 0, b"")

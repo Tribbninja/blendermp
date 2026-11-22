@@ -9,7 +9,7 @@ Unicode true
 
 !define APPNAME "Blendermp"
 !ifndef VERSION
-!define VERSION "0.11.3"
+!define VERSION "0.11.4"
 !endif
 !define PUBLISHER "Blendermp"
 !define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Blendermp"

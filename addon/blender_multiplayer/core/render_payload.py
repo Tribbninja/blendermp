@@ -3,14 +3,19 @@
 A rendered frame is one small JSON header plus the encoded image bytes. It is
 sent through the normal chunked transfer path, so the host receives it in order
 and can save it without knowing the transport.
+
+LAN senders pass the image through untouched. Relay senders may zlib the image
+bytes; the header records whether they did, and the decode is always lossless.
 """
 
 from __future__ import annotations
 
 import json
 import struct
+import zlib
 
-HEADER = struct.Struct("<I")
+HEADER = struct.Struct("<IB")  # meta length, flags
+FLAG_ZLIB = 1
 MAX_META = 4096
 MAX_FRAME_BYTES = 256 * 1024 * 1024
 
@@ -26,6 +31,7 @@ def encode(
     width: int,
     height: int,
     data: bytes,
+    compress: bool = False,
 ) -> bytes:
     if not data:
         raise RenderPayloadError("render frame is empty")
@@ -43,15 +49,24 @@ def encode(
     ).encode("utf-8")
     if len(meta) > MAX_META:
         raise RenderPayloadError("render header is too large")
-    return HEADER.pack(len(meta)) + meta + bytes(data)
+    flags = 0
+    wire = bytes(data)
+    if compress:
+        packed = zlib.compress(wire, 6)
+        if len(packed) < len(wire):
+            wire = packed
+            flags |= FLAG_ZLIB
+    return HEADER.pack(len(meta), flags) + meta + wire
 
 
 def decode(payload: bytes) -> dict:
     if not isinstance(payload, (bytes, bytearray)) or len(payload) < HEADER.size:
         raise RenderPayloadError("render frame is truncated")
-    (meta_len,) = HEADER.unpack_from(payload, 0)
+    meta_len, flags = HEADER.unpack_from(payload, 0)
     if meta_len <= 0 or meta_len > MAX_META:
         raise RenderPayloadError("render header length is invalid")
+    if flags & ~FLAG_ZLIB:
+        raise RenderPayloadError("render frame has unknown flags")
     end = HEADER.size + meta_len
     if len(payload) < end:
         raise RenderPayloadError("render frame is truncated")
@@ -62,6 +77,11 @@ def decode(payload: bytes) -> dict:
     if not isinstance(meta, dict):
         raise RenderPayloadError("render header must be an object")
     data = payload[end:]
+    if flags & FLAG_ZLIB:
+        try:
+            data = zlib.decompress(data)
+        except zlib.error as exc:
+            raise RenderPayloadError("render frame could not be decompressed") from exc
     if not data or len(data) > MAX_FRAME_BYTES:
         raise RenderPayloadError("render image is empty or too large")
     frame = meta.get("frame")

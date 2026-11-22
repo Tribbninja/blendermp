@@ -3406,7 +3406,9 @@ class SessionService:
         data: bytes,
     ) -> bool:
         try:
-            payload = render_payload.encode(job, frame, format_hint, width, height, data)
+            payload = render_payload.encode(
+                job, frame, format_hint, width, height, data, compress=self._using_relay
+            )
         except render_payload.RenderPayloadError:
             return False
         chunk_size = CHUNK_THRESHOLD if self._using_relay else MAX_MESH
