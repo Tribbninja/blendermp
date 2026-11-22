@@ -72,7 +72,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 9, 13),
+    "version": (0, 9, 14),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -3428,7 +3428,11 @@ def _checkpoint_scene(context) -> dict:
     for obj in context.scene.objects:
         if obj.get("bmp_ping"):
             continue
-        body = _object_create_payload(obj)
+        try:
+            body = _object_create_payload(obj)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+            continue
         geometry = body.get("geometry") or b""
         objects.append(
             {
@@ -4249,8 +4253,15 @@ def _object_create_payload(obj) -> dict:
     return {"uuid": uid, "kind": kind, "meta": meta, "geometry": geometry}
 
 
-def _send_object_create(session: SessionService, obj) -> None:
-    body = _object_create_payload(obj)
+def _send_object_create(session: SessionService, obj) -> bool:
+    try:
+        body = _object_create_payload(obj)
+    except Exception:  # noqa: BLE001
+        # One malformed object (for example a UV layer that disagrees with the
+        # loop count) must not abort the whole scene bootstrap and kick the
+        # joining peer.
+        traceback.print_exc()
+        return False
     uid = body["uuid"]
     kind = body["kind"]
     try:
@@ -4270,6 +4281,7 @@ def _send_object_create(session: SessionService, obj) -> None:
         runtime["create_errors"].discard(uid)
     if kind == object_payload.KIND_MESH:
         runtime["tracked"].add(obj.name)
+    return bool(sent)
 
 
 def _apply_armature_bones(context, obj, bones) -> None:
@@ -5387,6 +5399,7 @@ def _sync_edit_topology(context, session: SessionService, obj, bm) -> None:
     count = len(bm.edges)
     sample = []
     if count:
+        bm.edges.ensure_lookup_table()
         for index in list(range(min(128, count))) + list(range(max(0, count - 128), count)):
             edge = bm.edges[index]
             sample.append((edge.verts[0].index, edge.verts[1].index))

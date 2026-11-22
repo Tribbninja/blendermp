@@ -66,11 +66,19 @@ class MeshMirror:
         uvs = np.zeros(0, dtype=np.float32)
         uv_layers = []
         for layer in mesh.uv_layers:
-            if not len(mesh.loops):
+            count = len(layer.data)
+            if not count:
                 uv_layers.append((layer.name, np.zeros((0, 2), dtype=np.float32)))
                 continue
-            values = np.empty(len(mesh.loops) * 2, dtype=np.float32)
-            layer.data.foreach_get("uv", values)
+            values = np.empty(count * 2, dtype=np.float32)
+            try:
+                layer.data.foreach_get("uv", values)
+            except (TypeError, ValueError):
+                # A UV layer can briefly disagree with the loop count while the
+                # mesh is being edited or rebuilt. Skip it instead of aborting
+                # the whole scene bootstrap.
+                uv_layers.append((layer.name, np.zeros((0, 2), dtype=np.float32)))
+                continue
             uv_layers.append((layer.name, values.reshape(-1, 2)))
         try:
             active_uv = int(mesh.uv_layers.active_index)

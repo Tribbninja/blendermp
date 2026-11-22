@@ -184,7 +184,15 @@ class WorkerBridge:
                 writer.write(data)
                 await writer.drain()
 
-        await self._race(local_to_hub(), hub_to_local())
+        async def keepalive() -> None:
+            # Cloudflare closes idle WebSockets. A tiny ignored frame keeps the
+            # host's room alive between joins, so a friend does not land during
+            # a reconnect window and get dropped.
+            while True:
+                await asyncio.sleep(20.0)
+                await websocket.send_bytes(HEADER.pack(0, 0, 0))
+
+        await self._race(local_to_hub(), hub_to_local(), keepalive())
 
     async def _pump_join(self, reader, writer, websocket) -> None:
         async def local_to_hub() -> None:
@@ -202,8 +210,8 @@ class WorkerBridge:
 
         await self._race(local_to_hub(), hub_to_local())
 
-    async def _race(self, first, second) -> None:
-        tasks = [asyncio.create_task(first), asyncio.create_task(second)]
+    async def _race(self, *coros) -> None:
+        tasks = [asyncio.create_task(coro) for coro in coros]
         try:
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
