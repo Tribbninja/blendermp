@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - allows importing the module standalone
 APP_DIR = "Blendermp"
 MAX_CONTROL_BYTES = 4096
 MAX_STATUS_BYTES = 64 * 1024
-ALLOWED_ACTIONS = {"host", "join", "leave", "chat", "kick", "role", "render", "render_stop", "render_reply"}
+ALLOWED_ACTIONS = {"host", "join", "leave", "chat", "kick", "role", "render", "render_stop", "render_retry", "render_reply"}
 NAME_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,48}$")
 HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
@@ -279,6 +279,13 @@ def read_session() -> dict[str, Any] | None:
             result[key] = value
         if result["end"] < result["start"]:
             return None
+        for key in ("width", "height"):
+            value = body.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 16384:
+                return None
+            result[key] = value
         fmt = body.get("format")
         if fmt not in {"MP4", "WEBM", "PNG"}:
             return None
@@ -359,11 +366,22 @@ def write_status(data: dict[str, Any]) -> None:
             "claimed": max(0, min(int(render.get("claimed", 0) or 0), 1 << 31)),
             "pending": max(0, min(int(render.get("pending", 0) or 0), 1 << 31)),
             "percent": round(max(0.0, min(100.0, float(render.get("percent", 0) or 0))), 1),
+            "elapsed": max(0.0, min(float(render.get("elapsed", 0) or 0), 1 << 31)),
+            "eta_seconds": max(0.0, min(float(render.get("eta_seconds", 0) or 0), 1 << 31)),
             "workers": [
                 str(worker)[:48]
                 for worker in (render.get("workers") or [])[:64]
                 if isinstance(worker, str)
             ],
+            "worker_detail": {
+                str(name)[:48]: {
+                    "done": max(0, min(int(entry.get("done", 0) or 0), 1 << 31)),
+                    "failed": max(0, min(int(entry.get("failed", 0) or 0), 1 << 31)),
+                    "claimed": max(0, min(int(entry.get("claimed", 0) or 0), 1 << 31)),
+                }
+                for name, entry in list((render.get("worker_detail") or {}).items())[:64]
+                if isinstance(entry, dict)
+            },
             "started": bool(render.get("started")),
             "finished": bool(render.get("finished")),
             "stopped": bool(render.get("stopped")),

@@ -58,6 +58,8 @@ enum Action {
     Render,
     #[serde(rename = "render_stop")]
     RenderStop,
+    #[serde(rename = "render_retry")]
+    RenderRetry,
     #[serde(rename = "render_reply")]
     RenderReply,
 }
@@ -84,6 +86,8 @@ pub(crate) struct SessionRequest {
     start: Option<u32>,
     end: Option<u32>,
     step: Option<u32>,
+    width: Option<u32>,
+    height: Option<u32>,
     format: Option<String>,
     job: Option<String>,
     accept: Option<bool>,
@@ -1322,7 +1326,7 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
     }
 
     let code = match request.action {
-        Action::Leave | Action::Chat | Action::Kick | Action::Role | Action::Render | Action::RenderStop | Action::RenderReply => None,
+        Action::Leave | Action::Chat | Action::Kick | Action::Role | Action::Render | Action::RenderStop | Action::RenderRetry | Action::RenderReply => None,
         Action::Join => Some(normalize_code(request.code.as_deref().ok_or("a room code is required to join")?)?),
         Action::Host => match request.code.as_deref() {
             Some(value) => Some(normalize_code(value)?),
@@ -1387,6 +1391,8 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
         "start": request.start,
         "end": request.end,
         "step": request.step,
+        "width": request.width,
+        "height": request.height,
         "format": request.format,
         "job": request.job,
         "accept": request.accept,

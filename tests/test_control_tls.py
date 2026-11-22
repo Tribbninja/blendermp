@@ -273,3 +273,29 @@ def test_status_keeps_render_stop_state(appdir):
     assert body["render"]["finished"] is True
     assert body["render"]["done"] == 10
     assert body["render"]["request"]["job"] == "abc123"
+
+
+def test_render_retry_request(appdir):
+    write_session(appdir, {"action": "render_retry", "nonce": "r" * 16})
+    request = control.read_session()
+    assert request["action"] == "render_retry"
+
+
+def test_render_request_accepts_resolution(appdir):
+    write_session(
+        appdir,
+        {
+            "action": "render",
+            "nonce": "r" * 16,
+            "start": 1,
+            "end": 5,
+            "step": 1,
+            "width": 1280,
+            "height": 720,
+            "format": "WEBM",
+        },
+    )
+    request = control.read_session()
+    assert request["width"] == 1280
+    assert request["height"] == 720
+    assert request["format"] == "WEBM"

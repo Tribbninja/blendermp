@@ -140,7 +140,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.11.8";
+const APP_VERSION = "0.11.9";
 const PROTOCOL_VERSION = 3;
 const CAPABILITIES = 1 | (1 << 10) | (1 << 11) | (1 << 12); // presence, bookmarks, bundles, chunks
 const settings = {
@@ -784,6 +784,7 @@ function renderFarm(status) {
   $("renderHostControls").hidden = !hosting || running;
   $("renderProgressWrap").hidden = !(running || finished);
   $("renderStopBtn").hidden = !hosting || !running;
+  $("renderRetryBtn").hidden = !hosting || running || !(Number(render.failed || 0) > 0);
   $("renderConsent").hidden = hosting || !request;
   $("renderBadge").textContent = render.stopped
     ? "stopped"
@@ -796,14 +797,33 @@ function renderFarm(status) {
           : "idle";
   $("renderBadge").className = `live ${running || finished ? "on" : request ? "busy" : ""}`;
   if (running || finished) {
-    const percent = finished ? 100 : Math.max(0, Math.min(100, Number(render.percent || 0)));
+    const percent = Math.max(0, Math.min(100, Number(render.percent || 0)));
     $("renderBar").style.width = `${percent}%`;
     const failed = Number(render.failed || 0);
-    $("renderProgressText").textContent = `${render.done || 0}/${render.total || 0} frames (${percent.toFixed(0)}%)${failed ? `, ${failed} failed` : ""}`;
+    const eta = Number(render.eta_seconds || 0);
+    const etaText = running && eta > 0 ? ` · about ${formatEta(eta)} left` : "";
+    $("renderProgressText").textContent = `${render.done || 0}/${render.total || 0} frames (${percent.toFixed(0)}%)${failed ? `, ${failed} failed` : ""}${etaText}`;
+    const detail = render.worker_detail && typeof render.worker_detail === "object" ? render.worker_detail : {};
+    const parts = Object.keys(detail)
+      .sort()
+      .map((name) => `${name}: ${detail[name].done || 0} done, ${detail[name].claimed || 0} rendering`);
+    $("renderWorkers").textContent = parts.join(" · ");
+  } else {
+    $("renderWorkers").textContent = "";
   }
   if (request) {
     $("renderConsentText").textContent = `${request.name || "The host"} wants to render frames ${request.start}-${request.end} (step ${request.step}) at ${request.width}x${request.height}.`;
   }
+}
+
+function formatEta(seconds) {
+  const total = Math.max(0, Math.round(seconds));
+  if (total < 60) return `${total}s`;
+  const minutes = Math.floor(total / 60);
+  const rest = total % 60;
+  if (minutes < 60) return `${minutes}m ${rest}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
 }
 
 function renderMembers(status) {
@@ -1214,9 +1234,11 @@ async function startRender() {
   const start = Math.max(0, Number($("renderStart").value) || 0);
   const end = Math.max(start, Number($("renderEnd").value) || start);
   const step = Math.max(1, Number($("renderStep").value) || 1);
+  const width = Math.max(0, Number($("renderWidth").value) || 0);
+  const height = Math.max(0, Number($("renderHeight").value) || 0);
   const format = $("renderFormat").value || "MP4";
   try {
-    await request({ action: "render", start, end, step, format });
+    await request({ action: "render", start, end, step, width, height, format });
     toast("Render requested", "ok");
   } catch (error) {
     toast(String(error), "error");
@@ -1227,6 +1249,15 @@ async function stopRender() {
   try {
     await request({ action: "render_stop" });
     toast("Stopping the render; frames are kept", "ok");
+  } catch (error) {
+    toast(String(error), "error");
+  }
+}
+
+async function retryRender() {
+  try {
+    await request({ action: "render_retry" });
+    toast("Retrying failed frames", "ok");
   } catch (error) {
     toast(String(error), "error");
   }
@@ -1905,6 +1936,7 @@ function wire() {
 
   $("renderStartBtn")?.addEventListener("click", startRender);
   $("renderStopBtn")?.addEventListener("click", stopRender);
+  $("renderRetryBtn")?.addEventListener("click", retryRender);
   $("renderAccept")?.addEventListener("click", () => replyRender(true));
   $("renderDecline")?.addEventListener("click", () => replyRender(false));
 

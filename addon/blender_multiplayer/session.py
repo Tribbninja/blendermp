@@ -3411,7 +3411,12 @@ class SessionService:
             )
         except render_payload.RenderPayloadError:
             return False
-        chunk_size = CHUNK_THRESHOLD if self._using_relay else MAX_MESH
+        if self._mesh_ready:
+            chunk_size = 8 * 1024 * 1024
+        elif not self._using_relay:
+            chunk_size = MAX_MESH
+        else:
+            chunk_size = CHUNK_THRESHOLD
         try:
             _identity, chunks = transfer.split(
                 payload, transfer.KIND_RENDER, chunk_size=chunk_size

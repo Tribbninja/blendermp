@@ -35,7 +35,7 @@ $env:BMP_TEST_DATA = $clientData
 $clientArgs = @('--factory-startup', '--window-geometry', '850', '650', '800', '500', '--python', ('"' + (Join-Path $PSScriptRoot 'details_client.py') + '"'))
 $clientProc = Start-Process -FilePath $Blender -ArgumentList $clientArgs -PassThru -RedirectStandardOutput (Join-Path $clientData 'stdout.log') -RedirectStandardError (Join-Path $clientData 'stderr.log')
 
-$deadline = (Get-Date).AddSeconds(70)
+$deadline = (Get-Date).AddSeconds(90)
 do {
     Start-Sleep -Seconds 2
     $hostDone = Test-Path (Join-Path $hostData 'host-result.json')

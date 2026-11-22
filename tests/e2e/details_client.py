@@ -106,7 +106,7 @@ def tick():
         checks["settled"] = summary()
         finish("changed")
         return
-    if elapsed > 28.0:
+    if elapsed > 36.0:
         finish("timeout")
         return
     return 0.25

@@ -74,7 +74,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 11, 8),
+    "version": (0, 11, 9),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -3099,9 +3099,13 @@ def _poll_control(context) -> None:
                 request.get("step", 1),
                 request.get("format", "MP4"),
                 request.get("output", ""),
+                request.get("width", 0),
+                request.get("height", 0),
             )
         elif action == "render_stop":
             _stop_session_render(context)
+        elif action == "render_retry":
+            _retry_session_render(context)
         elif action == "render_reply":
             session = runtime.get("session")
             pending = runtime.get("render_request") or {}
@@ -8763,7 +8767,7 @@ def _render_progress_text(status: dict) -> str:
     return text
 
 
-def _start_session_render(context, start, end, step, format_hint, output) -> None:
+def _start_session_render(context, start, end, step, format_hint, output, width=0, height=0) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
     if session is None or not settings.is_host:
@@ -8775,13 +8779,15 @@ def _start_session_render(context, start, end, step, format_hint, output) -> Non
         return
     scene = context.scene
     out_dir = output or str(control.data_dir() / "render")
+    job_width = int(width) if int(width or 0) > 0 else int(scene.render.resolution_x)
+    job_height = int(height) if int(height or 0) > 0 else int(scene.render.resolution_y)
     job = manager.create(
         name=f"Render {int(start)}-{int(end)}",
         start=int(start),
         end=int(end),
         step=int(step or 1),
-        width=int(scene.render.resolution_x),
-        height=int(scene.render.resolution_y),
+        width=job_width,
+        height=job_height,
         format_hint="PNG",
         engine=str(scene.render.engine),
         output_dir=out_dir,
@@ -8826,6 +8832,26 @@ def _stop_session_render(context) -> None:
         _write_status(context, force=True)
     else:
         settings.last_error = "No render is running"
+
+
+def _retry_session_render(context) -> None:
+    settings = context.window_manager.bmp
+    if not settings.is_host:
+        settings.last_error = "Only the host can retry the render"
+        return
+    session: SessionService | None = runtime.get("session")
+    manager = _render_manager()
+    count = manager.retry_failed()
+    if not count:
+        settings.last_error = "No failed frames to retry"
+        return
+    job = manager.job()
+    if job is not None and session is not None:
+        for name in job.accepted:
+            session.send_render_control_to(name, "start", {"job": job.id})
+    _push_message(context, "system", f"Retrying {count} failed frame(s)")
+    settings.render_progress = _render_progress_text(manager.status())
+    _write_status(context, force=True)
 
 
 def _handle_render_control(context, event: dict) -> None:
@@ -9027,9 +9053,21 @@ def _pump_session_render(context) -> None:
                 settings.render_progress = _render_progress_text(manager.status())
                 _write_status(context, force=True)
         if job.finished:
+            if job.notified:
+                return
+            job.notified = True
+            failed = sum(1 for chunk in job.frames.values() if chunk.status == "failed")
             if job.stopped:
                 session.send_render_control("cancel", {"job": job.id})
                 _push_message(context, "system", "Render stopped; the rendered frames were kept")
+                manager.clear()
+            elif failed:
+                session.send_render_control("finish", {"job": job.id})
+                _push_message(
+                    context,
+                    "system",
+                    f"Render finished with {failed} failed frame(s); use Retry to render them",
+                )
             else:
                 if not job.error:
                     try:
@@ -9038,8 +9076,8 @@ def _pump_session_render(context) -> None:
                         job.error = str(exc)[:200]
                         settings.last_error = job.error
                 session.send_render_control("finish", {"job": job.id})
+                manager.clear()
             settings.render_progress = _render_progress_text(manager.status())
-            manager.clear()
             _write_status(context, force=True)
             runtime["render_job_id"] = ""
         return

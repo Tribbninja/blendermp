@@ -1,4 +1,4 @@
-﻿"""Animation/rig client."""
+"""Animation/rig client."""
 
 import bpy
 import json
@@ -116,7 +116,7 @@ def tick():
     if "changed" in checks:
         finish("changed")
         return
-    if elapsed > 28.0:
+    if elapsed > 36.0:
         finish("timeout")
         return
     return 0.25

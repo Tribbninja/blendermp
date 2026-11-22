@@ -145,3 +145,31 @@ def test_stop_keeps_frames_and_marks_stopped():
     assert manager.status()["done"] == 1
     # Stopping a finished job does nothing.
     assert manager.stop() is False
+
+
+def test_status_reports_eta_and_worker_detail():
+    manager = renderjob.RenderManager()
+    manager.create("Test", 1, 10, 1, 0, 0, "PNG", "", "out")
+    manager.start()
+    manager.claim("ada", 3)
+    manager.complete(1, "ada", "a.png")
+    status = manager.status()
+    assert status["percent"] == 10.0
+    assert status["worker_detail"]["ada"]["done"] == 1
+    assert status["worker_detail"]["ada"]["claimed"] == 2
+
+
+def test_retry_after_failure_resets_notified():
+    manager = renderjob.RenderManager()
+    manager.create("Test", 1, 2, 1, 0, 0, "PNG", "", "out")
+    manager.start()
+    manager.claim("w", 2)
+    manager.complete(1, "w", "a.png")
+    manager.fail(2, "w", "boom")
+    status = manager.status()
+    assert status["finished"] is True
+    assert status["failed"] == 1
+    assert status["percent"] == 100.0
+    assert manager.retry_failed() == 1
+    assert manager.job().notified is False
+    assert manager.status()["finished"] is False

@@ -54,6 +54,7 @@ class RenderJob:
     started: bool = False
     finished: bool = False
     stopped: bool = False
+    notified: bool = False
     error: str = ""
 
 
@@ -251,6 +252,7 @@ class RenderManager:
                     count += 1
             if count:
                 job.finished = False
+                job.notified = False
             return count
 
     def status(self) -> dict:
@@ -267,6 +269,17 @@ class RenderManager:
         failed = sum(1 for chunk in job.frames.values() if chunk.status == "failed")
         claimed = sum(1 for chunk in job.frames.values() if chunk.status == "claimed")
         pending = total - done - failed - claimed
+        processed = done + failed
+        elapsed = max(0.0, time.time() - job.started_at) if job.started_at else 0.0
+        rate = processed / elapsed if elapsed > 0 and processed > 0 else 0.0
+        remaining = (total - processed) / rate if rate > 0 else 0.0
+        workers: dict[str, dict] = {}
+        for chunk in job.frames.values():
+            if not chunk.worker:
+                continue
+            entry = workers.setdefault(chunk.worker, {"done": 0, "failed": 0, "claimed": 0})
+            if chunk.status in entry:
+                entry[chunk.status] += 1
         return {
             "active": not job.finished,
             "id": job.id,
@@ -285,8 +298,11 @@ class RenderManager:
             "failed": failed,
             "claimed": claimed,
             "pending": pending,
-            "percent": round(done * 100.0 / max(1, total), 1),
+            "percent": round(processed * 100.0 / max(1, total), 1),
+            "elapsed": round(elapsed, 1),
+            "eta_seconds": round(remaining, 1),
             "workers": sorted(job.accepted),
+            "worker_detail": workers,
             "declined": sorted(job.declined),
             "started": job.started,
             "finished": job.finished,

@@ -148,6 +148,8 @@
               <label>step <input id="renderStep" type="number" value="1" min="1" /></label>
             </div>
             <div class="render-range">
+              <label>Width <input id="renderWidth" type="number" value="0" min="0" max="16384" /></label>
+              <label>Height <input id="renderHeight" type="number" value="0" min="0" max="16384" /></label>
               <label>Format
                 <select id="renderFormat">
                   <option value="MP4">MP4</option>
@@ -157,11 +159,16 @@
               </label>
               <button class="btn primary" id="renderStartBtn">Custom render</button>
             </div>
+            <p class="fine">Width/height 0 uses the scene resolution.</p>
           </div>
           <div id="renderProgressWrap" hidden>
             <div class="progress"><div class="progress-bar" id="renderBar"></div></div>
             <p class="fine" id="renderProgressText"></p>
-            <button class="btn ghost danger" id="renderStopBtn">Stop render</button>
+            <p class="fine" id="renderWorkers"></p>
+            <div class="actions">
+              <button class="btn ghost danger" id="renderStopBtn">Stop render</button>
+              <button class="btn ghost" id="renderRetryBtn" hidden>Retry failed</button>
+            </div>
           </div>
           <div id="renderConsent" hidden>
             <p id="renderConsentText"></p>
@@ -339,7 +346,7 @@
         <span id="statusLeft">Ready</span>
         <span class="grow"></span>
         <span id="statusMid"></span>
-        <span id="statusRight">v0.11.8</span>
+        <span id="statusRight">v0.11.9</span>
       </div>
     </main>
     </section>

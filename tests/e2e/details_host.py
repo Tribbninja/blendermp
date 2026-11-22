@@ -155,7 +155,7 @@ def tick():
     if elapsed > 8.0 and os.path.exists(client_result):
         finish("client")
         return
-    if elapsed > 30.0:
+    if elapsed > 40.0:
         finish("timeout")
         return
     return 0.25

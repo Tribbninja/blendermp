@@ -36,3 +36,6 @@ desktop.ini
 # Cloudflare dev state
 cloudflare/.wrangler/
 cloudflare/node_modules/
+
+# Separate reference project, not part of this repo
+blender-multiplayer-main/

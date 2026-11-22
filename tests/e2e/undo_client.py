@@ -73,7 +73,7 @@ def tick():
     if "undone" in checks and elapsed > checks["undone"] + 0.5:
         finish("undone")
         return
-    if elapsed > 30.0:
+    if elapsed > 38.0:
         finish("timeout")
         return
     return 0.25

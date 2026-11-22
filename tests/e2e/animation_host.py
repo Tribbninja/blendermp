@@ -1,4 +1,4 @@
-﻿"""Animation/rig host: armature, weights, shape keys, action and pose."""
+"""Animation/rig host: armature, weights, shape keys, action and pose."""
 
 import bpy
 import json
@@ -147,7 +147,7 @@ def tick():
     if "changed" in phase and os.path.exists(client_result):
         finish("client")
         return
-    if elapsed > 30.0:
+    if elapsed > 40.0:
         finish("timeout")
         return
     return 0.25
