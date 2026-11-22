@@ -699,9 +699,11 @@ class SessionService:
         self._request_stop()
 
     def _enqueue(self, frame: Frame) -> None:
+        # Always queue: frames created just before the loop starts must not be
+        # lost. Only signal the loop when it is actually running.
+        self._outbox.put(frame)
         loop = self._loop
         if loop and loop.is_running():
-            self._outbox.put(frame)
             loop.call_soon_threadsafe(self._wake.set)
 
     def _tap(self, kind: str, body: dict) -> None:
@@ -3199,34 +3201,14 @@ class SessionService:
             return False
         if len(payload) > transfer.MAX_TRANSFER:
             return False
-        if len(payload) > CHUNK_THRESHOLD:
-            try:
-                identity, chunks = transfer.split(payload, transfer.KIND_OBJECT)
-            except transfer.TransferError:
-                return False
-            total = len(chunks)
-            for index, chunk in enumerate(chunks):
-                self._enqueue(Frame(type=MessageType.CHUNK, channel=Channel.BULK, payload=chunk))
-                self._emit(
-                    "transfer_progress",
-                    {
-                        "id": identity.hex(),
-                        "kind": transfer.KIND_OBJECT,
-                        "direction": "send",
-                        "received": index + 1,
-                        "total": total,
-                        "bytes": min(len(payload), (index + 1) * transfer.CHUNK_SIZE),
-                        "total_bytes": len(payload),
-                        "percent": round((index + 1) * 100.0 / max(1, total), 1),
-                    },
-                )
-            self._emit("transfer_done", {"direction": "send", "id": identity.hex()})
-            self._tap(
-                "object_create",
-                {"uuid": uid, "kind": kind, "meta": meta, "geometry": geometry},
-            )
-            return True
-        self._enqueue(Frame(type=MessageType.OBJECT_CREATE, channel=Channel.MESH, payload=payload))
+        self._send_bulk(
+            MessageType.OBJECT_CREATE,
+            Channel.MESH,
+            payload,
+            None,
+            transfer.KIND_OBJECT,
+            critical=True,
+        )
         self._tap(
             "object_create",
             {"uuid": uid, "kind": kind, "meta": meta, "geometry": geometry},
@@ -3275,38 +3257,99 @@ class SessionService:
         self._enqueue(protocol.json_frame(MessageType.MODIFIER_STACK, message))
         self._tap("modifier_stack", message)
 
+    def _peer_chunk_threshold(self, peer) -> int:
+        """LAN peers get one large frame; relay peers stay under the hub cap."""
+        return MAX_MESH if peer.lan else CHUNK_THRESHOLD
+
+    def _enqueue_bulk_to(self, peer, message_type: int, channel: int, payload: bytes, kind: int, critical: bool = True) -> bool:
+        threshold = self._peer_chunk_threshold(peer)
+        if len(payload) > threshold:
+            try:
+                _identity, chunks = transfer.split(payload, kind)
+            except transfer.TransferError:
+                return False
+            for chunk in chunks:
+                try:
+                    peer.enqueue(
+                        protocol.encode(
+                            Frame(type=MessageType.CHUNK, channel=Channel.BULK, payload=chunk)
+                        ),
+                        critical=critical,
+                    )
+                except Violation:
+                    return False
+            return True
+        try:
+            peer.enqueue(
+                protocol.encode(Frame(type=message_type, channel=channel, payload=payload)),
+                critical=critical,
+            )
+            return True
+        except Violation:
+            return False
+
+    def _send_bulk(self, message_type: int, channel: int, raw: bytes, compressed: bytes | None, kind: int, critical: bool = True) -> None:
+        """Send a bulk payload, encoding per transport.
+
+        LAN peers receive the raw payload (one large frame). Relay peers receive
+        the compressed payload, chunked under the Cloudflare cap.
+        """
+        if self.is_host:
+            for peer in list(self._peers.values()):
+                if not peer.authenticated:
+                    continue
+                payload = raw if peer.lan else (compressed or raw)
+                self._enqueue_bulk_to(peer, message_type, channel, payload, kind, critical)
+            return
+        payload = raw if not self._using_relay else (compressed or raw)
+        threshold = MAX_MESH if not self._using_relay else CHUNK_THRESHOLD
+        if len(payload) > threshold:
+            try:
+                identity, chunks = transfer.split(payload, kind)
+            except transfer.TransferError:
+                return
+            total = len(chunks)
+            for chunk in chunks:
+                self._enqueue(Frame(type=MessageType.CHUNK, channel=Channel.BULK, payload=chunk))
+            self._emit(
+                "transfer_progress",
+                {
+                    "id": identity.hex(),
+                    "kind": kind,
+                    "direction": "send",
+                    "received": total,
+                    "total": total,
+                    "bytes": len(payload),
+                    "total_bytes": len(payload),
+                    "percent": 100.0,
+                },
+            )
+            self._emit("transfer_done", {"direction": "send", "id": identity.hex()})
+            return
+        self._enqueue(Frame(type=message_type, channel=channel, payload=payload))
+
     def send_image(self, name: str, format_hint: str, data: bytes) -> int:
         try:
-            payload = image_payload.encode(name, format_hint, data)
+            raw = image_payload.encode(name, format_hint, data, compress=False)
         except image_payload.ImagePayloadError:
             return 0
-        if len(payload) > MAX_MESH:
+        if len(raw) > MAX_MESH:
             return 0
-        if len(payload) > CHUNK_THRESHOLD:
+        compressed = None
+        if len(data) > image_payload.COMPRESS_THRESHOLD:
             try:
-                identity, chunks = transfer.split(payload, transfer.KIND_IMAGE)
-            except transfer.TransferError:
-                return 0
-            total = len(chunks)
-            for index, chunk in enumerate(chunks):
-                self._enqueue(Frame(type=MessageType.CHUNK, channel=Channel.BULK, payload=chunk))
-                self._emit(
-                    "transfer_progress",
-                    {
-                        "id": identity.hex(),
-                        "kind": transfer.KIND_IMAGE,
-                        "direction": "send",
-                        "received": index + 1,
-                        "total": total,
-                        "bytes": min(len(payload), (index + 1) * transfer.CHUNK_SIZE),
-                        "total_bytes": len(payload),
-                        "percent": round((index + 1) * 100.0 / max(1, total), 1),
-                    },
-                )
-            self._emit("transfer_done", {"direction": "send", "id": identity.hex()})
-            return len(payload)
-        self._enqueue(Frame(type=MessageType.IMAGE_ASSET, channel=Channel.BULK, payload=payload))
-        return len(payload)
+                compressed = image_payload.encode(name, format_hint, data, compress=True)
+            except image_payload.ImagePayloadError:
+                compressed = None
+        self._send_bulk(
+            MessageType.IMAGE_ASSET,
+            Channel.BULK,
+            raw,
+            compressed,
+            transfer.KIND_IMAGE,
+            critical=True,
+        )
+        return len(raw)
 
     def request_lease(self, key: str, action: str = "acquire") -> None:
         self._enqueue(protocol.json_frame(MessageType.LEASE, {"key": key, "action": action}))
