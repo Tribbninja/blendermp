@@ -72,7 +72,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 9, 10),
+    "version": (0, 9, 11),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -422,7 +422,6 @@ class BMPState(PropertyGroup):
     host_name: StringProperty()
     sync_transforms: BoolProperty(name="Sync object transforms", default=True)
     sync_animation_values: BoolProperty(name="Sync live pose/shape values", default=False)
-    edit_locks: BoolProperty(name="Edit locks", default=True)
     users: CollectionProperty(type=BMPUser)
     messages: CollectionProperty(type=BMPMessage)
     show_users: BoolProperty(default=True)
@@ -4553,28 +4552,13 @@ def _sync_selection(context) -> None:
     owned = runtime["owned_leases"]
     activity = runtime.setdefault("lease_activity", {})
 
-    if not settings.edit_locks:
-        # The user turned edit locks off: release anything we hold and make
-        # every object selectable again.
-        for uid in list(owned):
-            _lease_request(session, uid, "release")
-            owned.discard(uid)
-            owners.pop(uid, None)
-            activity.pop(uid, None)
-        hidden = runtime["hidden_objects"]
-        for uid in list(hidden):
-            obj = obj_sync.find(uid)
-            if obj is not None:
-                try:
-                    obj.hide_select = False
-                except Exception:  # noqa: BLE001
-                    pass
-            hidden.discard(uid)
-        runtime["selection"] = selected
-        return
+    # --- Multi-User DynamicRightSelectTimer port -------------------------
+    # Selection is the lock: newly selected objects are locked to us, objects
+    # that leave the selection are released. There is no idle expiry.
+    to_lock = selected - previous
 
-    # Any lease we own that is no longer selected must be released. This also
-    # covers a lease that was granted after the object was already deselected.
+    # Release deselected objects. The short grace also covers a lease that was
+    # granted after the object was already deselected.
     for uid in owned - selected:
         runtime["deselected"].setdefault(uid, now)
     for uid in selected:
@@ -4589,8 +4573,9 @@ def _sync_selection(context) -> None:
             activity.pop(uid, None)
         runtime["deselected"].pop(uid, None)
 
+    # Lock newly selected objects.
     suppress = now < runtime.get("lease_suppress_until", 0.0)
-    for uid in selected - previous:
+    for uid in to_lock:
         if suppress:
             continue
         owner = owners.get(uid)
@@ -4601,56 +4586,49 @@ def _sync_selection(context) -> None:
                 owned.add(uid)
             activity[uid] = now
 
-    for uid in selected:
-        owner = owners.get(uid)
-        if owner in (None, settings.name):
-            runtime["lock_notified"].discard(uid)
-            continue
-        obj = obj_sync.find(uid)
-        if obj is None:
-            continue
-        try:
-            obj.select_set(False)
-        except Exception:  # noqa: BLE001
-            pass
-        if uid not in runtime["lock_notified"]:
-            runtime["lock_notified"].add(uid)
-            # Keep the panel informative without spamming the chat log.
-            settings.lease_info = f"{obj.name} is locked by {owner}"
+    # If nothing is selected, release everything we own (Multi-User does this).
+    if not selected:
+        for uid in list(owned):
+            _lease_request(session, uid, "release")
+            owned.discard(uid)
+            owners.pop(uid, None)
+            activity.pop(uid, None)
 
-    # Keep the lease for as long as the object stays selected. Multi-User locks
-    # on selection and releases on deselection; releasing an idle-but-selected
-    # object made the lock silently disappear while both sides could still move
-    # it. Disconnects are covered by the lease TTL and peer-leave cleanup.
+    # Renew held leases so they never expire while selected.
     if now - runtime["lease_renew"] > LEASE_RENEW:
         runtime["lease_renew"] = now
         for uid in list(owned):
             if uid in selected:
                 _lease_request(session, uid, "acquire")
 
-    blocked = {uid for uid, owner in owners.items() if owner and owner != settings.name}
-    hidden = runtime["hidden_objects"]
-    for uid in list(hidden - blocked):
-        obj = obj_sync.find(uid)
-        if obj is not None:
-            try:
-                obj.hide_select = False
-            except Exception:  # noqa: BLE001
-                pass
-        hidden.discard(uid)
+    # Multi-User's is_node_readonly pass: every object owned by someone else is
+    # made non-selectable. This is the part that actually enforces the lock.
     active = context.active_object
-    for uid in blocked:
-        obj = obj_sync.find(uid)
-        if obj is None:
+    hidden = runtime["hidden_objects"]
+    for obj in context.scene.objects:
+        uid = obj.get("bmp_uuid")
+        if not uid:
             continue
+        owner = owners.get(uid)
+        selectable = owner in (None, settings.name)
+        try:
+            if obj.hide_select == selectable:
+                obj.hide_select = not selectable
+        except Exception:  # noqa: BLE001
+            pass
+        if selectable:
+            hidden.discard(uid)
+            runtime["lock_notified"].discard(uid)
+            continue
+        hidden.add(uid)
         try:
             if obj.select_get():
                 obj.select_set(False)
-            if not obj.hide_select:
-                obj.hide_select = True
-            hidden.add(uid)
         except Exception:  # noqa: BLE001
             pass
+        if uid not in runtime["lock_notified"]:
+            runtime["lock_notified"].add(uid)
+            settings.lease_info = f"{obj.name} is locked by {owner}"
         if obj is active and context.mode != "OBJECT":
             # A locked object must not stay in Edit/Sculpt mode; otherwise the
             # user can keep changing it locally even though it will not sync.

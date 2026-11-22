@@ -78,7 +78,6 @@ class BMP_PT_main(bpy.types.Panel):
                     icon="SORTTIME",
                 )
             row = box.row(align=True)
-            row.prop(settings, "edit_locks")
             row.operator("bmp.release_locks", text="Release locks", icon="UNLOCKED")
             if settings.lease_info:
                 box.label(text=settings.lease_info[:80], icon="LOCKED")
