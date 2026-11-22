@@ -665,6 +665,59 @@ fn blender_running(state: State<AppState>) -> Result<bool, String> {
 }
 
 #[tauri::command]
+fn close_blender(state: State<AppState>) -> Result<bool, String> {
+    // A reused Blender keeps the addon that was loaded at process start. When
+    // the bundled addon version changes we must close it so the next launch
+    // picks up the new code.
+    let info = {
+        let mut guard = state
+            .embedded
+            .lock()
+            .map_err(|_| "state lock poisoned".to_string())?;
+        guard.take()
+    };
+    #[cfg(windows)]
+    if let Some(info) = info {
+        win_embed::detach(&info);
+    }
+    #[cfg(not(windows))]
+    let _ = info;
+    let pid = {
+        let mut guard = state
+            .blender_pid
+            .lock()
+            .map_err(|_| "state lock poisoned".to_string())?;
+        guard.take()
+    };
+    let Some(pid) = pid else { return Ok(false) };
+    #[cfg(windows)]
+    {
+        if win_embed::is_blender_process(pid) {
+            if !win_embed::request_close(pid) {
+                win_embed::terminate_process(pid);
+            } else {
+                for _ in 0..10 {
+                    if !win_embed::process_alive(pid) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                if win_embed::process_alive(pid) {
+                    win_embed::terminate_process(pid);
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+    }
+    Ok(true)
+}
+
+#[tauri::command]
 fn embed_blender(
     state: State<AppState>,
     x_px: f64,
@@ -1390,6 +1443,7 @@ pub fn run() {
             launch_blender,
             find_blender_window,
             blender_running,
+            close_blender,
             embed_blender,
             set_embed_bounds,
             dock_looks_black,

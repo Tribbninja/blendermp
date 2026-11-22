@@ -140,7 +140,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.9.8";
+const APP_VERSION = "0.9.9";
 const PROTOCOL_VERSION = 3;
 const CAPABILITIES = 1 | (1 << 10) | (1 << 11) | (1 << 12); // presence, bookmarks, bundles, chunks
 const settings = {
@@ -1109,22 +1109,38 @@ async function launchBlender() {
   if (state.blenderBusy) return;
   state.blenderBusy = true;
   try {
+    const runningAddon = String(state.status?.addon || "");
+    const addonChanged = Boolean(runningAddon && runningAddon !== APP_VERSION);
     if (state.embedded) {
-      log("Blender is already embedded; reusing it");
-      await invoke("focus_blender").catch(() => {});
-      return;
+      if (addonChanged) {
+        log(`addon changed ${runningAddon} -> ${APP_VERSION}; restarting Blender`);
+        await invoke("close_blender").catch(() => {});
+        state.embedded = false;
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+      } else {
+        log("Blender is already embedded; reusing it");
+        await invoke("focus_blender").catch(() => {});
+        return;
+      }
     }
     // A running Blender is reused even if its window is currently hidden or
     // being recreated. Launching another copy created duplicate players and
     // multiple docked windows when the first window was slow to appear.
     const running = await invoke("blender_running").catch(() => false);
     if (running) {
-      log("Blender is already running; reusing it");
-      state.dockEnabled = true;
-      const found = await invoke("find_blender_window").catch(() => null);
-      if (found) await embedNow();
-      else toast("Blender is running; waiting for its window", "ok");
-      return;
+      if (addonChanged) {
+        log(`addon changed ${runningAddon} -> ${APP_VERSION}; restarting Blender`);
+        await invoke("close_blender").catch(() => {});
+        state.embedded = false;
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+      } else {
+        log("Blender is already running; reusing it");
+        state.dockEnabled = true;
+        const found = await invoke("find_blender_window").catch(() => null);
+        if (found) await embedNow();
+        else toast("Blender is running; waiting for its window", "ok");
+        return;
+      }
     }
     const existing = await invoke("find_blender_window").catch(() => null);
     if (existing) {
