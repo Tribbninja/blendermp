@@ -7473,6 +7473,21 @@ def _update_timing(session: SessionService | None) -> None:
     runtime["view_smooth"] = 0.045 if fast else 0.075
 
 
+def _safe_tick_step(name: str, func) -> None:
+    """Run one tick step; never let a single failure kill the whole tick."""
+    try:
+        func()
+    except Exception:  # noqa: BLE001
+        try:
+            runtime["tick_errors"] = (runtime.get("tick_errors", []) + [name])[-20:]
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            traceback.print_exc()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def bmp_tick():
     context = bpy.context
     if context is None or context.window_manager is None:
@@ -7491,13 +7506,13 @@ def bmp_tick():
             runtime["tick_fps"] = runtime["tick_count"] / max(0.001, fps_now - fps_at)
             runtime["tick_count"] = 0
             runtime["tick_fps_at"] = fps_now
-        _poll_control(context)
-        _ensure_bookmarks(context)
-        _heartbeat_tick(context)
+        _safe_tick_step("poll_control", lambda: _poll_control(context))
+        _safe_tick_step("bookmarks", lambda: _ensure_bookmarks(context))
+        _safe_tick_step("heartbeat", lambda: _heartbeat_tick(context))
         session: SessionService | None = runtime.get("session")
-        _update_timing(session)
+        _safe_tick_step("timing", lambda: _update_timing(session))
         inbox = runtime["inbox"]
-        _expire_pings(context)
+        _safe_tick_step("expire_pings", lambda: _expire_pings(context))
         if runtime.get("transfer_clear_at") and time.monotonic() > runtime["transfer_clear_at"]:
             runtime["transfer_clear_at"] = 0.0
             settings = context.window_manager.bmp
@@ -7522,7 +7537,10 @@ def bmp_tick():
                     publisher.publish(kind, body)
                 except Exception:  # noqa: BLE001
                     pass
-            _handle_event(context, kind, body)
+            try:
+                _handle_event(context, kind, body)
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
             times = runtime.setdefault("apply_times", [])
             elapsed = (time.monotonic() - started) * 1000.0
             times.append(elapsed)
@@ -7530,30 +7548,29 @@ def bmp_tick():
             if len(times) > 240:
                 del times[: len(times) - 240]
         if session is not None:
-            _drain_ai_queue(context)
-            _sync_selection(context)
-            _sync_transforms(context)
-            _sync_mesh(context)
-            _sync_edit_selection(context)
-            _sync_materials(context)
-            _sync_modifiers(context)
-            _sync_pose(context)
-            _sync_shape_keys(context)
-            _sync_actions(context)
-            _process_image_queue(context)
-            _refresh_scene_hash(context)
-            _send_presence(context)
-            _send_subscription(context)
-            _send_client_stats(context)
-        _journal_capture(context)
-        _maybe_auto_checkpoint(context)
-        _pump_scene_bootstrap(context)
-        _sync_remote_visuals(context)
-        _ensure_hover_operator(context)
-        with runtime["perf"].measure("bridge_pump"):
-            _pump_bridge(context)
-        _pump_renderfarm(context)
-        _apply_follow(context)
+            _safe_tick_step("drain_ai", lambda: _drain_ai_queue(context))
+            _safe_tick_step("sync_selection", lambda: _sync_selection(context))
+            _safe_tick_step("sync_transforms", lambda: _sync_transforms(context))
+            _safe_tick_step("sync_mesh", lambda: _sync_mesh(context))
+            _safe_tick_step("sync_edit_selection", lambda: _sync_edit_selection(context))
+            _safe_tick_step("sync_materials", lambda: _sync_materials(context))
+            _safe_tick_step("sync_modifiers", lambda: _sync_modifiers(context))
+            _safe_tick_step("sync_pose", lambda: _sync_pose(context))
+            _safe_tick_step("sync_shape_keys", lambda: _sync_shape_keys(context))
+            _safe_tick_step("sync_actions", lambda: _sync_actions(context))
+            _safe_tick_step("process_images", lambda: _process_image_queue(context))
+            _safe_tick_step("refresh_scene_hash", lambda: _refresh_scene_hash(context))
+            _safe_tick_step("send_presence", lambda: _send_presence(context))
+            _safe_tick_step("send_subscription", lambda: _send_subscription(context))
+            _safe_tick_step("send_client_stats", lambda: _send_client_stats(context))
+        _safe_tick_step("journal_capture", lambda: _journal_capture(context))
+        _safe_tick_step("auto_checkpoint", lambda: _maybe_auto_checkpoint(context))
+        _safe_tick_step("scene_bootstrap", lambda: _pump_scene_bootstrap(context))
+        _safe_tick_step("remote_visuals", lambda: _sync_remote_visuals(context))
+        _safe_tick_step("hover_operator", lambda: _ensure_hover_operator(context))
+        _safe_tick_step("bridge", lambda: _pump_bridge(context))
+        _safe_tick_step("renderfarm", lambda: _pump_renderfarm(context))
+        _safe_tick_step("follow", lambda: _apply_follow(context))
         if (
             runtime.get("bootstrapping")
             and runtime.get("bootstrap_deadline")
@@ -7573,7 +7590,7 @@ def bmp_tick():
                 - runtime.pop("farm_render_ms", 0.0),
             ),
         )
-        _write_status(context)
+        _safe_tick_step("write_status", lambda: _write_status(context))
         if session is not None and not session.is_alive():
             settings = context.window_manager.bmp
             settings.last_error = session.failure_reason or "session stopped"
