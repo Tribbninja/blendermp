@@ -3,7 +3,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $failed = @()
-foreach ($name in @('run_material.ps1', 'run_details.ps1', 'run_topology.ps1', 'run_resume.ps1', 'run_checkpoint.ps1', 'run_undo.ps1', 'run_lease.ps1', 'run_lock.ps1', 'run_animation.ps1', 'run_sculpt.ps1', 'run_collab.ps1', 'run_chunk.ps1', 'run_foundation.ps1', 'run_mesh_relay.ps1')) {
+foreach ($name in @('run_material.ps1', 'run_details.ps1', 'run_topology.ps1', 'run_resume.ps1', 'run_checkpoint.ps1', 'run_undo.ps1', 'run_lease.ps1', 'run_lock.ps1', 'run_animation.ps1', 'run_sculpt.ps1', 'run_collab.ps1', 'run_chunk.ps1', 'run_reference.ps1', 'run_foundation.ps1', 'run_mesh_relay.ps1')) {
     Get-Process blender -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 700
     Write-Host "== $name" -ForegroundColor Cyan

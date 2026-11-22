@@ -72,7 +72,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 11, 1),
+    "version": (0, 11, 2),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -276,6 +276,7 @@ runtime: dict = {
     "shared_images": set(),
     "received_images": {},
     "last_image": 0.0,
+    "last_image_scan": 0.0,
     "last_presence": 0.0,
     "presence_shadow": {},
     "presence_full_at": 0.0,
@@ -2846,6 +2847,33 @@ def _process_image_queue(context) -> None:
                 wire=wire,
                 saved=saved,
             )
+
+
+def _scan_images(context) -> None:
+    """Queue every usable image, not just material textures.
+
+    This catches reference boards, compositor inputs and world textures that no
+    material points at, plus images loaded after the session started.
+    """
+    session = runtime.get("session")
+    if session is None:
+        return
+    now = time.monotonic()
+    if now - runtime.get("last_image_scan", 0.0) < 2.0:
+        return
+    runtime["last_image_scan"] = now
+    for image in list(bpy.data.images):
+        if image is None or image.name in runtime["image_queued"]:
+            continue
+        if getattr(image, "type", "IMAGE") in {"RENDER_RESULT", "COMPOSITING"}:
+            continue
+        if getattr(image, "source", "FILE") == "VIEWER":
+            continue
+        packed = getattr(image, "packed_file", None) is not None
+        filepath = getattr(image, "filepath", "")
+        if not packed and not filepath and tuple(getattr(image, "size", (0, 0))) == (0, 0):
+            continue
+        _queue_image(image)
 
 
 def _apply_image_settings(image, colorspace, alpha_mode) -> None:
@@ -7629,6 +7657,7 @@ def bmp_tick():
             _safe_tick_step("sync_pose", lambda: _sync_pose(context))
             _safe_tick_step("sync_shape_keys", lambda: _sync_shape_keys(context))
             _safe_tick_step("sync_actions", lambda: _sync_actions(context))
+            _safe_tick_step("scan_images", lambda: _scan_images(context))
             _safe_tick_step("process_images", lambda: _process_image_queue(context))
             _safe_tick_step("refresh_scene_hash", lambda: _refresh_scene_hash(context))
             _safe_tick_step("send_presence", lambda: _send_presence(context))
