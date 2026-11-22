@@ -116,7 +116,8 @@ fn python_vendor_paths() -> Vec<PathBuf> {
 
 fn ensure_python_vendor() {
     let target = data_dir().join("python");
-    if target.join("cryptography").is_dir() && target.join("cffi").is_dir() {
+    let required = ["cryptography", "cffi", "imageio_ffmpeg"];
+    if required.iter().all(|name| target.join(name).is_dir()) {
         return;
     }
     if let Ok(exe) = std::env::current_exe() {
