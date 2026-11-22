@@ -428,6 +428,7 @@ class BMPState(PropertyGroup):
     show_chat: BoolProperty(default=True)
     lease_info: StringProperty()
     lease_requester: StringProperty()
+    mesh_info: StringProperty()
     role: StringProperty(default="editor")
     internet_mode: BoolProperty(name="Internet mode", default=False)
     lan_fast: BoolProperty(name="LAN fast path", default=False)
@@ -7195,6 +7196,12 @@ def _write_status(context, force: bool = False) -> None:
     settings = context.window_manager.bmp
     settings.tick_errors = "; ".join(runtime.get("tick_errors", [])[-3:])
     stats = session.stats() if session else {}
+    mesh_status = session.mesh_status() if session is not None else {"active": False, "peers": []}
+    if mesh_status.get("active"):
+        count = len(mesh_status.get("peers") or [])
+        settings.mesh_info = f"P2P mesh: {count} direct peer(s)"
+    else:
+        settings.mesh_info = ""
     # The session object is the source of truth. Settings are updated from
     # queued events and can lag (or be overwritten by a late event), which used
     # to publish "offline" while the socket was healthy.

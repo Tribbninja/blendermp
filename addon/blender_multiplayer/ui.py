@@ -67,6 +67,8 @@ class BMP_PT_main(bpy.types.Panel):
             if settings.direct_code:
                 box.label(text=f"Direct: {settings.direct_code}", icon="LINKED")
                 box.operator("bmp.copy_direct_code", text="Copy direct code", icon="COPY_ID")
+            if settings.mesh_info:
+                box.label(text=settings.mesh_info[:80], icon="NETWORK")
             if settings.internet_mode:
                 box.label(
                     text="Internet mode: reduced presence/interest updates",

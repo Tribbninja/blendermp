@@ -66,3 +66,24 @@ def test_parse_rejects_missing_address():
     response = struct.pack("!HHI12s", stun.BINDING_RESPONSE, 0, stun.MAGIC_COOKIE, tid)
     with pytest.raises(stun.StunError):
         stun.parse_response(response, tid)
+
+
+def test_socket_udp_is_bound():
+    sock = stun.socket_udp()
+    try:
+        host, port = sock.getsockname()
+        assert port > 0
+    finally:
+        sock.close()
+
+
+def test_socket_udp_accepts_a_requested_port():
+    sock = stun.socket_udp(0)
+    try:
+        assert sock.getsockname()[1] > 0
+    finally:
+        sock.close()
+
+
+def test_socket_gethostbyname_resolves_localhost():
+    assert stun.socket_gethostbyname("localhost") in {"127.0.0.1", "::1"}

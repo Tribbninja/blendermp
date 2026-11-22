@@ -117,12 +117,14 @@ async def query(
     """
     host, port = server
     loop = asyncio.get_running_loop()
-    sock = socket_udp()
-    if local_port:
-        sock.bind(("0.0.0.0", local_port))
+    try:
+        address = socket_gethostbyname(host)
+    except OSError as exc:
+        raise StunError(f"cannot resolve STUN server: {exc}") from exc
+    sock = socket_udp(local_port)
     try:
         packet, tid = build_request()
-        await loop.sock_sendto(sock, packet, (host, port))
+        await loop.sock_sendto(sock, packet, (address, port))
         try:
             data, _addr = await asyncio.wait_for(loop.sock_recvfrom(sock, 2048), timeout)
         except asyncio.TimeoutError as exc:
@@ -132,12 +134,21 @@ async def query(
         sock.close()
 
 
-def socket_udp():
+def socket_udp(local_port: int = 0):
     import socket
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False)
+    # Windows rejects sendto on an unbound datagram socket, so always bind to an
+    # ephemeral port (or the requested one).
+    sock.bind(("0.0.0.0", int(local_port or 0)))
     return sock
+
+
+def socket_gethostbyname(host: str) -> str:
+    import socket
+
+    return socket.gethostbyname(host)
 
 
 async def discover(
