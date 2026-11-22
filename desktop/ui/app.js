@@ -783,12 +783,12 @@ function renderFarm(status) {
   $("renderHostControls").hidden = !hosting;
   $("renderProgressWrap").hidden = !running;
   $("renderConsent").hidden = hosting || !request;
-  $("renderState").textContent = running
+  $("renderBadge").textContent = running
     ? `${render.done || 0}/${render.total || 0}`
     : request
       ? "invite"
       : "idle";
-  $("renderState").className = `live ${running ? "on" : request ? "busy" : ""}`;
+  $("renderBadge").className = `live ${running ? "on" : request ? "busy" : ""}`;
   if (running) {
     const percent = Math.max(0, Math.min(100, Number(render.percent || 0)));
     $("renderBar").style.width = `${percent}%`;
