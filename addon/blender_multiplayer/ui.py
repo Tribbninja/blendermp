@@ -386,6 +386,10 @@ class BMP_PT_main(bpy.types.Panel):
 
         column = layout.column(align=True)
         column.operator("bmp.export_log", text="Export diagnostics", icon="TEXT")
+        if settings.tick_errors:
+            warn = layout.box()
+            warn.alert = True
+            warn.label(text=f"Tick errors: {settings.tick_errors[:180]}", icon="ERROR")
 
 
 classes = (BMP_PT_main,)

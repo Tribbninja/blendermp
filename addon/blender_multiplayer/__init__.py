@@ -365,6 +365,7 @@ class BMPState(PropertyGroup):
     overlay_scale: FloatProperty(name="Overlay scale", default=1.0, min=0.5, max=2.0)
     colorblind_safe: BoolProperty(name="Colour-blind-safe colours", default=False)
     scene_mismatch: StringProperty(name="Scene mismatch", default="")
+    tick_errors: StringProperty(name="Tick errors", default="")
     ai_enabled: BoolProperty(name="Enable AI copilot", default=False)
     ai_url: StringProperty(name="Ollama URL", default="http://127.0.0.1:11434")
     ai_model: StringProperty(name="Ollama model", default="qwen2.5:7b")
@@ -7137,7 +7138,7 @@ def _write_status(context, force: bool = False) -> None:
         return
     runtime["last_status"] = now
     settings = context.window_manager.bmp
-    stats = session.stats() if session else {}
+    settings.tick_errors = "; ".join(runtime.get("tick_errors", [])[-3:])
     # The session object is the source of truth. Settings are updated from
     # queued events and can lag (or be overwritten by a late event), which used
     # to publish "offline" while the socket was healthy.
