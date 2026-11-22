@@ -12,6 +12,7 @@ const CORS = {
 const TTL = 90;
 const MAX_SERVERS = 500;
 const MAX_BODY = 8 * 1024;
+const MAX_SIGNAL = 2048;
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const CODE_LEN = 15;
 
@@ -104,6 +105,20 @@ function validId(value) {
   return typeof value === "string" && value.length >= 16 && value.length <= 64 && /^[A-Za-z0-9_-]+$/.test(value);
 }
 
+function cleanSignalPeer(value) {
+  if (typeof value !== "string") return "";
+  const peer = value.trim();
+  if (peer.length < 8 || peer.length > 64 || !/^[A-Za-z0-9_-]+$/.test(peer)) return "";
+  return peer;
+}
+
+function cleanSignalType(value) {
+  if (typeof value !== "string") return "";
+  const type = value.trim().toLowerCase();
+  if (!/^[a-z][a-z0-9_-]{1,23}$/.test(type)) return "";
+  return type;
+}
+
 async function readJson(request) {
   const length = Number(request.headers.get("content-length") || 0);
   if (length > MAX_BODY) throw new Error("request body is too large");
@@ -182,6 +197,11 @@ export default {
       const room = env.ROOM.get(env.ROOM.idFromName(roomId || "invalid"));
       return room.fetch(request);
     }
+    if (url.pathname.startsWith("/signal/")) {
+      const roomId = url.pathname.slice("/signal/".length).toLowerCase();
+      const room = env.ROOM.get(env.ROOM.idFromName(roomId || "invalid"));
+      return room.fetch(request);
+    }
     const directory = env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));
     return directory.fetch(request);
   },
@@ -220,6 +240,7 @@ export class Hub {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return empty();
     if (url.pathname.startsWith("/relay/")) return this.relay(request, url);
+    if (url.pathname.startsWith("/signal/")) return this.signal(request, url);
     try {
       if (url.pathname === "/health" && request.method === "GET") {
         const servers = await this.loadServers();
@@ -569,5 +590,97 @@ export class Room extends Hub {
       server.addEventListener("error", close);
     }
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  // ---------------------------------------------------------------- signalling
+  // Peers connect here to exchange connection metadata (public addresses and
+  // direct-connect offers). The server only forwards small JSON messages; it
+  // never carries collaboration data.
+  async signal(request, url) {
+    const roomId = url.pathname.slice("/signal/".length).toLowerCase();
+    if (!/^[0-9a-f]{16}$/.test(roomId)) {
+      return new Response("bad room", { status: 400, headers: CORS });
+    }
+    if (request.headers.get("Upgrade") !== "websocket") {
+      return new Response("websocket required", { status: 426, headers: CORS });
+    }
+    const peerId = cleanSignalPeer(url.searchParams.get("peer"));
+    if (!peerId) return new Response("bad peer", { status: 400, headers: CORS });
+    if (!this.signals) this.signals = new Map();
+    if (this.signals.has(peerId)) {
+      return new Response("peer already connected", { status: 409, headers: CORS });
+    }
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    server.accept();
+    this.signals.set(peerId, server);
+    const welcome = { type: "welcome", peer: peerId, peers: [] };
+    for (const [id, socket] of this.signals) {
+      if (id === peerId) continue;
+      welcome.peers.push(id);
+    }
+    this.sendSignal(server, welcome);
+    this.broadcastSignal({ type: "join", peer: peerId }, peerId);
+    server.addEventListener("message", (event) => {
+      void this.signalMessage(peerId, server, event.data);
+    });
+    const close = () => {
+      if (this.signals.get(peerId) === server) {
+        this.signals.delete(peerId);
+        this.broadcastSignal({ type: "leave", peer: peerId }, peerId);
+      }
+    };
+    server.addEventListener("close", close);
+    server.addEventListener("error", close);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async signalMessage(peerId, socket, data) {
+    const buffer = await binaryData(data);
+    if (!buffer || buffer.byteLength > MAX_SIGNAL) return;
+    let message;
+    try {
+      message = JSON.parse(new TextDecoder().decode(buffer));
+    } catch {
+      return;
+    }
+    if (!message || typeof message !== "object") return;
+    const type = cleanSignalType(message.type);
+    if (!type) return;
+    const out = { type, peer: peerId };
+    if (typeof message.address === "string" && message.address.length <= 128) {
+      out.address = message.address;
+    }
+    if (typeof message.token === "string" && message.token.length <= 128) {
+      out.token = message.token;
+    }
+    if (typeof message.nonce === "string" && message.nonce.length <= 128) {
+      out.nonce = message.nonce;
+    }
+    const to = cleanSignalPeer(message.to);
+    if (to) {
+      const target = this.signals && this.signals.get(to);
+      if (target) this.sendSignal(target, { ...out, to });
+      return;
+    }
+    this.broadcastSignal(out, peerId);
+  }
+
+  sendSignal(socket, message) {
+    if (!socket) return;
+    try {
+      socket.send(new TextEncoder().encode(JSON.stringify(message)));
+    } catch {
+      /* ignore a closed socket */
+    }
+  }
+
+  broadcastSignal(message, except) {
+    if (!this.signals) return;
+    for (const [id, socket] of this.signals) {
+      if (id === except) continue;
+      this.sendSignal(socket, message);
+    }
   }
 }

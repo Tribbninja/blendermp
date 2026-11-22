@@ -316,6 +316,7 @@ class SessionService:
         direct_code: str | None = None,
         direct_first: bool = False,
         version: str | None = None,
+        mesh_url: str | None = None,
     ):
         self.inbox = inbox
         self.is_host = host
@@ -364,6 +365,9 @@ class SessionService:
         self._using_relay = bool(self.relay_mode)
         self._relay_host: RelayHostAgent | None = None
         self._relay_client: RelayClientAgent | None = None
+        self.mesh_url = (mesh_url or "").strip()
+        self._mesh = None
+        self._mesh_task: asyncio.Task | None = None
 
         self.failed = False
         self.failure_reason = ""
@@ -427,6 +431,8 @@ class SessionService:
         self._wake = asyncio.Event()
         tasks: list[asyncio.Task] = []
         try:
+            if self.mesh_url:
+                self._mesh_task = asyncio.create_task(self._start_mesh())
             if self.is_host:
                 await self._start_host()
             else:
@@ -446,7 +452,48 @@ class SessionService:
                     pass
             await self._shutdown()
 
+    async def _start_mesh(self) -> None:
+        """Start the direct mesh alongside the session, best-effort."""
+        try:
+            from .net.meshcoord import MeshCoordinator
+
+            coordinator = MeshCoordinator(self.mesh_url, room_id(self.code))
+            started = await asyncio.wait_for(coordinator.start(), 12.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            return
+        if not started:
+            await coordinator.stop()
+            return
+        self._mesh = coordinator
+
+    def mesh_status(self) -> dict:
+        if self._mesh is None:
+            return {"active": False, "peers": [], "public_address": "", "error": ""}
+        status = self._mesh.status()
+        return {
+            "active": True,
+            "peer_id": status.get("peer_id", ""),
+            "peers": status.get("peers", []),
+            "public_address": status.get("public_address", ""),
+            "error": status.get("error", ""),
+        }
+
     async def _shutdown(self) -> None:
+        if self._mesh_task is not None:
+            self._mesh_task.cancel()
+            try:
+                await self._mesh_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._mesh_task = None
+        if self._mesh is not None:
+            try:
+                await self._mesh.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._mesh = None
         if self._relay_client:
             try:
                 await self._relay_client.stop()

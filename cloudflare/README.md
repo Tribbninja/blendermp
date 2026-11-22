@@ -59,3 +59,15 @@ A connection with no key or the wrong key is rejected with 403, so a client who
 can see the public room code cannot replace the host or kick everyone. Joining
 clients do not need the key; the host's TLS certificate pinning and optional
 password still authenticate them.
+
+## Signalling (P2P mesh)
+
+`/signal/<room>?peer=<id>` is a WebSocket that introduces peers to each other.
+It only forwards small JSON messages (welcome, join, leave, hello, direct); it
+never carries collaboration data. Each message is capped at 2 KB and validated
+against a strict peer id and message-type grammar.
+
+The Worker never sees a private key. Peers exchange X25519 public keys and
+public addresses here, then establish a direct encrypted TCP link themselves
+with ChaCha20-Poly1305. When a direct link cannot be made (symmetric NAT,
+CGNAT) the session falls back to the relay for that peer.

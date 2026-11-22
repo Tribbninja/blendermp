@@ -141,6 +141,27 @@ def test_status_is_bounded_and_atomic(appdir):
     assert body["perf"]["violations"] == ["tick"]
 
 
+def test_status_bounds_mesh_fields(appdir):
+    control.write_status(
+        {
+            "state": "hosting",
+            "mesh": {
+                "active": True,
+                "peers": ["a" * 200, 42, "b" * 200],
+                "public_address": "203.0.113.5:" + "9" * 300,
+                "error": "x" * 1000,
+            },
+        }
+    )
+    body = json.loads(control.status_path().read_text(encoding="utf-8"))
+    mesh = body["mesh"]
+    assert mesh["active"] is True
+    assert len(mesh["peers"]) == 2
+    assert all(len(peer) <= 64 for peer in mesh["peers"])
+    assert len(mesh["public_address"]) <= 128
+    assert len(mesh["error"]) <= 256
+
+
 def test_tls_certificate_and_pinning(appdir):
     cert, key, fingerprint = tls.load_or_create_certificate(control.certs_dir())
     assert cert.exists() and key.exists()

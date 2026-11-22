@@ -72,7 +72,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 9, 15),
+    "version": (0, 10, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -635,6 +635,7 @@ def start_host(
             port=port,
             pin=settings.pin,
             relay=relay,
+            mesh_url=relay_url,
         )
         session.start()
     except Exception:
@@ -730,6 +731,7 @@ def start_join(
             relay=relay,
             direct_code=chosen or None,
             direct_first=bool(direct_first),
+            mesh_url=relay_url,
         )
         session.start()
     except Exception:
@@ -7279,6 +7281,7 @@ def _write_status(context, force: bool = False) -> None:
             "identity_descriptor": json.dumps(getattr(session, "identity_descriptor", {}) or {}, separators=(",", ":")) if session else "{}",
             "scene": _scene_stats(context) if now - runtime.get("last_scene_stats", 0.0) > 5.0 else runtime.get("scene_stats", {}),
             "relay": bool(stats.get("relay", False)),
+            "mesh": session.mesh_status() if session is not None else {"active": False, "peers": []},
             "rtt_ms": live_rtt,
             "bytes_in": stats.get("bytes_in", 0),
             "bytes_out": stats.get("bytes_out", 0),

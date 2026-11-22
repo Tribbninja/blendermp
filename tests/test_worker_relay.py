@@ -50,3 +50,26 @@ def test_room_verifies_the_host_token_from_its_own_state():
 def test_health_reports_no_debug_markers():
     assert '"build"' not in WORKER
     assert "/debug-state" not in WORKER
+
+
+def test_signal_requests_are_routed_to_the_room():
+    default_export = _between(WORKER, "export default {", "export class Hub")
+    signal_branch = _between(default_export, 'startsWith("/signal/")', "const directory =")
+    assert "ROOM.get" in signal_branch
+    assert "room.fetch(request)" in signal_branch
+
+
+def test_room_forwards_signalling_messages_between_peers():
+    room = WORKER[WORKER.index("export class Room extends Hub {") :]
+    assert "async signal(" in room
+    assert "signalMessage" in room
+    assert "broadcastSignal" in room
+    assert "sendSignal" in room
+    assert "peer already connected" in room
+    assert "MAX_SIGNAL" in WORKER
+
+
+def test_signalling_validates_peer_and_message_shapes():
+    assert "cleanSignalPeer" in WORKER
+    assert "cleanSignalType" in WORKER
+    assert "length <= 128" in WORKER

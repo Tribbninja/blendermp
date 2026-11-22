@@ -301,6 +301,18 @@ def write_status(data: dict[str, Any]) -> None:
             for key in ("objects", "meshes", "vertices", "materials", "images", "collections")
             if isinstance(scene.get(key, 0), int) and not isinstance(scene.get(key, 0), bool)
         }
+    mesh = data.get("mesh")
+    if isinstance(mesh, dict):
+        safe["mesh"] = {
+            "active": bool(mesh.get("active")),
+            "peers": [
+                str(peer)[:64]
+                for peer in (mesh.get("peers") or [])[:64]
+                if isinstance(peer, str)
+            ],
+            "public_address": str(mesh.get("public_address", ""))[:128],
+            "error": str(mesh.get("error", ""))[:256],
+        }
     for key in ("is_host", "relay", "fast_mode", "farm_active", "internet_mode", "lan_fast"):
         value = data.get(key)
         if isinstance(value, bool):
