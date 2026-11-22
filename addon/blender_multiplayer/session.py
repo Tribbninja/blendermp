@@ -1852,7 +1852,7 @@ class SessionService:
             ):
                 return True
             key = ("presence", sender)
-            if now - peer.last_sent.get(key, 0.0) < 0.2:
+            if now - peer.last_sent.get(key, 0.0) < 0.1:
                 return False
             peer.last_sent[key] = now
             return True

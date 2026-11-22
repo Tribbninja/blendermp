@@ -159,6 +159,7 @@ runtime: dict = {
     "view_smoothers": {},
     "remote_debug": {},
     "remote_selections": {},
+    "remote_signature": None,
     "remote_points": [],
     "lasers": {},
     "laser_active": False,
@@ -6280,6 +6281,24 @@ def _with_opacity(color, opacity: float):
     return values[:3] + (max(0.0, min(1.0, values[3] * float(opacity))),)
 
 
+def _tag_view3d_redraw() -> None:
+    """Force the 3D viewport to repaint so remote overlays animate live.
+
+    Blender does not continuously redraw an idle viewport. Without this, a
+    remote camera only appears to move when the local user moves their own
+    camera (which triggers a repaint), which is exactly the stale-camera bug.
+    """
+    try:
+        screen = getattr(bpy.context, "screen", None)
+        if screen is None:
+            return
+        for area in screen.areas:
+            if area.type == "VIEW_3D":
+                area.tag_redraw()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _sync_remote_visuals(context) -> None:
     session: SessionService | None = runtime.get("session")
     now = time.monotonic()
@@ -6431,6 +6450,23 @@ def _sync_remote_visuals(context) -> None:
         "labels": len(labels),
         "users": sorted(seen_users),
     }
+    signature = tuple(
+        (
+            user.name,
+            tuple(round(float(value), 2) for value in user.view_corners)
+            if user.has_corners
+            else (),
+            str(user.selected or ""),
+            tuple(round(float(value), 2) for value in user.cursor)
+            if user.has_cursor
+            else (),
+        )
+        for user in settings.users
+        if user.name != settings.name
+    )
+    if signature != runtime.get("remote_signature"):
+        runtime["remote_signature"] = signature
+        _tag_view3d_redraw()
     try:
         settings.overlay_info = (
             f"{len(labels)} tags, {total} lines, {point_total} points"
@@ -7467,7 +7503,7 @@ def _update_timing(session: SessionService | None) -> None:
         runtime["subscription_interval"] = 0.5
         runtime["stats_interval"] = 1.0
     else:
-        runtime["presence_interval"] = 1.0 / (3.0 if rtt > 150.0 else 5.0)
+        runtime["presence_interval"] = 1.0 / (5.0 if rtt > 150.0 else 10.0)
         runtime["subscription_interval"] = 5.0
         runtime["stats_interval"] = 2.0
     runtime["transform_smooth"] = 0.018 if fast else 0.035
