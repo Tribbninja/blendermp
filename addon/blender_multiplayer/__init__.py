@@ -4618,19 +4618,15 @@ def _sync_selection(context) -> None:
             # Keep the panel informative without spamming the chat log.
             settings.lease_info = f"{obj.name} is locked by {owner}"
 
-    # Renew only actively edited leases. Idle selections release themselves so
-    # a forgotten selection cannot hold an object forever.
+    # Keep the lease for as long as the object stays selected. Multi-User locks
+    # on selection and releases on deselection; releasing an idle-but-selected
+    # object made the lock silently disappear while both sides could still move
+    # it. Disconnects are covered by the lease TTL and peer-leave cleanup.
     if now - runtime["lease_renew"] > LEASE_RENEW:
         runtime["lease_renew"] = now
         for uid in list(owned):
-            last = activity.get(uid, 0.0)
-            if now - last <= LEASE_IDLE:
+            if uid in selected:
                 _lease_request(session, uid, "acquire")
-            else:
-                _lease_request(session, uid, "release")
-                owned.discard(uid)
-                owners.pop(uid, None)
-                activity.pop(uid, None)
 
     blocked = {uid for uid, owner in owners.items() if owner and owner != settings.name}
     hidden = runtime["hidden_objects"]

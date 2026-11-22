@@ -213,7 +213,8 @@ try:
     )
     RESULT["details"]["recording"] = replay.summary()
 
-    # Idle leases must release themselves even while the object stays selected.
+    # A lease must stay alive while selected (Multi-User semantics) and release
+    # as soon as the object is deselected.
     class FakeSession:
         is_host = True
         state = "hosting"
@@ -257,14 +258,32 @@ try:
     bm.LEASE_IDLE, bm.LEASE_RENEW, bm.SELECTION_POLL = 0.8, 0.3, 0.0
     try:
         bm._sync_selection(bpy.context)
-        released = False
+        check(
+            "lease_acquire",
+            any(action == "acquire" for _key, action in fake.actions),
+            fake.actions,
+        )
+        fake.actions.clear()
         for _ in range(20):
             time.sleep(0.15)
             bm._sync_selection(bpy.context)
-            if any(action == "release" for _key, action in fake.actions):
-                released = True
-                break
-        check("lease_idle_release", released, fake.actions)
+        check(
+            "lease_held_while_selected",
+            not any(action == "release" for _key, action in fake.actions)
+            and any(action == "acquire" for _key, action in fake.actions),
+            fake.actions,
+        )
+        fake.actions.clear()
+        target.select_set(False)
+        bpy.context.view_layer.update()
+        for _ in range(12):
+            time.sleep(0.15)
+            bm._sync_selection(bpy.context)
+        check(
+            "lease_release_on_deselect",
+            any(action == "release" for _key, action in fake.actions),
+            fake.actions,
+        )
     finally:
         bm.LEASE_IDLE, bm.LEASE_RENEW, bm.SELECTION_POLL = old_idle, old_renew, old_poll
         bm.runtime["session"] = None
