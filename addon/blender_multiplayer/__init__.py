@@ -72,7 +72,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 10, 0),
+    "version": (0, 11, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -557,6 +557,7 @@ def start_host(
     port: int | None = None,
     relay_url: str | None = None,
     relay_token: str | None = None,
+    mesh_url: str | None = None,
 ) -> None:
     settings = context.window_manager.bmp
     existing = runtime.get("session")
@@ -636,7 +637,7 @@ def start_host(
             port=port,
             pin=settings.pin,
             relay=relay,
-            mesh_url=relay_url,
+            mesh_url=mesh_url or relay_url,
         )
         session.start()
     except Exception:
@@ -667,6 +668,7 @@ def start_join(
     prefer_direct: bool = False,
     direct_code: str | None = None,
     direct_codes: list[str] | None = None,
+    mesh_url: str | None = None,
 ) -> None:
     settings = context.window_manager.bmp
     stop_session(context, publish=False)
@@ -732,7 +734,7 @@ def start_join(
             relay=relay,
             direct_code=chosen or None,
             direct_first=bool(direct_first),
-            mesh_url=relay_url,
+            mesh_url=mesh_url or relay_url,
         )
         session.start()
     except Exception:
@@ -3641,6 +3643,7 @@ def _pump_scene_bootstrap(context) -> None:
                     "render": entry.get("render"),
                 },
             )
+            session.mark_bootstrap_done(target)
             del bootstraps[target]
 
 

@@ -267,6 +267,10 @@ class Peer:
     byte_window: deque = field(default_factory=deque)
     pending: dict[tuple[str, int], tuple[bytes, float, bool]] = field(default_factory=dict)
     dropped: bool = False
+    mesh_id: str = ""
+    mesh: object = None
+    bootstrap_done: bool = False
+    mesh_sent: int = 0
 
     def enqueue(self, data: bytes, critical: bool = False) -> None:
         now = time.monotonic()
@@ -292,6 +296,11 @@ class Peer:
                 data = await self.queue.get()
                 if self.closed:
                     break
+                if self.mesh is not None and self.mesh_id and self.bootstrap_done:
+                    if await self.mesh.send(self.mesh_id, data):
+                        self.sent += len(data)
+                        self.mesh_sent += 1
+                        continue
                 self.writer.write(data)
                 await self.writer.drain()
                 self.sent += len(data)
@@ -368,6 +377,11 @@ class SessionService:
         self.mesh_url = (mesh_url or "").strip()
         self._mesh = None
         self._mesh_task: asyncio.Task | None = None
+        self._mesh_recv_task: asyncio.Task | None = None
+        self._frame_lock: asyncio.Lock | None = None
+        self._host_mesh_id = ""
+        self._mesh_ready = False
+        self._mesh_recv = 0
 
         self.failed = False
         self.failure_reason = ""
@@ -429,6 +443,7 @@ class SessionService:
     async def _main(self) -> None:
         self._stop_event = asyncio.Event()
         self._wake = asyncio.Event()
+        self._frame_lock = asyncio.Lock()
         tasks: list[asyncio.Task] = []
         try:
             if self.mesh_url:
@@ -467,20 +482,96 @@ class SessionService:
             await coordinator.stop()
             return
         self._mesh = coordinator
+        self._mesh_recv_task = asyncio.create_task(self._mesh_receive_loop())
+        if self.is_host:
+            for peer in self._peers.values():
+                peer.mesh = coordinator
+            self._broadcast_mesh_id()
+        else:
+            self._publish_mesh_id()
 
     def mesh_status(self) -> dict:
         if self._mesh is None:
-            return {"active": False, "peers": [], "public_address": "", "error": ""}
+            return {"active": False, "peers": [], "public_address": "", "error": "", "sent": 0, "received": 0}
         status = self._mesh.status()
+        sent = sum(peer.mesh_sent for peer in self._peers.values()) if self.is_host else 0
         return {
             "active": True,
             "peer_id": status.get("peer_id", ""),
             "peers": status.get("peers", []),
             "public_address": status.get("public_address", ""),
             "error": status.get("error", ""),
+            "sent": sent,
+            "received": self._mesh_recv,
         }
 
+    def _publish_mesh_id(self) -> None:
+        if self._mesh is None or self._mesh.manager is None:
+            return
+        self._mesh_ready = False
+        self._enqueue(
+            protocol.json_frame(MessageType.MESH, {"peer_id": self._mesh.manager.peer_id})
+        )
+
+    def _peer_by_mesh_id(self, mesh_id: str) -> Peer | None:
+        for peer in self._peers.values():
+            if peer.authenticated and peer.mesh_id and peer.mesh_id == mesh_id:
+                return peer
+        return None
+
+    async def _mesh_receive_loop(self) -> None:
+        while self._stop_event is not None and not self._stop_event.is_set():
+            mesh = self._mesh
+            if mesh is None:
+                await asyncio.sleep(0.2)
+                continue
+            try:
+                mesh_id, payload = await mesh.receive()
+            except asyncio.CancelledError:
+                return
+            except Exception:  # noqa: BLE001
+                return
+            try:
+                frame = protocol.decode(payload)
+            except Exception:  # noqa: BLE001
+                continue
+            if frame.type not in MessageType._value2member_map_:
+                continue
+            self._mesh_recv += 1
+            if self.is_host:
+                peer = self._peer_by_mesh_id(mesh_id)
+                if peer is None:
+                    continue
+                lock = self._frame_lock
+                try:
+                    if lock is not None:
+                        async with lock:
+                            await self._handle_host_frame(peer, frame)
+                    else:
+                        await self._handle_host_frame(peer, frame)
+                except Violation as exc:
+                    try:
+                        eventlog.log(
+                            "info", "MESH_VIOLATION", str(exc)[:120], name=peer.name
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    await self._drop_peer(peer)
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    continue
+            else:
+                if not self._host_mesh_id or mesh_id != self._host_mesh_id:
+                    continue
+                self._handle_client_frame(frame)
+
     async def _shutdown(self) -> None:
+        if self._mesh_recv_task is not None:
+            self._mesh_recv_task.cancel()
+            try:
+                await self._mesh_recv_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._mesh_recv_task = None
         if self._mesh_task is not None:
             self._mesh_task.cancel()
             try:
@@ -710,6 +801,7 @@ class SessionService:
             writer=writer,
             address=address,
             lan=_is_lan_ip(str(peername[0])),
+            mesh=self._mesh,
         )
         peer.writer_task = asyncio.create_task(peer.drain_writes())
         try:
@@ -717,9 +809,18 @@ class SessionService:
                 frame = await self._read_frame(reader)
                 if frame is None:
                     break
-                await self._handle_host_frame(peer, frame)
+                lock = self._frame_lock
+                if lock is not None:
+                    async with lock:
+                        await self._handle_host_frame(peer, frame)
+                else:
+                    await self._handle_host_frame(peer, frame)
         except Violation as exc:
             message = str(exc)
+            try:
+                eventlog.log("info", "PEER_VIOLATION", message[:120], name=peer.name)
+            except Exception:  # noqa: BLE001
+                pass
             if message != "peer left":
                 lowered = message.lower()
                 if "rate limit" in lowered:
@@ -792,6 +893,17 @@ class SessionService:
             return
         if not peer.authenticated:
             raise Violation("frame before authentication")
+
+        if frame.type == MessageType.MESH:
+            body = self._json(frame, 256)
+            mesh_id = clean_text(body.get("peer_id"), 64)
+            if mesh_id and len(mesh_id) == 32:
+                peer.mesh_id = mesh_id
+                if self._mesh is not None:
+                    peer.mesh = self._mesh
+                self._emit("mesh_peer", {"name": peer.name, "peer_id": mesh_id})
+                self._send_mesh_id(peer)
+            return
 
         if frame.type in MUTATING_TYPES and not can_edit(peer.role):
             peer.enqueue(
@@ -1469,6 +1581,7 @@ class SessionService:
                 peer.role = int(entry.get("role", int(Role.EDITOR)))
                 peer.resume_token = token
                 peer.authenticated = True
+                peer.bootstrap_done = True
                 if peer.lan:
                     self._lan_peer_count += 1
                 self._peers[peer.peer_id] = peer
@@ -1501,6 +1614,7 @@ class SessionService:
                     "identity": self._identity_body(),
                 }
                 peer.enqueue(protocol.encode(protocol.json_frame(MessageType.WELCOME, welcome)), critical=True)
+                self._send_mesh_id(peer)
                 self._broadcast(
                     protocol.json_frame(
                         MessageType.PRESENCE,
@@ -1556,6 +1670,7 @@ class SessionService:
             "identity": self._identity_body(),
         }
         peer.enqueue(protocol.encode(protocol.json_frame(MessageType.WELCOME, welcome)), critical=True)
+        self._send_mesh_id(peer)
         self._broadcast(
             protocol.json_frame(
                 MessageType.PRESENCE,
@@ -1953,6 +2068,37 @@ class SessionService:
         peer.last_sent[key] = now
         return True
 
+    def _send_mesh_id(self, peer: Peer) -> None:
+        """Tell a peer which mesh identity belongs to this session."""
+        if self._mesh is None or self._mesh.manager is None:
+            return
+        peer.mesh = self._mesh
+        try:
+            peer.enqueue(
+                protocol.encode(
+                    protocol.json_frame(
+                        MessageType.MESH,
+                        {"peer_id": self._mesh.manager.peer_id, "ack": peer.mesh_id},
+                    )
+                ),
+                critical=True,
+            )
+        except Violation:
+            pass
+
+    def mark_bootstrap_done(self, name: str) -> None:
+        """Allow a peer's post-bootstrap traffic to use the mesh."""
+        for peer in self._peers.values():
+            if peer.name == name:
+                peer.bootstrap_done = True
+
+    def _broadcast_mesh_id(self) -> None:
+        if self._mesh is None or self._mesh.manager is None:
+            return
+        for peer in self._peers.values():
+            if peer.authenticated:
+                self._send_mesh_id(peer)
+
     def _broadcast(self, frame: Frame, exclude: str | None = None, critical: bool = True) -> None:
         data = protocol.encode(frame)
         now = time.monotonic()
@@ -2046,6 +2192,18 @@ class SessionService:
 
     async def _drop_peer(self, peer: Peer) -> None:
         was_authenticated = peer.authenticated
+        try:
+            eventlog.log(
+                "info",
+                "PEER_DROP",
+                "peer dropped",
+                name=peer.name,
+                authenticated=was_authenticated,
+                idle=round(time.monotonic() - peer.last_seen, 1),
+                mesh=bool(peer.mesh_id),
+            )
+        except Exception:  # noqa: BLE001
+            pass
         if was_authenticated and peer.lan:
             self._lan_peer_count = max(0, self._lan_peer_count - 1)
         peer.authenticated = False
@@ -2123,6 +2281,8 @@ class SessionService:
                 direct_info = None
 
         self._set_state("joining")
+        self._mesh_ready = False
+        self._host_mesh_id = ""
         context = tls.client_context()
         use_relay = bool(
             self.relay_mode
@@ -2307,6 +2467,18 @@ class SessionService:
 
     def _handle_client_frame(self, frame: Frame) -> None:
         self._bytes_in += len(frame.payload)
+        if frame.type == MessageType.MESH:
+            body = self._json(frame, 256)
+            mesh_id = clean_text(body.get("peer_id"), 64)
+            if mesh_id and len(mesh_id) == 32:
+                self._host_mesh_id = mesh_id
+                self._emit("mesh_host", {"peer_id": mesh_id})
+            ack = clean_text(body.get("ack"), 64)
+            if ack and self._mesh is not None and self._mesh.manager is not None:
+                if ack == self._mesh.manager.peer_id:
+                    self._mesh_ready = True
+            return
+
         if frame.type == MessageType.PONG:
             try:
                 body = json.loads(frame.payload.decode("utf-8"))
@@ -2649,6 +2821,17 @@ class SessionService:
                         self._broadcast(frame, critical=True)
                     elif self._writer:
                         data = protocol.encode(frame)
+                        sent = False
+                        if (
+                            self._mesh is not None
+                            and self._host_mesh_id
+                            and self._mesh_ready
+                            and frame.type not in (MessageType.PING, MessageType.PONG)
+                        ):
+                            sent = await self._mesh.send(self._host_mesh_id, data)
+                        if sent:
+                            self._bytes_out += len(data)
+                            continue
                         if self._writer.transport.get_write_buffer_size() > 4 * 1024 * 1024:
                             if frame.type not in {
                                 MessageType.CHUNK,

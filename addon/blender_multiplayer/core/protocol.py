@@ -123,6 +123,7 @@ class MessageType(IntEnum):
     ASSET_BUNDLE = 43
     OBJECT_RENAME = 46
     CHUNK = 45
+    MESH = 47
 
 
 class Channel(IntEnum):

@@ -312,6 +312,8 @@ def write_status(data: dict[str, Any]) -> None:
             ],
             "public_address": str(mesh.get("public_address", ""))[:128],
             "error": str(mesh.get("error", ""))[:256],
+            "sent": max(0, min(int(mesh.get("sent", 0) or 0), 1 << 62)),
+            "received": max(0, min(int(mesh.get("received", 0) or 0), 1 << 62)),
         }
     for key in ("is_host", "relay", "fast_mode", "farm_active", "internet_mode", "lan_fast"):
         value = data.get(key)
