@@ -22,6 +22,8 @@ fn main() {
                 "take_deep_link",
                 "open_dashboard",
                 "log_client",
+                "ui_ready",
+                "export_diagnostics",
             ]),
         ),
     )

@@ -140,7 +140,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.11.13";
+const APP_VERSION = "0.11.14";
 const PROTOCOL_VERSION = 3;
 const CAPABILITIES = 1 | (1 << 10) | (1 << 11) | (1 << 12); // presence, bookmarks, bundles, chunks
 const settings = {
@@ -1955,7 +1955,7 @@ function wire() {
 }
 
 async function boot() {
-  invoke("ui_ready").catch(() => {});
+  invoke("ui_ready").catch((error) => log(`ui_ready failed: ${error}`));
   await loadSettings();
   applyStoredSettings();
   window.BMPA11y?.apply();
