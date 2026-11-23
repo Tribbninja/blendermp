@@ -74,7 +74,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 11, 9),
+    "version": (0, 11, 10),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -433,6 +433,7 @@ class BMPState(PropertyGroup):
     farm_host_worker: BoolProperty(name="This PC renders too", default=False)
     farm_client_url: StringProperty(name="Farm URL", default="")
     farm_client_token: StringProperty(name="Farm token", default="")
+    farm_cpu_percent: IntProperty(name="Render CPU percent", default=80, min=10, max=100)
     render_progress: StringProperty(name="Render progress", default="")
     render_request: StringProperty(name="Render request", default="")
     host_name: StringProperty()
@@ -8698,7 +8699,7 @@ def _pump_renderfarm(context) -> None:
             job = jobs[-1]
             settings.farm_progress = (
                 f"{job.get('done', 0)}/{job.get('frames', 0)} frames "
-                f"({job.get('percent', 0)}%) · {settings.farm_workers} worker(s)"
+                f"({job.get('percent', 0)}%) Â· {settings.farm_workers} worker(s)"
             )
     if runtime.get("farm_busy"):
         return
@@ -8874,7 +8875,12 @@ def _handle_render_control(context, event: dict) -> None:
             manager.decline(name)
             _push_message(context, "system", f"{name} declined the render")
         elif action == "need":
-            frames = manager.claim(name, renderjob.MAX_BATCH)
+            try:
+                count = int(message.get("count", renderjob.MAX_BATCH))
+            except (TypeError, ValueError):
+                count = renderjob.MAX_BATCH
+            count = max(1, min(renderjob.MAX_BATCH, count))
+            frames = manager.claim(name, count)
             if frames:
                 session.send_render_control_to(name, "work", {"job": job.id, "frames": frames})
         elif action == "fail":
@@ -8905,10 +8911,21 @@ def _handle_render_control(context, event: dict) -> None:
         runtime["render_job_id"] = job_id
         runtime["render_queue"] = []
         runtime["render_last_poll"] = 0.0
-        _push_message(context, "system", "Render started")
+        engine = str((runtime.get("render_request") or {}).get("engine", ""))
+        if "EEVEE" in engine.upper():
+            _push_message(
+                context,
+                "system",
+                "Render started (EEVEE is GPU-bound; CPU percent applies to Cycles)",
+            )
+        else:
+            _push_message(context, "system", "Render started")
     elif action == "work":
+        # Clients render one frame at a time; ignore extra assignments so a
+        # stale batch cannot build up a queue.
         frames = message.get("frames") or []
-        for frame in frames:
+        if frames and not runtime.get("render_queue"):
+            frame = frames[0]
             if isinstance(frame, int) and not isinstance(frame, bool):
                 runtime["render_queue"].append((job_id, frame))
         runtime["render_active"] = True
@@ -8950,12 +8967,24 @@ def _render_session_frame(context, frame: int, width: int = 0, height: int = 0) 
     old_x = scene.render.resolution_x
     old_y = scene.render.resolution_y
     old_pct = scene.render.resolution_percentage
+    old_threads_mode = scene.render.threads_mode
+    old_threads = scene.render.threads
+    settings = context.window_manager.bmp
+    try:
+        percent = int(getattr(settings, "farm_cpu_percent", 80) or 80)
+    except (TypeError, ValueError):
+        percent = 80
+    percent = max(10, min(100, percent))
+    threads = max(1, int((os.cpu_count() or 4) * (percent / 100.0)))
     handle, path = tempfile.mkstemp(suffix=".png")
     os.close(handle)
     try:
         scene.frame_set(int(frame))
         scene.render.filepath = path
         scene.render.image_settings.file_format = "PNG"
+        # Cycles uses this thread budget; EEVEE is GPU-bound and ignores it.
+        scene.render.threads_mode = "FIXED"
+        scene.render.threads = threads
         if width and height:
             scene.render.resolution_x = int(width)
             scene.render.resolution_y = int(height)
@@ -8978,6 +9007,11 @@ def _render_session_frame(context, frame: int, width: int = 0, height: int = 0) 
         scene.render.resolution_x = old_x
         scene.render.resolution_y = old_y
         scene.render.resolution_percentage = old_pct
+        try:
+            scene.render.threads_mode = old_threads_mode
+            scene.render.threads = old_threads
+        except Exception:  # noqa: BLE001
+            pass
         try:
             os.unlink(path)
         except OSError:
@@ -9109,11 +9143,11 @@ def _pump_session_render(context) -> None:
         finally:
             runtime["render_busy"] = False
         if not queue:
-            session.send_render_control("need", {"job": job_id})
+            session.send_render_control("need", {"job": job_id, "count": 1})
         return
     if now - runtime.get("render_last_poll", 0.0) > 3.0:
         runtime["render_last_poll"] = now
-        session.send_render_control("need", {"job": runtime.get("render_job_id", "")})
+        session.send_render_control("need", {"job": runtime.get("render_job_id", ""), "count": 1})
 
 
 class BMP_OT_ai_ask(Operator):
@@ -10394,3 +10428,4 @@ def unregister() -> None:
     del bpy.types.WindowManager.bmp
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
+

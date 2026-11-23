@@ -168,6 +168,7 @@ class BMP_PT_main(bpy.types.Panel):
 
         farm_box = layout.box()
         farm_box.label(text="LAN Render Farm", icon="RENDER_STILL")
+        farm_box.prop(settings, "farm_cpu_percent")
         if not settings.farm_active:
             farm_box.prop(settings, "farm_mode")
             if settings.farm_mode == "host":

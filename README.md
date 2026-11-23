@@ -5,7 +5,7 @@ Blender and **docks the live window over the app viewport** (a native owned
 window, not video capture, so it keeps full GPU performance and avoids the black
 surface that cross-process re-parenting causes on some GPUs).
 
-> **Status: 0.11.9 collaboration foundation.** Hosting, the public server
+> **Status: 0.11.10 collaboration foundation.** Hosting, the public server
 > browser, TLS pinning, presence, chat, object transforms, mesh streaming, live
 > Edit Mode topology, animation, sculpt, materials/textures, asset bundles,
 > roles, checkpoints, an Ollama copilot, session recording/replay, a live
