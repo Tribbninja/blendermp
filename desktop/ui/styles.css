@@ -800,8 +800,6 @@ body.resizing { user-select: none; }
 .render-range .btn { margin-left: auto; }
 .progress { height: 6px; border-radius: 999px; background: var(--line-soft); overflow: hidden; margin: 10px 0 6px; }
 .progress-bar { height: 100%; width: 0; background: var(--accent); transition: width .3s ease; }
-#renderConsent { border: 1px solid var(--line); border-radius: var(--radius); padding: 10px; margin-top: 8px; background: var(--panel-soft); }
-#renderConsent p { margin: 0 0 8px; font-size: 12px; color: var(--text); }
 
 /* render consent modal --------------------------------------------------- */
 .modal-overlay {

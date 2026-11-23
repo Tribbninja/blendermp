@@ -140,7 +140,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.11.12";
+const APP_VERSION = "0.11.13";
 const PROTOCOL_VERSION = 3;
 const CAPABILITIES = 1 | (1 << 10) | (1 << 11) | (1 << 12); // presence, bookmarks, bundles, chunks
 const settings = {
@@ -770,6 +770,8 @@ function renderState(status) {
   renderFarm(status);
 }
 
+let consentVisible = false;
+
 function renderFarm(status) {
   const section = $("renderSection");
   if (!section) return;
@@ -781,6 +783,14 @@ function renderFarm(status) {
   const request = render.request && typeof render.request === "object" ? render.request : null;
   const showConsent = active && Boolean(request) && !hosting;
   $("renderConsent").hidden = !showConsent;
+  // The docked Blender window is a native window above the WebView2 surface, so
+  // it would cover a centred modal. Hide it while the prompt is open.
+  if (showConsent !== consentVisible) {
+    consentVisible = showConsent;
+    if (state.embedded) {
+      invoke("set_blender_visible", { visible: !showConsent }).catch(() => {});
+    }
+  }
   if (request) {
     $("renderConsentText").textContent = `${request.name || "The host"} wants to render frames ${request.start}-${request.end} (step ${request.step}) at ${request.width}x${request.height}.`;
   }
