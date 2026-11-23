@@ -802,3 +802,27 @@ body.resizing { user-select: none; }
 .progress-bar { height: 100%; width: 0; background: var(--accent); transition: width .3s ease; }
 #renderConsent { border: 1px solid var(--line); border-radius: var(--radius); padding: 10px; margin-top: 8px; background: var(--panel-soft); }
 #renderConsent p { margin: 0 0 8px; font-size: 12px; color: var(--text); }
+
+/* render consent modal --------------------------------------------------- */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.62);
+  backdrop-filter: blur(3px);
+  animation: fade-in .12s ease;
+}
+.modal-box {
+  width: min(440px, 90vw);
+  padding: 22px;
+  border-radius: 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.55);
+}
+.modal-box h2 { margin: 0 0 8px; font-size: 16px; color: var(--text); }
+.modal-box p { margin: 0 0 18px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.modal-box .actions { justify-content: flex-end; }

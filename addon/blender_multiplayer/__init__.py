@@ -74,7 +74,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 11, 10),
+    "version": (0, 11, 11),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -3114,8 +3114,9 @@ def _poll_control(context) -> None:
             accept = bool(request.get("accept"))
             if session is not None and job_id:
                 session.send_render_control("accept" if accept else "decline", {"job": job_id})
-                if not accept:
-                    runtime["render_request"] = None
+                # Dismiss the modal either way; a start message drives the UI
+                # once the host has collected answers.
+                runtime["render_request"] = None
                 _push_message(
                     context,
                     "system",
@@ -8817,6 +8818,7 @@ def _start_session_render(context, start, end, step, format_hint, output, width=
     for name in peers:
         manager.ask(name)
     session.send_render_control("request", request)
+    eventlog.log("info", "RENDER_REQUEST", "sent", peers=len(peers), job=job.id)
     settings.render_progress = _render_progress_text(manager.status())
     _push_message(context, "system", f"Render {job.start}-{job.end} requested from {len(peers)} peer(s)")
     _write_status(context, force=True)
@@ -8904,6 +8906,8 @@ def _handle_render_control(context, event: dict) -> None:
         }
         runtime["render_width"] = int(message.get("width", 0) or 0)
         runtime["render_height"] = int(message.get("height", 0) or 0)
+        runtime["render_engine"] = str(message.get("engine", ""))[:32]
+        eventlog.log("info", "RENDER_RECEIVED", "request", job=job_id)
         _push_message(context, "system", f"{message.get('name', 'Host')} asked you to join a render")
         _write_status(context, force=True)
     elif action == "start":
@@ -8911,7 +8915,8 @@ def _handle_render_control(context, event: dict) -> None:
         runtime["render_job_id"] = job_id
         runtime["render_queue"] = []
         runtime["render_last_poll"] = 0.0
-        engine = str((runtime.get("render_request") or {}).get("engine", ""))
+        runtime["render_request"] = None
+        engine = str(runtime.get("render_engine", ""))
         if "EEVEE" in engine.upper():
             _push_message(
                 context,

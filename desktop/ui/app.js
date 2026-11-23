@@ -140,7 +140,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.11.10";
+const APP_VERSION = "0.11.11";
 const PROTOCOL_VERSION = 3;
 const CAPABILITIES = 1 | (1 << 10) | (1 << 11) | (1 << 12); // presence, bookmarks, bundles, chunks
 const settings = {
@@ -779,13 +779,17 @@ function renderFarm(status) {
   const running = Boolean(render.active);
   const finished = Boolean(render.finished);
   const request = render.request && typeof render.request === "object" ? render.request : null;
+  const showConsent = active && Boolean(request) && !hosting;
+  $("renderConsent").hidden = !showConsent;
+  if (request) {
+    $("renderConsentText").textContent = `${request.name || "The host"} wants to render frames ${request.start}-${request.end} (step ${request.step}) at ${request.width}x${request.height}.`;
+  }
   section.hidden = !active;
   if (!active) return;
   $("renderHostControls").hidden = !hosting || running;
   $("renderProgressWrap").hidden = !(running || finished);
   $("renderStopBtn").hidden = !hosting || !running;
   $("renderRetryBtn").hidden = !hosting || running || !(Number(render.failed || 0) > 0);
-  $("renderConsent").hidden = hosting || !request;
   $("renderBadge").textContent = render.stopped
     ? "stopped"
     : finished
@@ -810,9 +814,6 @@ function renderFarm(status) {
     $("renderWorkers").textContent = parts.join(" · ");
   } else {
     $("renderWorkers").textContent = "";
-  }
-  if (request) {
-    $("renderConsentText").textContent = `${request.name || "The host"} wants to render frames ${request.start}-${request.end} (step ${request.step}) at ${request.width}x${request.height}.`;
   }
 }
 

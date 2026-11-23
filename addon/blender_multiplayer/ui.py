@@ -125,7 +125,7 @@ class BMP_PT_main(bpy.types.Panel):
                 ai_box.label(text=settings.last_error[:120], icon="ERROR")
 
         recording_box = layout.box()
-        recording_box.label(text="Recording & Replay", icon="RECORD")
+        recording_box.label(text="Recording & Replay", icon="RECORD_ON")
         row = recording_box.row(align=True)
         if settings.recording_active:
             row.operator("bmp.record_stop", text="Stop recording", icon="PAUSE")

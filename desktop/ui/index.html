@@ -170,13 +170,6 @@
               <button class="btn ghost" id="renderRetryBtn" hidden>Retry failed</button>
             </div>
           </div>
-          <div id="renderConsent" hidden>
-            <p id="renderConsentText"></p>
-            <div class="actions">
-              <button class="btn primary" id="renderAccept">Join render</button>
-              <button class="btn ghost" id="renderDecline">Decline</button>
-            </div>
-          </div>
         </section>
 
         <section class="section" id="diagnosticsSection">
@@ -346,7 +339,7 @@
         <span id="statusLeft">Ready</span>
         <span class="grow"></span>
         <span id="statusMid"></span>
-        <span id="statusRight">v0.11.10</span>
+        <span id="statusRight">v0.11.11</span>
       </div>
     </main>
     </section>
@@ -383,6 +376,16 @@
     </div>
   </div>
 
+  <div class="modal-overlay" id="renderConsent" hidden>
+    <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="renderConsentTitle">
+      <h2 id="renderConsentTitle">Join this render?</h2>
+      <p id="renderConsentText"></p>
+      <div class="actions">
+        <button class="btn primary" id="renderAccept">Yes, join</button>
+        <button class="btn ghost" id="renderDecline">No</button>
+      </div>
+    </div>
+  </div>
   <script src="layout.js"></script>
   <script src="a11y.js"></script>
   <script src="app.js"></script>
