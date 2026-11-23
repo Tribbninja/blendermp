@@ -299,3 +299,13 @@ def test_render_request_accepts_resolution(appdir):
     assert request["width"] == 1280
     assert request["height"] == 720
     assert request["format"] == "WEBM"
+
+
+def test_status_keeps_render_engine(appdir):
+    control.write_status(
+        {"state": "hosting", "render": {"active": True, "engine": "CYCLES", "format": "MP4", "fps": 24}}
+    )
+    body = json.loads(control.status_path().read_text(encoding="utf-8"))
+    assert body["render"]["engine"] == "CYCLES"
+    assert body["render"]["format"] == "MP4"
+    assert body["render"]["fps"] == 24
