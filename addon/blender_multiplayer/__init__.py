@@ -74,7 +74,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 11, 15),
+    "version": (0, 11, 16),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -8909,6 +8909,16 @@ def _handle_render_control(context, event: dict) -> None:
         runtime["render_engine"] = str(message.get("engine", ""))[:32]
         eventlog.log("info", "RENDER_RECEIVED", "request", job=job_id)
         _push_message(context, "system", f"{message.get('name', 'Host')} asked you to join a render")
+        lines = [
+            f"Frames {message.get('start', 0)}-{message.get('end', 0)} (step {message.get('step', 1)})",
+            f"Resolution {message.get('width', 0)}x{message.get('height', 0)}",
+            f"Format {str(message.get('format', 'PNG'))[:8]}  Engine {str(message.get('engine', ''))[:32]}",
+        ]
+        try:
+            if os.environ.get("BMP_NO_CONSENT_DIALOG") != "1":
+                bpy.ops.bmp.render_consent("INVOKE_DEFAULT", job=job_id, text="\n".join(lines))
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
         _write_status(context, force=True)
     elif action == "start":
         runtime["render_active"] = True
@@ -10278,6 +10288,44 @@ class BMP_OT_export_log(Operator, ExportHelper):
         return {"FINISHED"}
 
 
+def _reply_render(context, job_id: str, accept: bool) -> None:
+    session = runtime.get("session")
+    if session is not None and job_id:
+        session.send_render_control("accept" if accept else "decline", {"job": job_id})
+    runtime["render_request"] = None
+    _push_message(context, "system", "Joined the render" if accept else "Declined the render")
+    _write_status(context, force=True)
+
+
+class BMP_OT_render_consent(Operator):
+    bl_idname = "bmp.render_consent"
+    bl_label = "Join render?"
+    bl_description = "The host asked you to join a render"
+    bl_options = {"REGISTER", "INTERNAL"}
+
+    job: StringProperty()
+    text: StringProperty()
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=460)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="The host wants to render with your computer.", icon="RENDER_STILL")
+        box = layout.box()
+        for line in (self.text or "").split("\n"):
+            box.label(text=line[:120])
+        layout.label(text="OK joins the render, Cancel declines.", icon="INFO")
+
+    def execute(self, context):
+        _reply_render(context, self.job, True)
+        return {"FINISHED"}
+
+    def cancel(self, context):
+        _reply_render(context, self.job, False)
+        return {"CANCELLED"}
+
+
 classes = (
     BMPUser,
     BMPMessage,
@@ -10298,6 +10346,7 @@ classes = (
     BMP_OT_hover,
     BMP_OT_trust_host,
     BMP_OT_ai_ask,
+    BMP_OT_render_consent,
     BMP_OT_ai_test,
     BMP_OT_ai_apply_all,
     BMP_OT_ai_clear,

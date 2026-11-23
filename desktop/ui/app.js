@@ -140,7 +140,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.11.15";
+const APP_VERSION = "0.11.16";
 const PROTOCOL_VERSION = 3;
 const CAPABILITIES = 1 | (1 << 10) | (1 << 11) | (1 << 12); // presence, bookmarks, bundles, chunks
 const settings = {
@@ -770,8 +770,6 @@ function renderState(status) {
   renderFarm(status);
 }
 
-let consentVisible = false;
-
 function renderFarm(status) {
   const section = $("renderSection");
   if (!section) return;
@@ -781,19 +779,10 @@ function renderFarm(status) {
   const running = Boolean(render.active);
   const finished = Boolean(render.finished);
   const request = render.request && typeof render.request === "object" ? render.request : null;
-  const showConsent = active && Boolean(request) && !hosting;
-  $("renderConsent").hidden = !showConsent;
-  // The docked Blender window is a native window above the WebView2 surface, so
-  // it would cover a centred modal. Hide it while the prompt is open.
-  if (showConsent !== consentVisible) {
-    consentVisible = showConsent;
-    if (state.embedded) {
-      invoke("set_blender_visible", { visible: !showConsent }).catch(() => {});
-    }
-  }
-  if (request) {
-    $("renderConsentText").textContent = `${request.name || "The host"} wants to render frames ${request.start}-${request.end} (step ${request.step}) at ${request.width}x${request.height}.`;
-  }
+  // The consent prompt is a native Blender dialog (bmp.render_consent), so the
+  // web overlay stays hidden. This avoids covering the UI with a modal that the
+  // docked Blender window sits on top of.
+  $("renderConsent").hidden = true;
   section.hidden = !active;
   if (!active) return;
   $("renderHostControls").hidden = !hosting || running;

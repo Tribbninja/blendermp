@@ -7,6 +7,7 @@ streaming, edit leases, presence 2.0, exact remote application, durable settings
 strict version gate, lease request UX, server-enforced roles, optional LAN direct).
 
 Progress log:
+- [x] 2026-11-23: 0.11.16: the render consent prompt is now a native Blender dialog (`bmp.render_consent`, `invoke_props_dialog`) shown inside the Blender window. It is centred, modal, and only OK (join) or Cancel (decline) dismisses it. The desktop app no longer shows its web overlay, so nothing covers the UI. `BMP_NO_CONSENT_DIALOG=1` keeps the e2e automated.
 - [x] 2026-11-23: 0.11.15: added `allow-ui-ready` to the window capability. Tauri 2 enforces commands in `capabilities/default.json`, so `ui_ready` was denied even though it was in the handler and `build.rs`, which made the startup watchdog show a false "UI did not load" message. The render consent prompt and the blank-UI hint now behave correctly.
 - [x] 2026-11-23: 0.11.14: registered `ui_ready` (and `export_diagnostics`) in `build.rs`. Tauri 2 only allows commands listed in the app manifest, so the new `ui_ready` invoke was denied and the watchdog fired a false timeout. The frontend now logs a denied command instead of swallowing it.
 - [x] 2026-11-23: 0.11.13: the render consent prompt is actually visible now. The docked Blender window is a native window above the WebView2 surface, so it covered the centred modal; the app now hides Blender while the prompt is open and restores it after Yes/No. Removed the old `#renderConsent` inline styles that made the overlay opaque and blended the dialog into the background.
