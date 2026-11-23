@@ -51,6 +51,7 @@ class BMP_PT_main(bpy.types.Panel):
             if settings.is_host:
                 box.label(text="Public listing is managed in the desktop app")
                 box.operator("bmp.resync_scene", text="Resync scene to everyone", icon="FILE_REFRESH")
+                box.prop(settings, "auto_resync")
             if settings.scene_mismatch:
                 warn = box.box()
                 warn.alert = True

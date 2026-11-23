@@ -74,7 +74,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 11, 21),
+    "version": (0, 11, 22),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -185,6 +185,14 @@ runtime: dict = {
     "ai_pending_edits": [],
     "overlay_scale": 1.0,
     "last_transform": 0.0,
+    "auto_resync_interval": 5.0,
+    "deep_resync_interval": 120.0,
+    "last_auto_resync": 0.0,
+    "last_deep_resync": 0.0,
+    "resync_queue": [],
+    "resync_deep": False,
+    "resync_notice_at": 0.0,
+    "mesh_payload_hash": {},
     "fast_mode": True,
     "transform_interval": 1.0 / 60.0,
     "presence_interval": 1.0 / 30.0,
@@ -364,6 +372,11 @@ class BMPState(PropertyGroup):
     sync_materials: BoolProperty(name="Sync materials", default=True)
     sync_modifiers: BoolProperty(name="Sync modifiers", default=True)
     sync_visible_only: BoolProperty(name="Only sync visible objects", default=False)
+    auto_resync: BoolProperty(
+        name="Auto resync",
+        default=True,
+        description="Periodically reconcile the host scene with every client (about every 0.5 s on LAN and 5 s over the internet)",
+    )
     use_relay: BoolProperty(name="Use relay", default=False)
     relay_host: StringProperty(name="Relay host", default="")
     relay_port: IntProperty(name="Relay port", default=7100, min=1024, max=65535)
@@ -1446,10 +1459,16 @@ def _apply_mesh_snapshot(context, body: dict) -> None:
         return
     if context.active_object == obj and context.mode in {"EDIT_MESH", "SCULPT"}:
         return  # never rebuild the mesh the user is editing
+    data = bytes(payload)
+    digest = hashlib.blake2b(data, digest_size=8).digest()
+    cached = runtime["mesh_payload_hash"].get(uid)
+    if cached is not None and cached[0] == digest and cached[1] == len(obj.data.vertices):
+        return
     runtime["mesh_smoothers"].pop(uid, None)
     mirror = runtime["mirrors"].setdefault(uid, MeshMirror())
     try:
-        mirror.apply_snapshot(obj.data, bytes(payload))
+        mirror.apply_snapshot(obj.data, data)
+        runtime["mesh_payload_hash"][uid] = (digest, len(obj.data.vertices))
     except Exception:  # noqa: BLE001
         traceback.print_exc()
 
@@ -3183,23 +3202,33 @@ def _parent_depth(obj) -> int:
     return depth
 
 
-def _send_object_details(session: SessionService, obj) -> None:
+def _send_object_details(session: SessionService, obj, force: bool = True) -> None:
     uid = obj.get("bmp_uuid")
     if not uid:
         return
-    for index, slot in enumerate(getattr(obj, "material_slots", []) or []):
-        material = slot.material
-        if material is None:
-            continue
-        data = material_values(material)
-        session.send_material(uid, index, data)
-        _queue_material_images(material)
-        runtime["material_shadow"][(uid, index)] = _material_signature(data)
+    settings = bpy.context.window_manager.bmp if bpy.context.window_manager else None
+    if settings is None or getattr(settings, "sync_materials", True):
+        for index, slot in enumerate(getattr(obj, "material_slots", []) or []):
+            material = slot.material
+            if material is None:
+                continue
+            data = material_values(material)
+            signature = _material_signature(data)
+            if not force and runtime["material_shadow"].get((uid, index)) == signature:
+                continue
+            session.send_material(uid, index, data)
+            _queue_material_images(material)
+            runtime["material_shadow"][(uid, index)] = signature
+    if settings is not None and not getattr(settings, "sync_modifiers", True):
+        return
     if hasattr(obj, "modifiers"):
         snapshot = modifier_snapshot(obj)
         details = object_details(obj)
+        signature = _modifier_signature(snapshot, details)
+        if not force and runtime["modifier_shadow"].get(uid) == signature:
+            return
         session.send_modifier_stack(uid, snapshot, details)
-        runtime["modifier_shadow"][uid] = _modifier_signature(snapshot, details)
+        runtime["modifier_shadow"][uid] = signature
 
 
 def _note_rev(uid: str) -> None:
@@ -3742,6 +3771,117 @@ def _pump_scene_bootstrap(context) -> None:
             del bootstraps[target]
 
 
+def _pump_auto_resync(context) -> None:
+    """Reconcile the host scene with every client on a timer.
+
+    A light sweep runs every ``auto_resync_interval`` (0.5 s on LAN, 5 s over
+    the internet) and refreshes transforms plus changed materials/modifiers.
+    A deep sweep additionally recreates missing objects and pushes full mesh
+    snapshots. Deep sweeps happen when a client reports a different scene
+    fingerprint and as a periodic safety net.
+
+    The sweep is spread across ticks so a large scene cannot stall Blender.
+    """
+    session: SessionService | None = runtime.get("session")
+    settings = context.window_manager.bmp
+    if session is None or not session.is_host or settings.paused:
+        return
+    if not getattr(settings, "auto_resync", True):
+        runtime["resync_queue"] = []
+        runtime["resync_deep"] = False
+        return
+    if not (
+        settings.sync_transforms
+        or settings.sync_mesh
+        or settings.sync_materials
+        or settings.sync_modifiers
+    ):
+        return
+    if runtime.get("bootstrapping") or runtime.get("replaying"):
+        return
+    manager = runtime.get("render_manager")
+    if runtime.get("render_busy") or (manager is not None and manager.active()):
+        return
+    now = time.monotonic()
+    queue = runtime.get("resync_queue") or []
+    if not queue:
+        interval = max(0.25, float(runtime.get("auto_resync_interval", 5.0)))
+        if now - runtime.get("last_auto_resync", 0.0) < interval:
+            return
+        peers = session.authenticated_peers()
+        if not peers:
+            settings.scene_mismatch = ""
+            runtime["resync_queue"] = []
+            runtime["resync_deep"] = False
+            return
+        runtime["last_auto_resync"] = now
+        local = runtime.get("scene_hash") or ""
+        if now - runtime.get("last_scene_hash", 0.0) >= 2.0:
+            local = _scene_fingerprint(context)
+            runtime["scene_hash"] = local
+            runtime["last_scene_hash"] = now
+        mismatch = [
+            user.name
+            for user in settings.users
+            if user.name != settings.name and user.scene_hash and user.scene_hash != local
+        ]
+        settings.scene_mismatch = ", ".join(mismatch[:4])
+        deep_interval = max(5.0, float(runtime.get("deep_resync_interval", 120.0)))
+        deep_due = now - runtime.get("last_deep_resync", 0.0) >= deep_interval
+        mismatch_due = bool(mismatch) and now - runtime.get("last_deep_resync", 0.0) >= max(
+            2.0, interval * 4.0
+        )
+        deep = deep_due or mismatch_due
+        if deep:
+            runtime["last_deep_resync"] = now
+        runtime["resync_deep"] = deep
+        runtime["resync_queue"] = [
+            obj.name for obj in context.scene.objects if not obj.get("bmp_ping")
+        ]
+        if mismatch and now - runtime.get("resync_notice_at", 0.0) > 30.0:
+            runtime["resync_notice_at"] = now
+            _push_message(context, "system", f"Auto-resyncing {len(mismatch)} client(s)")
+    queue = runtime.get("resync_queue") or []
+    if not queue:
+        runtime["resync_deep"] = False
+        return
+    deep = bool(runtime.get("resync_deep"))
+    sent = 0
+    while queue and sent < 2:
+        name = queue.pop(0)
+        obj = bpy.data.objects.get(name)
+        if obj is None or obj.get("bmp_ping"):
+            continue
+        uid = obj.get("bmp_uuid") or str(uuid.uuid4())
+        obj["bmp_uuid"] = uid
+        try:
+            if deep:
+                if obj.type == "MESH":
+                    if settings.sync_mesh:
+                        _send_object_create(session, obj, include_geometry=False)
+                elif settings.sync_transforms or settings.sync_materials or settings.sync_modifiers:
+                    _send_object_create(session, obj, include_geometry=False)
+            owner = runtime["lease_owners"].get(uid)
+            if settings.sync_transforms and owner in (None, settings.name):
+                session.send_transform(
+                    uid, [float(value) for row in obj.matrix_world for value in row]
+                )
+            _send_object_details(session, obj, force=deep)
+            if deep and obj.type == "MESH" and settings.sync_mesh:
+                mirror = runtime["mirrors"].get(uid)
+                if mirror is None:
+                    mirror = MeshMirror()
+                    runtime["mirrors"][uid] = mirror
+                payload = mirror.full_snapshot(obj.data)
+                session.send_mesh(obj, "snapshot", payload, 0)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        sent += 1
+    runtime["resync_queue"] = queue
+    if not queue:
+        runtime["resync_deep"] = False
+
+
 def _clear_scene(context, body: dict | None = None) -> None:
     try:
         if context.mode != "OBJECT" and context.active_object is not None:
@@ -4262,7 +4402,7 @@ def _apply_drivers(obj, specs) -> None:
         traceback.print_exc()
 
 
-def _object_create_payload(obj) -> dict:
+def _object_create_payload(obj, include_geometry: bool = True) -> dict:
     uid = obj.get("bmp_uuid") or str(uuid.uuid4())
     obj["bmp_uuid"] = uid
     kind = _object_kind(obj)
@@ -4303,7 +4443,7 @@ def _object_create_payload(obj) -> dict:
     except Exception:  # noqa: BLE001
         traceback.print_exc()
     geometry = b""
-    if kind == object_payload.KIND_MESH:
+    if kind == object_payload.KIND_MESH and include_geometry:
         mirror = runtime["mirrors"].get(uid)
         if mirror is None:
             mirror = MeshMirror()
@@ -4354,9 +4494,9 @@ def _object_create_payload(obj) -> dict:
     return {"uuid": uid, "kind": kind, "meta": meta, "geometry": geometry}
 
 
-def _send_object_create(session: SessionService, obj) -> bool:
+def _send_object_create(session: SessionService, obj, include_geometry: bool = True) -> bool:
     try:
-        body = _object_create_payload(obj)
+        body = _object_create_payload(obj, include_geometry=include_geometry)
     except Exception:  # noqa: BLE001
         # One malformed object (for example a UV layer that disagrees with the
         # loop count) must not abort the whole scene bootstrap and kick the
@@ -7646,10 +7786,14 @@ def _update_timing(session: SessionService | None) -> None:
         runtime["presence_interval"] = 1.0 / 30.0
         runtime["subscription_interval"] = 0.5
         runtime["stats_interval"] = 1.0
+        runtime["auto_resync_interval"] = 0.5
+        runtime["deep_resync_interval"] = 30.0
     else:
         runtime["presence_interval"] = 1.0 / (5.0 if rtt > 150.0 else 10.0)
         runtime["subscription_interval"] = 5.0
         runtime["stats_interval"] = 2.0
+        runtime["auto_resync_interval"] = 5.0
+        runtime["deep_resync_interval"] = 120.0
     runtime["transform_smooth"] = 0.018 if fast else 0.035
     runtime["mesh_smooth"] = 0.025 if fast else 0.045
     runtime["view_smooth"] = 0.045 if fast else 0.075
@@ -7737,6 +7881,7 @@ def bmp_tick():
             _safe_tick_step("sync_edit_selection", lambda: _sync_edit_selection(context))
             _safe_tick_step("sync_materials", lambda: _sync_materials(context))
             _safe_tick_step("sync_modifiers", lambda: _sync_modifiers(context))
+            _safe_tick_step("auto_resync", lambda: _pump_auto_resync(context))
             _safe_tick_step("sync_pose", lambda: _sync_pose(context))
             _safe_tick_step("sync_shape_keys", lambda: _sync_shape_keys(context))
             _safe_tick_step("sync_actions", lambda: _sync_actions(context))

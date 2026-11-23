@@ -22,7 +22,7 @@ $suites = @(
     'run_material.ps1', 'run_details.ps1', 'run_topology.ps1', 'run_resume.ps1',
     'run_checkpoint.ps1', 'run_undo.ps1', 'run_lease.ps1', 'run_lock.ps1',
     'run_animation.ps1', 'run_sculpt.ps1', 'run_collab.ps1', 'run_chunk.ps1',
-    'run_reference.ps1', 'run_render.ps1', 'run_render_tiles.ps1', 'run_foundation.ps1', 'run_mesh_relay.ps1'
+    'run_reference.ps1', 'run_render.ps1', 'run_render_tiles.ps1', 'run_resync.ps1', 'run_foundation.ps1', 'run_mesh_relay.ps1'
 )
 if ($Only) {
     $suites = @($suites | Where-Object { $_ -like "*$Only*" })

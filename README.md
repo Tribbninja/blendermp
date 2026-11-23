@@ -5,7 +5,7 @@ Blender and **docks the live window over the app viewport** (a native owned
 window, not video capture, so it keeps full GPU performance and avoids the black
 surface that cross-process re-parenting causes on some GPUs).
 
-> **Status: 0.11.21 collaboration foundation.** Hosting, the public server
+> **Status: 0.11.22 collaboration foundation.** Hosting, the public server
 > browser, TLS pinning, presence, chat, object transforms, mesh streaming, live
 > Edit Mode topology, animation, sculpt, materials/textures, asset bundles,
 > roles, checkpoints, an Ollama copilot, session recording/replay, a live
@@ -59,9 +59,12 @@ All releases: <https://github.com/Tribbninja/blendermp/releases>
   are evaluated locally from the shared action, so each user can scrub to a
   different frame. Turn on **Sync live pose/shape values** only if you want
   manual rig posing shared.
-* **Scene fingerprint + resync**: presence carries a cheap structural hash of
-  objects, types, mesh counts and material slots. If a client differs, the panel
-  warns and the host can press **Resync scene to everyone**.
+* **Scene fingerprint + automatic resync**: presence carries a cheap structural
+  hash of objects, types, mesh counts and material slots. The host reconciles
+  transforms and changed materials/modifiers every 0.5 s on LAN and every 5 s
+  over the internet, and pushes full geometry when a client's fingerprint
+  differs (or as a periodic safety net). The panel still has **Resync scene to
+  everyone** for a manual full reset.
 * **LAN render farm**: split a frame range across the room. Peers claim a frame,
   render it from their local scene and upload the PNG back to the host. It is
   LAN-only, token-protected, and rendering blocks Blender while a frame runs.
