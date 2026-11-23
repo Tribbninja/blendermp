@@ -140,7 +140,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.11.17";
+const APP_VERSION = "0.11.18";
 const PROTOCOL_VERSION = 3;
 const CAPABILITIES = 1 | (1 << 10) | (1 << 11) | (1 << 12); // presence, bookmarks, bundles, chunks
 const settings = {
@@ -1236,9 +1236,10 @@ async function startRender() {
   const step = Math.max(1, Number($("renderStep").value) || 1);
   const width = Math.max(0, Number($("renderWidth").value) || 0);
   const height = Math.max(0, Number($("renderHeight").value) || 0);
+  const engine = $("renderEngine").value || "BLENDER_EEVEE";
   const format = $("renderFormat").value || "MP4";
   try {
-    await request({ action: "render", start, end, step, width, height, format });
+    await request({ action: "render", start, end, step, width, height, engine, format });
     toast("Render requested", "ok");
   } catch (error) {
     toast(String(error), "error");

@@ -290,6 +290,11 @@ def read_session() -> dict[str, Any] | None:
         if fmt not in {"MP4", "WEBM", "PNG"}:
             return None
         result["format"] = fmt
+        engine = body.get("engine")
+        if engine is not None:
+            if engine not in {"CYCLES", "BLENDER_EEVEE", "BLENDER_EEVEE_NEXT", "BLENDER_WORKBENCH"}:
+                return None
+            result["engine"] = engine
         output = body.get("output")
         if output is not None:
             if not isinstance(output, str) or len(output) > 512 or any(ord(ch) < 32 for ch in output):

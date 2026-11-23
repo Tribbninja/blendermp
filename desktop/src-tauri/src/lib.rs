@@ -89,6 +89,7 @@ pub(crate) struct SessionRequest {
     step: Option<u32>,
     width: Option<u32>,
     height: Option<u32>,
+    engine: Option<String>,
     format: Option<String>,
     job: Option<String>,
     accept: Option<bool>,
@@ -1323,6 +1324,14 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
             return Err("invalid render format".into());
         }
     }
+    if let Some(engine) = &request.engine {
+        if !matches!(
+            engine.as_str(),
+            "CYCLES" | "BLENDER_EEVEE" | "BLENDER_EEVEE_NEXT" | "BLENDER_WORKBENCH"
+        ) {
+            return Err("invalid render engine".into());
+        }
+    }
     if let Some(job) = &request.job {
         if job.len() > 32 || !job.chars().all(|ch| ch.is_ascii_alphanumeric()) {
             return Err("invalid render job id".into());
@@ -1402,6 +1411,7 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
         "step": request.step,
         "width": request.width,
         "height": request.height,
+        "engine": request.engine,
         "format": request.format,
         "job": request.job,
         "accept": request.accept,

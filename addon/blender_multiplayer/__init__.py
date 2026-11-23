@@ -74,7 +74,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 11, 17),
+    "version": (0, 11, 18),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -434,6 +434,7 @@ class BMPState(PropertyGroup):
     farm_client_url: StringProperty(name="Farm URL", default="")
     farm_client_token: StringProperty(name="Farm token", default="")
     farm_cpu_percent: IntProperty(name="Render CPU percent", default=80, min=10, max=100)
+    farm_hybrid: BoolProperty(name="Use CPU + GPU (Cycles)", default=False)
     render_progress: StringProperty(name="Render progress", default="")
     render_request: StringProperty(name="Render request", default="")
     host_name: StringProperty()
@@ -3102,6 +3103,7 @@ def _poll_control(context) -> None:
                 request.get("output", ""),
                 request.get("width", 0),
                 request.get("height", 0),
+                request.get("engine", ""),
             )
         elif action == "render_stop":
             _stop_session_render(context)
@@ -8773,7 +8775,7 @@ def _render_progress_text(status: dict) -> str:
     return text
 
 
-def _start_session_render(context, start, end, step, format_hint, output, width=0, height=0) -> None:
+def _start_session_render(context, start, end, step, format_hint, output, width=0, height=0, engine_override="") -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
     # The session is the source of truth. Loading a .blend can reset the
@@ -8791,6 +8793,7 @@ def _start_session_render(context, start, end, step, format_hint, output, width=
     out_dir = output or str(control.data_dir() / "render")
     job_width = int(width) if int(width or 0) > 0 else int(scene.render.resolution_x)
     job_height = int(height) if int(height or 0) > 0 else int(scene.render.resolution_y)
+    job_engine = str(engine_override or scene.render.engine)[:32]
     job = manager.create(
         name=f"Render {int(start)}-{int(end)}",
         start=int(start),
@@ -8799,7 +8802,7 @@ def _start_session_render(context, start, end, step, format_hint, output, width=
         width=job_width,
         height=job_height,
         format_hint="PNG",
-        engine=str(scene.render.engine),
+        engine=job_engine,
         output_dir=out_dir,
         fps=int(getattr(scene.render, "fps", 24) or 24),
     )
@@ -8916,6 +8919,7 @@ def _handle_render_control(context, event: dict) -> None:
         runtime["render_width"] = int(message.get("width", 0) or 0)
         runtime["render_height"] = int(message.get("height", 0) or 0)
         runtime["render_engine"] = str(message.get("engine", ""))[:32]
+        runtime["render_engine_override"] = str(message.get("engine", ""))[:32]
         eventlog.log("info", "RENDER_RECEIVED", "request", job=job_id)
         _push_message(context, "system", f"{message.get('name', 'Host')} asked you to join a render")
         lines = [
@@ -8983,7 +8987,60 @@ def _handle_render_frame(context, event: dict) -> None:
     _write_status(context, force=True)
 
 
-def _render_session_frame(context, frame: int, width: int = 0, height: int = 0) -> tuple[bool, str, bytes]:
+def _configure_cycles_hybrid(scene) -> dict:
+    """Enable CPU + GPU compute for a Cycles render.
+
+    Cycles lists the CPU as a device alongside the GPUs; enabling both and
+    switching the scene to GPU makes Cycles use them together. The previous
+    preference state is returned so it can be restored afterwards.
+    """
+    token = {"mode": None, "device": None, "use": {}}
+    try:
+        addon = bpy.context.preferences.addons.get("cycles")
+        if addon is None:
+            return token
+        prefs = addon.preferences
+        token["mode"] = prefs.compute_device_type
+        token["device"] = scene.cycles.device
+        if not prefs.devices:
+            for kind in ("OPTIX", "CUDA", "HIP", "ONEAPI"):
+                try:
+                    prefs.compute_device_type = kind
+                    prefs.get_devices()
+                except Exception:  # noqa: BLE001
+                    continue
+                if any(device.type != "CPU" for device in prefs.devices):
+                    break
+        gpus = [device for device in prefs.devices if device.type != "CPU"]
+        if not gpus:
+            return token
+        for device in prefs.devices:
+            token["use"][device.name] = device.use
+            device.use = True
+        scene.cycles.device = "GPU"
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+    return token
+
+
+def _restore_cycles_hybrid(scene, token: dict) -> None:
+    try:
+        addon = bpy.context.preferences.addons.get("cycles")
+        if addon is None:
+            return
+        prefs = addon.preferences
+        for device in prefs.devices:
+            if device.name in token.get("use", {}):
+                device.use = token["use"][device.name]
+        if token.get("mode"):
+            prefs.compute_device_type = token["mode"]
+        if token.get("device"):
+            scene.cycles.device = token["device"]
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _render_session_frame(context, frame: int, width: int = 0, height: int = 0, engine: str = "") -> tuple[bool, str, bytes]:
     scene = context.scene
     old_frame = scene.frame_current
     old_path = scene.render.filepath
@@ -8993,6 +9050,7 @@ def _render_session_frame(context, frame: int, width: int = 0, height: int = 0) 
     old_pct = scene.render.resolution_percentage
     old_threads_mode = scene.render.threads_mode
     old_threads = scene.render.threads
+    old_engine = scene.render.engine
     settings = context.window_manager.bmp
     try:
         percent = int(getattr(settings, "farm_cpu_percent", 80) or 80)
@@ -9000,15 +9058,25 @@ def _render_session_frame(context, frame: int, width: int = 0, height: int = 0) 
         percent = 80
     percent = max(10, min(100, percent))
     threads = max(1, int((os.cpu_count() or 4) * (percent / 100.0)))
+    requested_engine = str(engine or "").strip()
     handle, path = tempfile.mkstemp(suffix=".png")
     os.close(handle)
+    hybrid_token = None
     try:
+        if requested_engine and requested_engine != scene.render.engine:
+            try:
+                scene.render.engine = requested_engine
+            except (TypeError, ValueError):
+                pass
         scene.frame_set(int(frame))
         scene.render.filepath = path
         scene.render.image_settings.file_format = "PNG"
         # Cycles uses this thread budget; EEVEE is GPU-bound and ignores it.
         scene.render.threads_mode = "FIXED"
         scene.render.threads = threads
+        # Cycles: use the CPU and every GPU together.
+        if scene.render.engine == "CYCLES":
+            hybrid_token = _configure_cycles_hybrid(scene)
         if width and height:
             scene.render.resolution_x = int(width)
             scene.render.resolution_y = int(height)
@@ -9022,6 +9090,12 @@ def _render_session_frame(context, frame: int, width: int = 0, height: int = 0) 
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)[:200], b""
     finally:
+        if hybrid_token is not None:
+            _restore_cycles_hybrid(scene, hybrid_token)
+        try:
+            scene.render.engine = old_engine
+        except (TypeError, ValueError):
+            pass
         try:
             scene.frame_set(old_frame)
         except Exception:  # noqa: BLE001
@@ -9100,7 +9174,7 @@ def _pump_session_render(context) -> None:
             if frames:
                 runtime["render_busy"] = True
                 try:
-                    ok, error, data = _render_session_frame(context, frames[0], job.width, job.height)
+                    ok, error, data = _render_session_frame(context, frames[0], job.width, job.height, job.engine)
                     if ok:
                         path = renderjob.write_frame(job.output_dir, frames[0], job.format, data)
                         manager.complete(frames[0], settings.name or "host", path)
@@ -9151,6 +9225,7 @@ def _pump_session_render(context) -> None:
                 frame,
                 int(runtime.get("render_width", 0) or 0),
                 int(runtime.get("render_height", 0) or 0),
+                str(runtime.get("render_engine_override", "")),
             )
             if ok:
                 session.send_render_frame(

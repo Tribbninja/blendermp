@@ -150,6 +150,12 @@
             <div class="render-range">
               <label>Width <input id="renderWidth" type="number" value="0" min="0" max="16384" /></label>
               <label>Height <input id="renderHeight" type="number" value="0" min="0" max="16384" /></label>
+              <label>Engine
+                <select id="renderEngine">
+                  <option value="BLENDER_EEVEE">EEVEE (GPU)</option>
+                  <option value="CYCLES">Cycles (CPU + GPU)</option>
+                </select>
+              </label>
               <label>Format
                 <select id="renderFormat">
                   <option value="MP4">MP4</option>
@@ -339,7 +345,7 @@
         <span id="statusLeft">Ready</span>
         <span class="grow"></span>
         <span id="statusMid"></span>
-        <span id="statusRight">v0.11.17</span>
+        <span id="statusRight">v0.11.18</span>
       </div>
     </main>
     </section>
