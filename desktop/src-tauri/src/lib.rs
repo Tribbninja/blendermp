@@ -43,8 +43,20 @@ struct AppState {
     embedded: Mutex<Option<win_embed::EmbedInfo>>,
     #[cfg(not(windows))]
     embedded: Mutex<Option<()>>,
-    directory: Option<directory::DirectoryHandle>,
+    directory: Mutex<Option<directory::DirectoryHandle>>,
     ui_ready: std::sync::atomic::AtomicBool,
+}
+
+fn ensure_directory(state: &State<AppState>) -> Option<directory::DirectoryHandle> {
+    // The dashboard/LAN directory is started on first use (hosting, opening the
+    // dashboard, or browsing servers) rather than at process start. A brand-new
+    // unsigned app that immediately opens a listening socket and broadcasts on
+    // UDP looks like a backdoor to antivirus behaviour heuristics.
+    let mut guard = state.directory.lock().ok()?;
+    if guard.is_none() {
+        *guard = directory::start();
+    }
+    guard.clone()
 }
 
 #[derive(Deserialize, Serialize, Clone, Copy)]
@@ -592,27 +604,42 @@ fn launch_blender(state: State<AppState>, path: String, blend_file: Option<Strin
 
     let root = addon_root().ok_or_else(|| "addon folder not found; set BMP_ADDON_ROOT".to_string())?;
     let root_text = root.to_string_lossy().to_string();
-    if root_text.contains('\'') || root_text.contains('\n') || root_text.contains('\r') {
-        return Err("addon path contains unsupported characters".into());
-    }
-
     // A previously enabled copy (for example a development checkout) can win
     // over the addon bundled with the app. Disable any loaded copy, drop its
     // modules, then load the bundled addon from the front of sys.path.
-    let expression = format!(
-        "import sys,bpy; sys.path.insert(0,r'{root_text}'); \
-         mod='blender_multiplayer'; \
-         (bpy.ops.preferences.addon_disable(module=mod) if mod in bpy.context.preferences.addons else None); \
-         _old=sys.modules.get(mod); \
-         (_old.unregister() if _old is not None and hasattr(_old, 'unregister') else None); \
-         bpy._blendermp_active=False; \
-         [sys.modules.pop(name) for name in list(sys.modules) if name == mod or name.startswith(mod + '.')]; \
-         bpy.ops.preferences.addon_enable(module=mod); \
-         import blender_multiplayer as _bmp; print('BMP_ADDON=' + str(_bmp.__file__), flush=True)"
+    //
+    // This lives in a small bootstrap file instead of an inline --python-expr:
+    // it keeps the Blender command line short and avoids the "spawns a process
+    // with inline script" pattern that antivirus heuristics dislike.
+    let root_literal = serde_json::to_string(&root_text).map_err(|error| error.to_string())?;
+    let bootstrap = format!(
+        "import sys\n\
+         import bpy\n\
+         \n\
+         root = {root_literal}\n\
+         if root not in sys.path:\n\
+         \x20   sys.path.insert(0, root)\n\
+         mod = \"blender_multiplayer\"\n\
+         if mod in bpy.context.preferences.addons:\n\
+         \x20   bpy.ops.preferences.addon_disable(module=mod)\n\
+         old = sys.modules.get(mod)\n\
+         if old is not None and hasattr(old, \"unregister\"):\n\
+         \x20   old.unregister()\n\
+         bpy._blendermp_active = False\n\
+         for name in list(sys.modules):\n\
+         \x20   if name == mod or name.startswith(mod + \".\"):\n\
+         \x20       sys.modules.pop(name)\n\
+         bpy.ops.preferences.addon_enable(module=mod)\n\
+         import blender_multiplayer as _bmp\n\
+         print(\"BMP_ADDON=\" + str(_bmp.__file__), flush=True)\n"
     );
+    fs::create_dir_all(data_dir()).map_err(|error| error.to_string())?;
+    let bootstrap_path = data_dir().join("bootstrap.py");
+    fs::write(&bootstrap_path, bootstrap)
+        .map_err(|error| format!("could not write the Blender bootstrap: {error}"))?;
 
     let mut command = Command::new(&exe);
-    command.arg("--python-expr").arg(expression);
+    command.arg("--python").arg(&bootstrap_path);
     ensure_python_vendor();
     let mut python_paths = python_vendor_paths();
     if let Some(existing) = std::env::var_os("PYTHONPATH") {
@@ -1090,58 +1117,146 @@ fn tail_log(path: &Path, max_lines: usize) -> String {
 fn gpu_names() -> String {
     #[cfg(windows)]
     {
-        if let Ok(output) = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "(Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name) -join '; '",
-            ])
-            .output()
-        {
-            if output.status.success() {
-                let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !text.is_empty() {
-                    return text.chars().take(300).collect();
-                }
+        use windows_sys::Win32::Graphics::Gdi::{EnumDisplayDevicesW, DISPLAY_DEVICEW};
+        let mut names: Vec<String> = Vec::new();
+        let mut index = 0u32;
+        loop {
+            let mut device: DISPLAY_DEVICEW = unsafe { std::mem::zeroed() };
+            device.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+            let ok = unsafe { EnumDisplayDevicesW(std::ptr::null(), index, &mut device, 0) };
+            if ok == 0 {
+                break;
             }
+            let end = device
+                .DeviceString
+                .iter()
+                .position(|&value| value == 0)
+                .unwrap_or(device.DeviceString.len());
+            let name = String::from_utf16_lossy(&device.DeviceString[..end])
+                .trim()
+                .to_string();
+            if !name.is_empty() && !names.iter().any(|existing| existing == &name) {
+                names.push(name);
+            }
+            index += 1;
+            if index > 32 {
+                break;
+            }
+        }
+        if !names.is_empty() {
+            return names.join("; ").chars().take(300).collect();
         }
     }
     "unknown".into()
 }
 
-fn run_zip(stage: &Path, destination: &Path) -> Result<(), String> {
-    let status = Command::new("tar")
-        .arg("-a")
-        .arg("-c")
-        .arg("-f")
-        .arg(destination)
-        .arg("-C")
-        .arg(stage)
-        .arg(".")
-        .status();
-    if let Ok(status) = status {
-        if status.success() && destination.is_file() {
-            return Ok(());
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
         }
     }
-    let pattern = format!("{}/*", stage.display());
-    let status = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Compress-Archive -Force -Path $args[0] -DestinationPath $args[1]",
-        ])
-        .arg(pattern)
-        .arg(destination)
-        .status()
-        .map_err(|error| error.to_string())?;
-    if status.success() && destination.is_file() {
+    !crc
+}
+
+fn zip_entries(root: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
+    fn walk(root: &Path, current: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Result<(), String> {
+        let entries = fs::read_dir(current).map_err(|error| error.to_string())?;
+        for entry in entries {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, out)?;
+            } else if path.is_file() {
+                let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
+                let name = relative
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let data = fs::read(&path).map_err(|error| error.to_string())?;
+                out.push((name, data));
+            }
+        }
         Ok(())
-    } else {
-        Err("could not create the diagnostics archive".into())
     }
+    let mut out = Vec::new();
+    walk(root, root, &mut out)?;
+    out.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(out)
+}
+
+fn write_u16(buffer: &mut Vec<u8>, value: u16) {
+    buffer.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32(buffer: &mut Vec<u8>, value: u32) {
+    buffer.extend_from_slice(&value.to_le_bytes());
+}
+
+fn run_zip(stage: &Path, destination: &Path) -> Result<(), String> {
+    // A tiny stored (uncompressed) ZIP writer. Diagnostics are small JSON and
+    // text files, so this avoids spawning tar/PowerShell and keeps the app free
+    // of dropper-like process behaviour.
+    let files = zip_entries(stage)?;
+    let mut body: Vec<u8> = Vec::new();
+    let mut central: Vec<u8> = Vec::new();
+    let mut offsets: Vec<u32> = Vec::with_capacity(files.len());
+    for (name, data) in &files {
+        offsets.push(body.len() as u32);
+        let checksum = crc32(data);
+        let name_bytes = name.as_bytes();
+        write_u32(&mut body, 0x0403_4b50);
+        write_u16(&mut body, 20);
+        write_u16(&mut body, 0x0800);
+        write_u16(&mut body, 0);
+        write_u16(&mut body, 0);
+        write_u16(&mut body, 0);
+        write_u32(&mut body, checksum);
+        write_u32(&mut body, data.len() as u32);
+        write_u32(&mut body, data.len() as u32);
+        write_u16(&mut body, name_bytes.len() as u16);
+        write_u16(&mut body, 0);
+        body.extend_from_slice(name_bytes);
+        body.extend_from_slice(data);
+    }
+    let central_offset = body.len() as u32;
+    for (index, (name, data)) in files.iter().enumerate() {
+        let checksum = crc32(data);
+        let name_bytes = name.as_bytes();
+        write_u32(&mut central, 0x0201_4b50);
+        write_u16(&mut central, 20);
+        write_u16(&mut central, 20);
+        write_u16(&mut central, 0x0800);
+        write_u16(&mut central, 0);
+        write_u16(&mut central, 0);
+        write_u16(&mut central, 0);
+        write_u32(&mut central, checksum);
+        write_u32(&mut central, data.len() as u32);
+        write_u32(&mut central, data.len() as u32);
+        write_u16(&mut central, name_bytes.len() as u16);
+        write_u16(&mut central, 0);
+        write_u16(&mut central, 0);
+        write_u16(&mut central, 0);
+        write_u16(&mut central, 0);
+        write_u32(&mut central, 0);
+        write_u32(&mut central, offsets[index]);
+        central.extend_from_slice(name_bytes);
+    }
+    let central_size = central.len() as u32;
+    body.extend_from_slice(&central);
+    write_u32(&mut body, 0x0605_4b50);
+    write_u16(&mut body, 0);
+    write_u16(&mut body, 0);
+    write_u16(&mut body, files.len() as u16);
+    write_u16(&mut body, files.len() as u16);
+    write_u32(&mut body, central_size);
+    write_u32(&mut body, central_offset);
+    write_u16(&mut body, 0);
+    fs::write(destination, &body).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1235,9 +1350,7 @@ fn export_diagnostics(app: tauri::AppHandle) -> Result<String, String> {
 
 #[tauri::command]
 fn open_dashboard(state: State<AppState>) -> Result<(), String> {
-    let handle = state
-        .directory
-        .as_ref()
+    let handle = ensure_directory(&state)
         .ok_or_else(|| "local dashboard server is unavailable".to_string())?;
     let url = format!(
         "http://127.0.0.1:{}/dashboard/?token={}",
@@ -1245,12 +1358,36 @@ fn open_dashboard(state: State<AppState>) -> Result<(), String> {
     );
     log_client(format!("opening dashboard on port {}", handle.port));
     #[cfg(windows)]
-    let spawned = Command::new("cmd").args(["/C", "start", "", &url]).spawn();
-    #[cfg(target_os = "macos")]
-    let spawned = Command::new("open").arg(&url).spawn();
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let spawned = Command::new("xdg-open").arg(&url).spawn();
-    spawned.map(|_| ()).map_err(|error| format!("could not open browser: {error}"))
+    {
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let operation: Vec<u16> = "open\0".encode_utf16().collect();
+        let file: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                operation.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if (result as isize) <= 32 {
+            return Err("could not open browser".into());
+        }
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        #[cfg(target_os = "macos")]
+        let spawned = Command::new("open").arg(&url).spawn();
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let spawned = Command::new("xdg-open").arg(&url).spawn();
+        spawned
+            .map(|_| ())
+            .map_err(|error| format!("could not open browser: {error}"))
+    }
 }
 
 #[tauri::command]
@@ -1444,7 +1581,7 @@ pub(crate) fn write_session_from_dashboard(request: SessionRequest) -> Result<()
 
 #[tauri::command]
 fn local_directory(state: State<AppState>) -> Option<serde_json::Value> {
-    let handle = state.directory.as_ref()?;
+    let handle = ensure_directory(&state)?;
     Some(serde_json::json!({
         "local": format!("http://127.0.0.1:{}", handle.port),
         "lan": format!("http://{}:{}", directory::lan_ip(), handle.port),
@@ -1498,12 +1635,11 @@ pub fn run() {
     }
     let _instance = instance;
 
-    let directory_server = directory::start();
     tauri::Builder::default()
         .manage(AppState {
             blender_pid: Mutex::new(None),
             embedded: Mutex::new(None),
-            directory: directory_server,
+            directory: Mutex::new(None),
             ui_ready: std::sync::atomic::AtomicBool::new(false),
         })
         .setup(|app| {
@@ -1667,6 +1803,29 @@ mod tests {
         assert_eq!(percent_decode("hello%20world"), "hello world");
         assert_eq!(percent_decode("a+b"), "a b");
         assert_eq!(percent_decode("%zz"), "%zz");
+    }
+
+    #[test]
+    fn crc32_matches_the_standard_check_value() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn diagnostics_zip_is_a_valid_archive() {
+        let directory = std::env::temp_dir().join(format!("bmp-zip-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(directory.join("sub")).unwrap();
+        fs::write(directory.join("status.json"), b"{\"ok\":true}").unwrap();
+        fs::write(directory.join("sub").join("log.txt"), b"hello").unwrap();
+        let archive = directory.join("out.zip");
+        run_zip(&directory, &archive).unwrap();
+        let data = fs::read(&archive).unwrap();
+        assert_eq!(&data[0..4], b"PK\x03\x04");
+        assert!(data.windows(4).any(|window| window == b"PK\x01\x02"));
+        assert!(data.windows(4).any(|window| window == b"PK\x05\x06"));
+        assert!(data.windows(11).any(|window| window == b"status.json"));
+        assert!(data.windows(11).any(|window| window == b"sub/log.txt"));
+        let _ = fs::remove_dir_all(&directory);
     }
 }
 

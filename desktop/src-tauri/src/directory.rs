@@ -47,6 +47,7 @@ struct Entry {
     seen: Instant,
 }
 
+#[derive(Clone)]
 pub struct DirectoryHandle {
     pub port: u16,
     pub token: String,

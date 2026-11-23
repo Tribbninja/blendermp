@@ -140,7 +140,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.11.20";
+const APP_VERSION = "0.11.21";
 const PROTOCOL_VERSION = 3;
 const CAPABILITIES = 1 | (1 << 10) | (1 << 11) | (1 << 12); // presence, bookmarks, bundles, chunks
 const settings = {
@@ -1299,6 +1299,7 @@ async function hostRoom() {
     toast("Set the Blender path first", "error");
     return;
   }
+  await ensureLocalDirectory();
   settings.serverName = $("serverName").value.trim() || `${settings.name}'s server`;
   settings.public = $("serverPublic").checked;
   settings.pin = $("serverPassword").value;
@@ -1417,6 +1418,24 @@ async function kickPlayer(name) {
 }
 
 /* ------------------------------------------------------------------ servers */
+async function ensureLocalDirectory() {
+  // Start the in-process dashboard/LAN directory only when the user hosts,
+  // opens the dashboard, or browses servers. Starting it during app boot made
+  // a fresh unsigned build look like a listening backdoor to antivirus
+  // behaviour heuristics.
+  if (!isTauri || state.localDirectory) return;
+  try {
+    const directory = await invoke("local_directory");
+    if (directory) {
+      state.localDirectory = directory.local || "";
+      state.lanDirectory = directory.lan || "";
+      log(`app directory: ${state.localDirectory} / ${state.lanDirectory}`);
+    }
+  } catch (error) {
+    log(`local directory unavailable: ${error}`);
+  }
+}
+
 async function discoverDirectories() {
   if (!isTauri) return;
   try {
@@ -1429,6 +1448,7 @@ async function discoverDirectories() {
 }
 
 async function refreshServerBrowser() {
+  await ensureLocalDirectory();
   await discoverDirectories();
   await loadServers();
 }
@@ -2006,17 +2026,6 @@ async function boot() {
     applyStatus(demoStatus);
     renderEmbed();
     return;
-  }
-
-  try {
-    const directory = await invoke("local_directory");
-    if (directory) {
-      state.localDirectory = directory.local || "";
-      state.lanDirectory = directory.lan || "";
-      log(`app directory: ${state.localDirectory} / ${state.lanDirectory}`);
-    }
-  } catch (error) {
-    log(`local directory unavailable: ${error}`);
   }
 
   await detectBlender();
