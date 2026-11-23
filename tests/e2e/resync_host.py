@@ -41,7 +41,39 @@ if bsdf is not None:
     bsdf.inputs["Base Color"].default_value = (0.8, 0.1, 0.1, 1.0)
 cube.data.materials.append(material)
 
-PORT = 52478
+group = bpy.data.node_groups.new("ResyncGeo", "GeometryNodeTree")
+group.interface.new_socket("Value", in_out="INPUT", socket_type="NodeSocketFloat")
+geo = cube.modifiers.new("Geo", "NODES")
+geo.node_group = group
+try:
+    geo.properties.inputs.Socket_0.value = 0.75
+except Exception:  # noqa: BLE001
+    pass
+cube["ResyncProp"] = 0.5
+
+bpy.ops.object.camera_add(location=(5.0, -5.0, 5.0))
+camera = context.active_object
+camera.name = "ResyncCamera"
+camera.data.lens = 50.0
+context.scene.camera = camera
+
+bpy.ops.object.light_add(type="POINT", location=(3.0, 3.0, 3.0))
+light = context.active_object
+light.name = "ResyncLight"
+light.data.energy = 100.0
+
+context.scene.render.resolution_x = 64
+context.scene.render.resolution_y = 64
+context.scene.render.resolution_percentage = 100
+if context.scene.world is None:
+    context.scene.world = bpy.data.worlds.new("ResyncWorld")
+context.scene.world.use_nodes = True
+background = context.scene.world.node_tree.nodes.get("Background")
+if background is not None:
+    background.inputs["Color"].default_value = (0.2, 0.4, 0.8, 1.0)
+    background.inputs["Strength"].default_value = 1.0
+
+PORT = 52479
 code = encode_room("127.0.0.1", PORT)
 bmp.start_host(context, code=code, port=PORT)
 start = time.monotonic()

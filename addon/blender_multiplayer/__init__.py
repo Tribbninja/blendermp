@@ -74,7 +74,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 11, 22),
+    "version": (0, 11, 23),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -603,7 +603,7 @@ def start_host(
         return
     # Keep the previous session's late events out of this one. They used to land
     # in a shared inbox and overwrite the fresh state with "offline".
-    stop_session(context, publish=False)
+    stop_session(context, publish=False, preserve_render=True)
     inbox = queue.Queue()
     runtime["inbox"] = inbox
     from .core.roomcode import FLAG_PIN, FLAG_RELAY, encode_room, room_id
@@ -688,6 +688,7 @@ def start_host(
     _upsert_user(context, name, tuple(settings.color), host=True)
     _push_message(context, "system", f"Hosting room {code}")
     eventlog.log("info", "HOST_START", "hosting", room=code, relay=bool(relay))
+    _restore_render_job(context)
     _ensure_timer()
 
 
@@ -795,7 +796,7 @@ def _ensure_timer() -> None:
 
 
 
-def stop_session(context, publish: bool = True) -> None:
+def stop_session(context, publish: bool = True, preserve_render: bool = False) -> None:
     session = runtime.get("session")
     if session:
         try:
@@ -815,7 +816,10 @@ def stop_session(context, publish: bool = True) -> None:
     manager = runtime.get("render_manager")
     if manager is not None:
         try:
-            manager.cancel()
+            if preserve_render:
+                manager.save(force=True)
+            else:
+                manager.cancel()
         except Exception:  # noqa: BLE001
             pass
     runtime["render_manager"] = None
@@ -1028,6 +1032,9 @@ def _handle_event(context, kind: str, body: dict) -> None:
         runtime["bootstrap_deadline"] = time.monotonic() + 30.0
         _push_message(context, "system", "Replacing local scene with the host's")
     elif kind == "scene_ready":
+        if body.get("settings_only"):
+            _apply_scene_settings(context, body)
+            return
         target = body.get("target")
         if target and target != settings.name:
             return
@@ -2473,6 +2480,28 @@ def modifier_snapshot(obj) -> list:
                 props["node_group"] = mod.node_group.name if mod.node_group else ""
             except AttributeError:
                 props["node_group"] = ""
+            try:
+                inputs = mod.properties.inputs
+                node_inputs = {}
+                for prop in inputs.bl_rna.properties:
+                    if prop.identifier == "rna_type":
+                        continue
+                    try:
+                        item = getattr(inputs, prop.identifier)
+                    except AttributeError:
+                        continue
+                    if not hasattr(item, "bl_rna"):
+                        continue
+                    try:
+                        value = item.value
+                    except AttributeError:
+                        continue
+                    if isinstance(value, (bool, int, float, str)):
+                        node_inputs[prop.identifier] = value
+                if node_inputs:
+                    props["node_inputs"] = node_inputs
+            except Exception:  # noqa: BLE001
+                pass
         if mod.type in {"ARMATURE", "LATTICE", "CURVE", "HOOK", "SURFACE_DEFORM", "MESH_DEFORM", "BOOLEAN"}:
             target = getattr(mod, "object", None)
             if target is not None and target.get("bmp_uuid"):
@@ -2538,6 +2567,25 @@ def object_details(obj) -> dict:
         constraints.append(item)
     if constraints:
         details["constraints"] = constraints
+    custom = {}
+    try:
+        for key in list(obj.keys())[:64]:
+            if not isinstance(key, str) or not key or key.startswith("bmp_"):
+                continue
+            value = obj[key]
+            if isinstance(value, (bool, int, float, str)):
+                custom[key[:64]] = value
+            elif isinstance(value, (list, tuple)) and len(value) <= 4 and all(
+                isinstance(item, (int, float)) and not isinstance(item, bool)
+                for item in value
+            ):
+                custom[key[:64]] = list(value)
+            if len(custom) >= 32:
+                break
+    except Exception:  # noqa: BLE001
+        pass
+    if custom:
+        details["custom_props"] = custom
     return details
 
 
@@ -2720,6 +2768,21 @@ def _apply_object_details(obj, details) -> None:
                     constraint.subtarget = subtarget
             except (AttributeError, TypeError, ValueError, RuntimeError):
                 pass
+    custom = details.get("custom_props")
+    if isinstance(custom, dict):
+        for key, value in list(custom.items())[:32]:
+            if not isinstance(key, str) or not key or key.startswith("bmp_"):
+                continue
+            try:
+                if isinstance(value, (bool, int, float, str)):
+                    obj[key] = value
+                elif isinstance(value, list) and len(value) <= 4 and all(
+                    isinstance(item, (int, float)) and not isinstance(item, bool)
+                    for item in value
+                ):
+                    obj[key] = value
+            except (TypeError, ValueError, RuntimeError):
+                pass
 
 
 def _apply_modifier_stack(context, body: dict) -> None:
@@ -2773,6 +2836,21 @@ def _apply_modifier_stack(context, body: dict) -> None:
                         mod.object = target
                     except Exception:  # noqa: BLE001
                         pass
+                continue
+            if key == "node_inputs" and isinstance(value, dict):
+                try:
+                    inputs = mod.properties.inputs
+                    for identifier, input_value in value.items():
+                        if not isinstance(input_value, (bool, int, float, str)):
+                            continue
+                        target = getattr(inputs, str(identifier), None)
+                        if target is not None:
+                            try:
+                                target.value = input_value
+                            except (AttributeError, TypeError, ValueError):
+                                pass
+                except Exception:  # noqa: BLE001
+                    pass
                 continue
             try:
                 setattr(mod, key, value)
@@ -3552,6 +3630,45 @@ def _apply_world_render(context, world_values, render_values) -> None:
                     pass
 
 
+def _apply_scene_settings(context, body: dict) -> None:
+    """Apply live world/render/camera/light changes from the host."""
+    _apply_world_render(context, body.get("world"), body.get("render"))
+    camera_uid = body.get("camera")
+    if isinstance(camera_uid, str):
+        camera = obj_sync.find(camera_uid)
+        if camera is not None:
+            try:
+                context.scene.camera = camera
+            except Exception:  # noqa: BLE001
+                pass
+    updates = body.get("objects")
+    if not isinstance(updates, list):
+        return
+    for item in updates[:256]:
+        if not isinstance(item, dict):
+            continue
+        obj = obj_sync.find(item.get("uid"))
+        if obj is None:
+            continue
+        kind = item.get("kind")
+        try:
+            if kind == "camera" and obj.type == "CAMERA":
+                for key in ("lens", "sensor_width", "clip_start", "clip_end"):
+                    if key in item:
+                        setattr(obj.data, key, float(item[key]))
+            elif kind == "light" and obj.type == "LIGHT":
+                if "energy" in item:
+                    obj.data.energy = float(item["energy"])
+                for key in ("shadow_soft_size", "spot_size", "spot_blend"):
+                    if key in item:
+                        setattr(obj.data, key, float(item[key]))
+                color = item.get("color")
+                if isinstance(color, list) and len(color) >= 3:
+                    obj.data.color = tuple(float(value) for value in color[:3])
+        except (AttributeError, TypeError, ValueError):
+            continue
+
+
 def _checkpoint_scene(context) -> dict:
     objects = []
     for obj in context.scene.objects:
@@ -3718,6 +3835,51 @@ def _render_snapshot(context) -> dict:
     }
 
 
+def _scene_settings_payload(context) -> dict:
+    scene = context.scene
+    camera = scene.camera
+    camera_uid = None
+    if camera is not None:
+        camera_uid = camera.get("bmp_uuid") or str(uuid.uuid4())
+        camera["bmp_uuid"] = camera_uid
+    objects = []
+    for obj in scene.objects:
+        if obj.get("bmp_ping"):
+            continue
+        if obj.type not in {"CAMERA", "LIGHT"}:
+            continue
+        uid = obj.get("bmp_uuid") or str(uuid.uuid4())
+        obj["bmp_uuid"] = uid
+        if obj.type == "CAMERA":
+            item = {"uid": uid, "kind": "camera"}
+            for key in ("lens", "sensor_width", "clip_start", "clip_end"):
+                try:
+                    item[key] = float(getattr(obj.data, key))
+                except (AttributeError, TypeError, ValueError):
+                    pass
+            objects.append(item)
+        else:
+            item = {"uid": uid, "kind": "light"}
+            for key in ("energy", "shadow_soft_size", "spot_size", "spot_blend"):
+                try:
+                    item[key] = float(getattr(obj.data, key))
+                except (AttributeError, TypeError, ValueError):
+                    pass
+            try:
+                item["color"] = [float(value) for value in obj.data.color[:3]]
+            except (AttributeError, TypeError, ValueError):
+                pass
+            objects.append(item)
+        if len(objects) >= 256:
+            break
+    return {
+        "world": _world_values(scene.world),
+        "render": _render_snapshot(context),
+        "camera": camera_uid,
+        "objects": objects,
+    }
+
+
 def _queue_scene_bootstrap(context, target: str) -> None:
     session: SessionService | None = runtime.get("session")
     if session is None or not session.is_host:
@@ -3835,6 +3997,17 @@ def _pump_auto_resync(context) -> None:
         if deep:
             runtime["last_deep_resync"] = now
         runtime["resync_deep"] = deep
+        try:
+            settings_body = _scene_settings_payload(context)
+            signature = hashlib.blake2b(
+                json.dumps(settings_body, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+                digest_size=8,
+            ).hexdigest()
+            if deep or signature != runtime.get("scene_settings_sig"):
+                runtime["scene_settings_sig"] = signature
+                session.send_scene_settings(settings_body)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
         runtime["resync_queue"] = [
             obj.name for obj in context.scene.objects if not obj.get("bmp_ping")
         ]
@@ -8903,9 +9076,57 @@ def _pump_renderfarm(context) -> None:
 def _render_manager():
     manager = runtime.get("render_manager")
     if manager is None:
-        manager = renderjob.RenderManager()
+        manager = renderjob.RenderManager(
+            persist_path=control.data_dir() / "render_job.json"
+        )
         runtime["render_manager"] = manager
     return manager
+
+
+def _restore_render_job(context) -> None:
+    """Resume an unfinished host render after Blender or the host restarted."""
+    session: SessionService | None = runtime.get("session")
+    if session is None or not session.is_host:
+        return
+    settings = context.window_manager.bmp
+    manager = _render_manager()
+    if manager.job() is not None:
+        return
+    if not manager.load():
+        return
+    job = manager.job()
+    if job is None:
+        return
+    try:
+        Path(job.output_dir).mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    runtime["render_job_id"] = job.id
+    runtime["render_output"] = job.output_dir
+    runtime["render_format"] = job.format
+    runtime["render_engine"] = job.engine
+    runtime["render_engine_override"] = job.engine
+    runtime["render_tiles_x"] = job.tiles_x
+    runtime["render_tiles_y"] = job.tiles_y
+    runtime["render_width"] = job.width
+    runtime["render_height"] = job.height
+    status = manager.status()
+    settings.render_progress = _render_progress_text(status)
+    _push_message(
+        context,
+        "system",
+        f"Resuming render {job.start}-{job.end} "
+        f"({status.get('done', 0)}/{status.get('total', 0)} chunks already done)",
+    )
+    eventlog.log(
+        "info",
+        "RENDER_RESUME",
+        "resumed",
+        job=job.id,
+        done=int(status.get("done", 0)),
+        total=int(status.get("total", 0)),
+    )
+    _write_status(context, force=True)
 
 
 def _render_progress_text(status: dict) -> str:
@@ -9036,6 +9257,8 @@ def _handle_render_control(context, event: dict) -> None:
         if action == "accept":
             manager.accept(name)
             _push_message(context, "system", f"{name} joined the render")
+            if job.started and not job.finished:
+                session.send_render_control_to(name, "start", {"job": job.id})
         elif action == "decline":
             manager.decline(name)
             _push_message(context, "system", f"{name} declined the render")
@@ -9412,6 +9635,47 @@ def _render_session_frame(
             pass
 
 
+def _render_scene_audio(context, job) -> str:
+    """Mix the scene's sequencer audio to a temporary WAV, if it has any."""
+    scene = context.scene
+    editor = getattr(scene, "sequence_editor", None)
+    if editor is None:
+        return ""
+    strips = getattr(editor, "strips_all", None)
+    if strips is None:
+        strips = getattr(editor, "sequences_all", []) or []
+    if not any(getattr(strip, "type", "") == "SOUND" for strip in strips):
+        return ""
+    handle, path = tempfile.mkstemp(suffix=".wav")
+    os.close(handle)
+    old_start = scene.frame_start
+    old_end = scene.frame_end
+    try:
+        scene.frame_start = int(job.start)
+        scene.frame_end = int(job.end)
+        mixrate = int(getattr(scene.render.ffmpeg, "audio_mixrate", 48000) or 48000)
+        bpy.ops.sound.mixdown(
+            filepath=path,
+            check_existing=False,
+            container="WAV",
+            codec="PCM",
+            format="S16",
+            mixrate=mixrate,
+        )
+        if os.path.exists(path) and os.path.getsize(path) > 44:
+            return path
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+    finally:
+        scene.frame_start = old_start
+        scene.frame_end = old_end
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    return ""
+
+
 def _compile_session_video(context, job) -> str:
     settings = context.window_manager.bmp
     output_format = str(runtime.get("render_format", "MP4")).upper()
@@ -9427,21 +9691,45 @@ def _compile_session_video(context, job) -> str:
     pattern = os.path.join(job.output_dir, "frame_%05d.png")
     extension = "webm" if output_format == "WEBM" else "mp4"
     output = os.path.join(job.output_dir, f"render_{job.id}.{extension}")
+    audio = _render_scene_audio(context, job)
     codec = ["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "30"] if extension == "webm" else ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18"]
     command = [
         ffmpeg,
         "-y",
+        "-start_number",
+        str(max(0, int(job.start))),
         "-framerate",
         str(max(1, int(getattr(job, "fps", 24) or 24))),
         "-i",
         pattern,
-        *codec,
-        output,
     ]
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError((result.stderr or "ffmpeg failed").strip()[-300:])
-    _push_message(context, "system", f"Render video saved to {output}")
+    if audio:
+        command += ["-i", audio]
+    command += [*codec]
+    if audio:
+        command += [
+            "-c:a",
+            "libopus" if extension == "webm" else "aac",
+            "-b:a",
+            "128k" if extension == "webm" else "192k",
+            "-shortest",
+        ]
+    command.append(output)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or "ffmpeg failed").strip()[-300:])
+    finally:
+        if audio:
+            try:
+                os.unlink(audio)
+            except OSError:
+                pass
+    _push_message(
+        context,
+        "system",
+        f"Render video saved to {output}{' with audio' if audio else ''}",
+    )
     return output
 
 
@@ -9456,6 +9744,31 @@ def _pump_session_render(context) -> None:
         job = manager.job()
         if job is None:
             return
+        if not job.asked and not job.finished:
+            peers = session.authenticated_peers()
+            if peers:
+                request = {
+                    "action": "request",
+                    "job": job.id,
+                    "name": job.name,
+                    "start": job.start,
+                    "end": job.end,
+                    "step": job.step,
+                    "width": job.width,
+                    "height": job.height,
+                    "format": job.format,
+                    "engine": job.engine,
+                    "tiles_x": job.tiles_x,
+                    "tiles_y": job.tiles_y,
+                }
+                for name in peers:
+                    manager.ask(name)
+                session.send_render_control("request", request)
+                _push_message(
+                    context,
+                    "system",
+                    f"Resuming render with {len(peers)} peer(s)",
+                )
         if not job.started and not job.finished:
             all_answered = bool(job.asked) and job.asked <= (job.accepted | job.declined)
             timed_out = bool(job.asked) and now - job.created_at > renderjob.CONSENT_TIMEOUT
@@ -10882,6 +11195,12 @@ def unregister() -> None:
         pass
     session = runtime.get("session")
     if session:
+        manager = runtime.get("render_manager")
+        if manager is not None:
+            try:
+                manager.save(force=True)
+            except Exception:  # noqa: BLE001
+                pass
         session.stop()
         runtime["session"] = None
     try:

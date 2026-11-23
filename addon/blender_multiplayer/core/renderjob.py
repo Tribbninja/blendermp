@@ -16,6 +16,7 @@ from Blender's main thread while the session thread receives frames.
 
 from __future__ import annotations
 
+import json
 import secrets
 import threading
 import time
@@ -81,11 +82,13 @@ class RenderJob:
 class RenderManager:
     """Host-side render job state."""
 
-    def __init__(self, max_batch: int = MAX_BATCH):
+    def __init__(self, max_batch: int = MAX_BATCH, persist_path: str | Path | None = None):
         self.max_batch = max(1, min(32, int(max_batch)))
         self._lock = threading.Lock()
         self._job: RenderJob | None = None
         self._last: dict | None = None
+        self._persist_path = Path(persist_path) if persist_path else None
+        self._last_save = 0.0
 
     def active(self) -> bool:
         with self._lock:
@@ -94,6 +97,156 @@ class RenderManager:
     def job(self) -> RenderJob | None:
         with self._lock:
             return self._job
+
+    # --------------------------------------------------------------- persistence
+    def _snapshot_locked(self, job: RenderJob) -> dict:
+        return {
+            "version": 1,
+            "id": job.id,
+            "name": job.name,
+            "start": job.start,
+            "end": job.end,
+            "step": job.step,
+            "width": job.width,
+            "height": job.height,
+            "format": job.format,
+            "engine": job.engine,
+            "output_dir": job.output_dir,
+            "fps": job.fps,
+            "tiles_x": job.tiles_x,
+            "tiles_y": job.tiles_y,
+            "created_at": job.created_at,
+            "started_at": job.started_at,
+            "started": job.started,
+            "finished": job.finished,
+            "stopped": job.stopped,
+            "error": job.error,
+            "chunks": [
+                {
+                    "frame": chunk.frame,
+                    "tile": chunk.tile,
+                    "status": chunk.status,
+                    "worker": chunk.worker,
+                    "path": chunk.path,
+                    "error": chunk.error,
+                }
+                for chunk in job.chunks.values()
+                if chunk.status in {"done", "failed"}
+            ],
+        }
+
+    def save(self, force: bool = False) -> None:
+        """Write the active job so a crash can resume it."""
+        if self._persist_path is None:
+            return
+        now = time.time()
+        with self._lock:
+            if not force and now - self._last_save < 2.0:
+                return
+            self._last_save = now
+            job = self._job
+            if job is None:
+                return
+            data = self._snapshot_locked(job)
+        try:
+            path = self._persist_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp = path.with_suffix(path.suffix + ".tmp")
+            temp.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+            temp.replace(path)
+        except OSError:
+            pass
+
+    def load(self) -> bool:
+        """Restore an unfinished job. Claimed chunks become pending again."""
+        if self._persist_path is None:
+            return False
+        path = self._persist_path
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(data, dict) or int(data.get("version", 0) or 0) != 1:
+            return False
+        if data.get("finished") or data.get("stopped"):
+            self._delete()
+            return False
+        try:
+            start = int(data.get("start", 0))
+            end = int(data.get("end", 0))
+            step = max(1, int(data.get("step", 1) or 1))
+            width = max(0, int(data.get("width", 0) or 0))
+            height = max(0, int(data.get("height", 0) or 0))
+            output_dir = str(data.get("output_dir", ""))[:512]
+            if not output_dir:
+                return False
+            if end < start:
+                start, end = end, start
+            cols = max(1, min(MAX_TILES, int(data.get("tiles_x", 1) or 1)))
+            rows = max(1, min(MAX_TILES, int(data.get("tiles_y", 1) or 1)))
+            job = RenderJob(
+                id=str(data.get("id", ""))[:32] or secrets.token_hex(8),
+                name=str(data.get("name", "render"))[:80],
+                start=start,
+                end=end,
+                step=step,
+                width=width,
+                height=height,
+                format=str(data.get("format", "PNG"))[:8].upper(),
+                engine=str(data.get("engine", ""))[:32],
+                output_dir=output_dir,
+                fps=max(1, min(240, int(data.get("fps", 24) or 24))),
+                tiles_x=cols,
+                tiles_y=rows,
+                started=bool(data.get("started")),
+            )
+        except (TypeError, ValueError):
+            return False
+        for frame in range(start, end + 1, step):
+            for tile in range(cols * rows):
+                job.chunks[(frame, tile)] = RenderChunk(frame, tile)
+        for item in data.get("chunks", []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                key = (int(item.get("frame", 0)), int(item.get("tile", 0)))
+            except (TypeError, ValueError):
+                continue
+            chunk = job.chunks.get(key)
+            if chunk is None:
+                continue
+            status = str(item.get("status", ""))
+            if status not in {"done", "failed"}:
+                continue
+            chunk.status = status
+            chunk.worker = str(item.get("worker", ""))[:48]
+            chunk.path = str(item.get("path", ""))[:512]
+            chunk.error = str(item.get("error", ""))[:300]
+        job.accepted.clear()
+        job.declined.clear()
+        job.asked.clear()
+        job.notified = False
+        job.created_at = time.time()
+        job.started_at = time.time() if job.started else 0.0
+        job.finished = False
+        job.stopped = False
+        job.error = ""
+        if all(chunk.status in {"done", "failed"} for chunk in job.chunks.values()):
+            self._delete()
+            return False
+        with self._lock:
+            if self._job is not None and not self._job.finished:
+                return False
+            self._job = job
+        return True
+
+    def _delete(self) -> None:
+        if self._persist_path is None:
+            return
+        try:
+            self._persist_path.unlink()
+        except OSError:
+            pass
 
     def create(
         self,
@@ -136,7 +289,8 @@ class RenderManager:
                 for tile in range(cols * rows):
                     job.chunks[(frame, tile)] = RenderChunk(frame, tile)
             self._job = job
-            return job
+        self.save(force=True)
+        return job
 
     def ask(self, worker: str) -> None:
         with self._lock:
@@ -161,7 +315,8 @@ class RenderManager:
                 return False
             self._job.started = True
             self._job.started_at = time.time()
-            return True
+        self.save(force=True)
+        return True
 
     def claim(self, worker: str, count: int | None = None) -> list[tuple[int, int]]:
         now = time.time()
@@ -185,6 +340,7 @@ class RenderManager:
 
     def complete(self, frame: int, tile: int, worker: str, path: str) -> bool:
         """Mark a chunk done. Returns True when its whole frame is ready."""
+        ready = False
         with self._lock:
             job = self._job
             if job is None:
@@ -197,7 +353,9 @@ class RenderManager:
             chunk.path = str(path)[:512]
             chunk.error = ""
             self._maybe_finish(job)
-            return job.frame_complete(int(frame))
+            ready = job.frame_complete(int(frame))
+        self.save()
+        return ready
 
     def fail(self, frame: int, tile: int, worker: str, error: str) -> bool:
         with self._lock:
@@ -211,7 +369,8 @@ class RenderManager:
             chunk.worker = str(worker or chunk.worker)[:48]
             chunk.error = str(error)[:300]
             self._maybe_finish(job)
-            return True
+        self.save()
+        return True
 
     def fail_frame(self, frame: int, worker: str, error: str) -> int:
         """Mark every tile of a frame failed so Retry re-renders it."""
@@ -231,7 +390,8 @@ class RenderManager:
                 job.finished = False
                 job.notified = False
                 self._maybe_finish(job)
-            return count
+        self.save()
+        return count
 
     def release(self, worker: str) -> None:
         """Return a disconnected worker's claimed chunks to the queue."""
@@ -249,6 +409,7 @@ class RenderManager:
         with self._lock:
             if self._job is not None:
                 self._job.finished = True
+        self._delete()
 
     def stop(self) -> bool:
         """Stop the job now and keep the frames already written to disk."""
@@ -258,7 +419,8 @@ class RenderManager:
                 return False
             job.finished = True
             job.stopped = True
-            return True
+        self.save(force=True)
+        return True
 
     def clear(self) -> None:
         """Retire the finished job and keep its summary for the UI."""
@@ -266,6 +428,7 @@ class RenderManager:
             if self._job is not None:
                 self._last = self._status_locked(self._job)
             self._job = None
+        self._delete()
 
     def _maybe_finish(self, job: RenderJob) -> None:
         if job.finished:
@@ -301,7 +464,9 @@ class RenderManager:
             if count:
                 job.finished = False
                 job.notified = False
-            return count
+        if count:
+            self.save(force=True)
+        return count
 
     def status(self) -> dict:
         with self._lock:

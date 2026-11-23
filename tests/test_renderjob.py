@@ -272,3 +272,56 @@ def test_retry_after_failure_resets_notified():
     assert manager.retry_failed() == 1
     assert manager.job().notified is False
     assert manager.status()["finished"] is False
+
+
+def test_job_persists_and_resumes(tmp_path):
+    path = tmp_path / "job.json"
+    manager = renderjob.RenderManager(persist_path=path)
+    job = manager.create(
+        "Resume", 1, 3, 1, 64, 64, "PNG", "CYCLES", str(tmp_path), tiles_x=2, tiles_y=2
+    )
+    manager.start()
+    claimed = manager.claim("worker", 4)
+    manager.complete(claimed[0][0], claimed[0][1], "worker", "tile.png")
+    manager.save(force=True)
+    assert path.exists()
+
+    restored = renderjob.RenderManager(persist_path=path)
+    assert restored.load() is True
+    resumed = restored.job()
+    assert resumed is not None
+    assert resumed.id == job.id
+    assert (resumed.tiles_x, resumed.tiles_y) == (2, 2)
+    assert resumed.started is True
+    status = restored.status()
+    assert status["done"] == 1
+    assert status["pending"] == 11
+    assert status["claimed"] == 0
+
+
+def test_finished_job_is_not_resumed(tmp_path):
+    path = tmp_path / "job.json"
+    manager = renderjob.RenderManager(persist_path=path)
+    manager.create("Done", 1, 1, 1, 0, 0, "PNG", "", str(tmp_path))
+    manager.start()
+    manager.complete(1, 0, "worker", "frame_00001.png")
+    manager.save(force=True)
+    assert path.exists()
+
+    restored = renderjob.RenderManager(persist_path=path)
+    assert restored.load() is False
+    assert not path.exists()
+
+
+def test_stopped_job_is_not_resumed(tmp_path):
+    path = tmp_path / "job.json"
+    manager = renderjob.RenderManager(persist_path=path)
+    manager.create("Stop", 1, 4, 1, 0, 0, "PNG", "", str(tmp_path))
+    manager.start()
+    manager.claim("worker", 2)
+    assert manager.stop() is True
+    manager.save(force=True)
+
+    restored = renderjob.RenderManager(persist_path=path)
+    assert restored.load() is False
+    assert not path.exists()

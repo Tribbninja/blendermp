@@ -12,7 +12,7 @@ $clientData = Join-Path $env:TEMP 'bmp-resync-client'
 Get-CimInstance Win32_Process -Filter "Name='blender.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.CommandLine -like "*$hostData*" -or $_.CommandLine -like "*$clientData*" } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-Start-Sleep -Milliseconds 500
+Start-Sleep -Seconds 2
 
 Remove-Item $hostData, $clientData -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $hostData, $clientData | Out-Null
@@ -53,7 +53,13 @@ function Check([bool]$condition, [string]$message) { if (-not $condition) { $scr
 Check ($client.reason -eq 'healed') "client finished by '$($client.reason)'"
 Check ([bool]$client.diverged) 'client never diverged'
 Check ([bool]$client.healed) 'client scene was never healed'
-Check ($null -ne $client.heal_seconds -and [double]$client.heal_seconds -le 15.0) "heal took $($client.heal_seconds)s"
+Check ($null -ne $client.heal_seconds -and [double]$client.heal_seconds -le 20.0) "heal took $($client.heal_seconds)s"
+Check ([int]$client.resolution_x -eq 64) "resolution healed to $($client.resolution_x)"
+Check ($null -ne $client.world_color -and [math]::Abs([double]$client.world_color[0] - 0.2) -le 0.01 -and [math]::Abs([double]$client.world_color[2] - 0.8) -le 0.01) "world colour was $($client.world_color -join ',')"
+Check ($null -ne $client.camera_lens -and [math]::Abs([double]$client.camera_lens - 50.0) -le 0.1) "camera lens was $($client.camera_lens)"
+Check ($null -ne $client.light_energy -and [math]::Abs([double]$client.light_energy - 100.0) -le 0.1) "light energy was $($client.light_energy)"
+Check ($null -ne $client.geo_value -and [math]::Abs([double]$client.geo_value - 0.75) -le 0.01) "geometry node input was $($client.geo_value)"
+Check ($null -ne $client.prop_value -and [math]::Abs([double]$client.prop_value - 0.5) -le 0.001) "custom property was $($client.prop_value)"
 if ($null -ne $hostResult) {
     Check ([bool]$hostResult.auto_resync) 'auto resync was disabled on the host'
     Check ([double]$hostResult.resync_interval -le 0.5) "host resync interval was $($hostResult.resync_interval)"

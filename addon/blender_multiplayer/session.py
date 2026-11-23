@@ -2808,7 +2808,7 @@ class SessionService:
             return
 
         if frame.type in (MessageType.SCENE_RESET, MessageType.SCENE_READY):
-            body = self._json(frame, 512)
+            body = self._json(frame, 256 * 1024)
             self._emit("scene_reset" if frame.type == MessageType.SCENE_RESET else "scene_ready", body)
             return
 
@@ -3006,6 +3006,13 @@ class SessionService:
 
     def send_scene_ready(self, target: str, extra: dict | None = None) -> None:
         body = {"target": target}
+        if isinstance(extra, dict):
+            body.update(extra)
+        self._enqueue(protocol.json_frame(MessageType.SCENE_READY, body))
+
+    def send_scene_settings(self, extra: dict | None = None) -> None:
+        """Broadcast live world/render/camera/light settings."""
+        body = {"settings_only": True}
         if isinstance(extra, dict):
             body.update(extra)
         self._enqueue(protocol.json_frame(MessageType.SCENE_READY, body))

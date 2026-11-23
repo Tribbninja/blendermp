@@ -5,7 +5,7 @@ Blender and **docks the live window over the app viewport** (a native owned
 window, not video capture, so it keeps full GPU performance and avoids the black
 surface that cross-process re-parenting causes on some GPUs).
 
-> **Status: 0.11.22 collaboration foundation.** Hosting, the public server
+> **Status: 0.11.23 collaboration foundation.** Hosting, the public server
 > browser, TLS pinning, presence, chat, object transforms, mesh streaming, live
 > Edit Mode topology, animation, sculpt, materials/textures, asset bundles,
 > roles, checkpoints, an Ollama copilot, session recording/replay, a live
@@ -68,7 +68,9 @@ All releases: <https://github.com/Tribbninja/blendermp/releases>
 * **LAN render farm**: split a frame range across the room. Peers claim a frame,
   render it from their local scene and upload the PNG back to the host. It is
   LAN-only, token-protected, and rendering blocks Blender while a frame runs.
-  Fluid caches stay local; frame rendering is the distributed part.
+  Fluid caches stay local; frame rendering is the distributed part. Jobs are
+  saved to disk, so a host that restarts resumes the remaining frames instead of
+  starting over, and compiled videos include the scene's sequencer audio.
 * **AI copilot (local Ollama)**: a chat panel proposes structured edits
   (transforms, primitives, materials, modifiers, booleans, scene settings) with
   a scene snapshot for context. Nothing is applied until you confirm; failed
@@ -528,8 +530,11 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   editor is still in Edit Mode; the receiver rebuilds the mesh in Object Mode.
 * Worlds are limited to background colour/strength. Node groups, scripts and
   other unsafe shader nodes are skipped rather than approximated; the rest of a
-  material graph still applies. Compositor nodes, simulations and linked
-  libraries are not replicated yet.
+  material graph still applies. World background, render settings, active
+  camera, camera lens/clip, light energy/colour, geometry-node modifier input
+  values and safe object custom properties are refreshed live by auto-resync.
+  Geometry-node group graphs themselves, compositor nodes, simulations and
+  linked libraries are not replicated yet.
 * Action sync covers the active action plus NLA tracks/strips and their actions.
   Shape-key values and coordinates sync. Object-transform drivers are replicated
   only when their expression is a safe arithmetic/math subset; other drivers are
