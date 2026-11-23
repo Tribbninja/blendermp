@@ -309,3 +309,53 @@ def test_status_keeps_render_engine(appdir):
     assert body["render"]["engine"] == "CYCLES"
     assert body["render"]["format"] == "MP4"
     assert body["render"]["fps"] == 24
+
+
+def test_render_request_accepts_tiles(appdir):
+    write_session(
+        appdir,
+        {
+            "action": "render",
+            "nonce": "r" * 16,
+            "start": 1,
+            "end": 5,
+            "step": 1,
+            "format": "MP4",
+            "tiles_x": 2,
+            "tiles_y": 3,
+        },
+    )
+    request = control.read_session()
+    assert request["tiles_x"] == 2
+    assert request["tiles_y"] == 3
+
+
+def test_invalid_render_tiles_are_ignored(appdir):
+    for value in (0, 17, -1, "2", True):
+        write_session(
+            appdir,
+            {
+                "action": "render",
+                "nonce": "r" * 16,
+                "start": 1,
+                "end": 5,
+                "step": 1,
+                "format": "MP4",
+                "tiles_x": value,
+            },
+        )
+        assert control.read_session() is None, value
+
+
+def test_status_keeps_render_tiles(appdir):
+    control.write_status(
+        {
+            "state": "hosting",
+            "render": {"active": True, "tiles_x": 3, "tiles_y": 2, "frames": 10, "frames_done": 4},
+        }
+    )
+    body = json.loads(control.status_path().read_text(encoding="utf-8"))
+    assert body["render"]["tiles_x"] == 3
+    assert body["render"]["tiles_y"] == 2
+    assert body["render"]["frames"] == 10
+    assert body["render"]["frames_done"] == 4

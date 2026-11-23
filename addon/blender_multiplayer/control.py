@@ -295,6 +295,13 @@ def read_session() -> dict[str, Any] | None:
             if engine not in {"CYCLES", "BLENDER_EEVEE", "BLENDER_EEVEE_NEXT", "BLENDER_WORKBENCH"}:
                 return None
             result["engine"] = engine
+        for key in ("tiles_x", "tiles_y"):
+            value = body.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 16:
+                return None
+            result[key] = value
         output = body.get("output")
         if output is not None:
             if not isinstance(output, str) or len(output) > 512 or any(ord(ch) < 32 for ch in output):
@@ -368,6 +375,10 @@ def write_status(data: dict[str, Any]) -> None:
             "engine": str(render.get("engine", ""))[:32],
             "format": str(render.get("format", ""))[:8],
             "fps": max(1, min(int(render.get("fps", 24) or 24), 240)),
+            "tiles_x": max(1, min(int(render.get("tiles_x", 1) or 1), 16)),
+            "tiles_y": max(1, min(int(render.get("tiles_y", 1) or 1), 16)),
+            "frames": max(0, min(int(render.get("frames", 0) or 0), 1 << 31)),
+            "frames_done": max(0, min(int(render.get("frames_done", 0) or 0), 1 << 31)),
             "total": max(0, min(int(render.get("total", 0) or 0), 1 << 31)),
             "done": max(0, min(int(render.get("done", 0) or 0), 1 << 31)),
             "failed": max(0, min(int(render.get("failed", 0) or 0), 1 << 31)),
@@ -408,6 +419,8 @@ def write_status(data: dict[str, Any]) -> None:
                 "height": max(0, min(int(request.get("height", 0) or 0), 1 << 16)),
                 "format": str(request.get("format", "PNG"))[:8],
                 "engine": str(request.get("engine", ""))[:32],
+                "tiles_x": max(1, min(int(request.get("tiles_x", 1) or 1), 16)),
+                "tiles_y": max(1, min(int(request.get("tiles_y", 1) or 1), 16)),
             }
         safe["render"] = clean
     for key in ("is_host", "relay", "fast_mode", "farm_active", "internet_mode", "lan_fast"):

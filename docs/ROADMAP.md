@@ -7,6 +7,7 @@ streaming, edit leases, presence 2.0, exact remote application, durable settings
 strict version gate, lease request UX, server-enforced roles, optional LAN direct).
 
 Progress log:
+- [x] 2026-11-23: 0.11.20: tile-based rendering. The Custom render panel has a Tiles selector (1x1 up to 4x4). A heavy frame is split into a grid; each worker renders one border region and uploads only that tile, and the host stitches the tiles back into the final frame before compiling the video. Progress now reports frames completed and tiles per frame.
 - [x] 2026-11-23: 0.11.19: the render status now includes `engine`, `format` and `fps`, so the desktop app and diagnostics can show which engine the job is using. Cycles renders continue to use the CPU plus every GPU.
 - [x] 2026-11-23: 0.11.18: the Custom render panel has an engine selector (EEVEE or Cycles). The chosen engine is sent with the job, applied per frame on every worker, and restored afterwards. Cycles renders now enable the CPU device alongside every GPU (Cycles' hybrid CPU+GPU mode), so the CPU is no longer idle when Cycles is selected.
 - [x] 2026-11-23: 0.11.17: fixed "only the host can start a render" on the host. Loading a .blend can reset the window-manager property group, so `settings.is_host` went stale while the session kept hosting. Host-only render actions now read `session.is_host`, and `_write_status` writes the live value back into the property group every tick.

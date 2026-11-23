@@ -89,6 +89,8 @@ pub(crate) struct SessionRequest {
     step: Option<u32>,
     width: Option<u32>,
     height: Option<u32>,
+    tiles_x: Option<u32>,
+    tiles_y: Option<u32>,
     engine: Option<String>,
     format: Option<String>,
     job: Option<String>,
@@ -1332,6 +1334,11 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
             return Err("invalid render engine".into());
         }
     }
+    for tiles in [request.tiles_x, request.tiles_y].into_iter().flatten() {
+        if !(1..=16).contains(&tiles) {
+            return Err("invalid render tile count".into());
+        }
+    }
     if let Some(job) = &request.job {
         if job.len() > 32 || !job.chars().all(|ch| ch.is_ascii_alphanumeric()) {
             return Err("invalid render job id".into());
@@ -1411,6 +1418,8 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
         "step": request.step,
         "width": request.width,
         "height": request.height,
+        "tiles_x": request.tiles_x,
+        "tiles_y": request.tiles_y,
         "engine": request.engine,
         "format": request.format,
         "job": request.job,

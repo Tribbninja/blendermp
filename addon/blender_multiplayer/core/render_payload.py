@@ -32,6 +32,13 @@ def encode(
     height: int,
     data: bytes,
     compress: bool = False,
+    tile: int = 0,
+    tiles_x: int = 1,
+    tiles_y: int = 1,
+    tile_x: int = 0,
+    tile_y: int = 0,
+    tile_w: int = 0,
+    tile_h: int = 0,
 ) -> bytes:
     if not data:
         raise RenderPayloadError("render frame is empty")
@@ -44,6 +51,13 @@ def encode(
             "format": str(format_hint)[:8].lower(),
             "width": max(0, int(width)),
             "height": max(0, int(height)),
+            "tile": max(0, int(tile)),
+            "tiles_x": max(1, int(tiles_x)),
+            "tiles_y": max(1, int(tiles_y)),
+            "tile_x": max(0, int(tile_x)),
+            "tile_y": max(0, int(tile_y)),
+            "tile_w": max(0, int(tile_w)),
+            "tile_h": max(0, int(tile_h)),
         },
         separators=(",", ":"),
     ).encode("utf-8")
@@ -93,5 +107,12 @@ def decode(payload: bytes) -> dict:
         "format": str(meta.get("format", "png"))[:8],
         "width": int(meta.get("width", 0) or 0),
         "height": int(meta.get("height", 0) or 0),
+        "tile": int(meta.get("tile", 0) or 0),
+        "tiles_x": max(1, int(meta.get("tiles_x", 1) or 1)),
+        "tiles_y": max(1, int(meta.get("tiles_y", 1) or 1)),
+        "tile_x": int(meta.get("tile_x", 0) or 0),
+        "tile_y": int(meta.get("tile_y", 0) or 0),
+        "tile_w": int(meta.get("tile_w", 0) or 0),
+        "tile_h": int(meta.get("tile_h", 0) or 0),
         "data": data,
     }

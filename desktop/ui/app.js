@@ -140,7 +140,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.11.19";
+const APP_VERSION = "0.11.20";
 const PROTOCOL_VERSION = 3;
 const CAPABILITIES = 1 | (1 << 10) | (1 << 11) | (1 << 12); // presence, bookmarks, bundles, chunks
 const settings = {
@@ -779,6 +779,9 @@ function renderFarm(status) {
   const running = Boolean(render.active);
   const finished = Boolean(render.finished);
   const request = render.request && typeof render.request === "object" ? render.request : null;
+  const tileCount = Math.max(1, Number(render.tiles_x || 1)) * Math.max(1, Number(render.tiles_y || 1));
+  const framesTotal = Number(render.frames || 0);
+  const framesDone = Number(render.frames_done || 0);
   // The consent prompt is a native Blender dialog (bmp.render_consent), so the
   // web overlay stays hidden. This avoids covering the UI with a modal that the
   // docked Blender window sits on top of.
@@ -794,7 +797,7 @@ function renderFarm(status) {
     : finished
       ? "done"
       : running
-        ? `${render.done || 0}/${render.total || 0}`
+        ? `${framesDone}/${framesTotal}`
         : request
           ? "invite"
           : "idle";
@@ -805,7 +808,8 @@ function renderFarm(status) {
     const failed = Number(render.failed || 0);
     const eta = Number(render.eta_seconds || 0);
     const etaText = running && eta > 0 ? ` · about ${formatEta(eta)} left` : "";
-    $("renderProgressText").textContent = `${render.done || 0}/${render.total || 0} frames (${percent.toFixed(0)}%)${failed ? `, ${failed} failed` : ""}${etaText}`;
+    const tileText = tileCount > 1 ? ` · ${tileCount} tiles per frame` : "";
+    $("renderProgressText").textContent = `${framesDone}/${framesTotal} frames (${percent.toFixed(0)}%)${tileText}${failed ? `, ${failed} failed` : ""}${etaText}`;
     const detail = render.worker_detail && typeof render.worker_detail === "object" ? render.worker_detail : {};
     const parts = Object.keys(detail)
       .sort()
@@ -1238,8 +1242,22 @@ async function startRender() {
   const height = Math.max(0, Number($("renderHeight").value) || 0);
   const engine = $("renderEngine").value || "BLENDER_EEVEE";
   const format = $("renderFormat").value || "MP4";
+  const [tilesX, tilesY] = ($("renderTiles").value || "1x1")
+    .split("x")
+    .map((part) => Math.max(1, Math.min(16, Number(part) || 1)));
   try {
-    await request({ action: "render", start, end, step, width, height, engine, format });
+    await request({
+      action: "render",
+      start,
+      end,
+      step,
+      width,
+      height,
+      engine,
+      format,
+      tiles_x: tilesX,
+      tiles_y: tilesY,
+    });
     toast("Render requested", "ok");
   } catch (error) {
     toast(String(error), "error");

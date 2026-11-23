@@ -31,7 +31,7 @@ scene.render.resolution_x = 64
 scene.render.resolution_y = 64
 scene.render.resolution_percentage = 100
 
-PORT = 52476
+PORT = int(os.environ.get("BMP_TEST_PORT", "52476"))
 code = encode_room("127.0.0.1", PORT)
 bmp.start_join(context, code)
 start = time.monotonic()

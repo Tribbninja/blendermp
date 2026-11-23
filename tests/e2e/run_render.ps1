@@ -7,13 +7,13 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$hostData = Join-Path $env:TEMP 'bmp-render-host'
+$clientData = Join-Path $env:TEMP 'bmp-render-client'
 Get-CimInstance Win32_Process -Filter "Name='blender.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -like '*render_host.py*' -or $_.CommandLine -like '*render_client.py*' } |
+    Where-Object { $_.CommandLine -like "*$hostData*" -or $_.CommandLine -like "*$clientData*" } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Milliseconds 500
 
-$hostData = Join-Path $env:TEMP 'bmp-render-host'
-$clientData = Join-Path $env:TEMP 'bmp-render-client'
 Remove-Item $hostData, $clientData -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $hostData, $clientData | Out-Null
 
@@ -22,12 +22,12 @@ $env:BMP_ADDON = Join-Path $root 'addon'
 $env:BMP_NO_CONSENT_DIALOG = '1'
 
 $env:BMP_TEST_DATA = $hostData
-$hostArgs = @('--factory-startup', '--window-geometry', '0', '650', '800', '500', '--python', ('"' + (Join-Path $PSScriptRoot 'render_host.py') + '"'))
+$hostArgs = @('--factory-startup', '--window-geometry', '0', '650', '800', '500', '--python', ('"' + (Join-Path $PSScriptRoot 'render_host.py') + '"'), '--', '--bmp-data', $hostData)
 $hostProc = Start-Process -FilePath $Blender -ArgumentList $hostArgs -PassThru -RedirectStandardOutput (Join-Path $hostData 'stdout.log') -RedirectStandardError (Join-Path $hostData 'stderr.log')
 Start-Sleep -Seconds 2
 
 $env:BMP_TEST_DATA = $clientData
-$clientArgs = @('--factory-startup', '--window-geometry', '850', '650', '800', '500', '--python', ('"' + (Join-Path $PSScriptRoot 'render_client.py') + '"'))
+$clientArgs = @('--factory-startup', '--window-geometry', '850', '650', '800', '500', '--python', ('"' + (Join-Path $PSScriptRoot 'render_client.py') + '"'), '--', '--bmp-data', $clientData)
 $clientProc = Start-Process -FilePath $Blender -ArgumentList $clientArgs -PassThru -RedirectStandardOutput (Join-Path $clientData 'stdout.log') -RedirectStandardError (Join-Path $clientData 'stderr.log')
 
 $deadline = (Get-Date).AddSeconds(120)

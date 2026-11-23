@@ -3404,10 +3404,30 @@ class SessionService:
         width: int,
         height: int,
         data: bytes,
+        tile: int = 0,
+        tiles_x: int = 1,
+        tiles_y: int = 1,
+        tile_x: int = 0,
+        tile_y: int = 0,
+        tile_w: int = 0,
+        tile_h: int = 0,
     ) -> bool:
         try:
             payload = render_payload.encode(
-                job, frame, format_hint, width, height, data, compress=self._using_relay
+                job,
+                frame,
+                format_hint,
+                width,
+                height,
+                data,
+                compress=self._using_relay,
+                tile=tile,
+                tiles_x=tiles_x,
+                tiles_y=tiles_y,
+                tile_x=tile_x,
+                tile_y=tile_y,
+                tile_w=tile_w,
+                tile_h=tile_h,
             )
         except render_payload.RenderPayloadError:
             return False

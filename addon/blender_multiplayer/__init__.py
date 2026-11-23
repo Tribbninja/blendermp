@@ -74,7 +74,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 11, 19),
+    "version": (0, 11, 20),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -3104,6 +3104,8 @@ def _poll_control(context) -> None:
                 request.get("width", 0),
                 request.get("height", 0),
                 request.get("engine", ""),
+                request.get("tiles_x", 1),
+                request.get("tiles_y", 1),
             )
         elif action == "render_stop":
             _stop_session_render(context)
@@ -8775,7 +8777,7 @@ def _render_progress_text(status: dict) -> str:
     return text
 
 
-def _start_session_render(context, start, end, step, format_hint, output, width=0, height=0, engine_override="") -> None:
+def _start_session_render(context, start, end, step, format_hint, output, width=0, height=0, engine_override="", tiles_x=1, tiles_y=1) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
     # The session is the source of truth. Loading a .blend can reset the
@@ -8805,6 +8807,8 @@ def _start_session_render(context, start, end, step, format_hint, output, width=
         engine=job_engine,
         output_dir=out_dir,
         fps=int(getattr(scene.render, "fps", 24) or 24),
+        tiles_x=int(tiles_x or 1),
+        tiles_y=int(tiles_y or 1),
     )
     if job is None:
         settings.last_error = "Could not create the render job"
@@ -8824,6 +8828,8 @@ def _start_session_render(context, start, end, step, format_hint, output, width=
         "height": job.height,
         "format": job.format,
         "engine": job.engine,
+        "tiles_x": job.tiles_x,
+        "tiles_y": job.tiles_y,
     }
     peers = session.authenticated_peers()
     for name in peers:
@@ -8894,13 +8900,20 @@ def _handle_render_control(context, event: dict) -> None:
             except (TypeError, ValueError):
                 count = renderjob.MAX_BATCH
             count = max(1, min(renderjob.MAX_BATCH, count))
-            frames = manager.claim(name, count)
-            if frames:
-                session.send_render_control_to(name, "work", {"job": job.id, "frames": frames})
+            chunks = manager.claim(name, count)
+            if chunks:
+                work = [{"frame": frame, "tile": tile} for frame, tile in chunks]
+                session.send_render_control_to(
+                    name,
+                    "work",
+                    {"job": job.id, "chunks": work, "tiles_x": job.tiles_x, "tiles_y": job.tiles_y},
+                )
         elif action == "fail":
             frame = message.get("frame")
             if isinstance(frame, int) and not isinstance(frame, bool):
-                manager.fail(frame, name, str(message.get("error", ""))[:200])
+                tile = message.get("tile", 0)
+                tile = int(tile) if isinstance(tile, int) and not isinstance(tile, bool) else 0
+                manager.fail(frame, tile, name, str(message.get("error", ""))[:200])
         settings.render_progress = _render_progress_text(manager.status())
         return
     job_id = str(message.get("job", ""))
@@ -8920,6 +8933,8 @@ def _handle_render_control(context, event: dict) -> None:
         runtime["render_height"] = int(message.get("height", 0) or 0)
         runtime["render_engine"] = str(message.get("engine", ""))[:32]
         runtime["render_engine_override"] = str(message.get("engine", ""))[:32]
+        runtime["render_tiles_x"] = max(1, min(16, int(message.get("tiles_x", 1) or 1)))
+        runtime["render_tiles_y"] = max(1, min(16, int(message.get("tiles_y", 1) or 1)))
         eventlog.log("info", "RENDER_RECEIVED", "request", job=job_id)
         _push_message(context, "system", f"{message.get('name', 'Host')} asked you to join a render")
         lines = [
@@ -8949,21 +8964,97 @@ def _handle_render_control(context, event: dict) -> None:
         else:
             _push_message(context, "system", "Render started")
     elif action == "work":
-        # Clients render one frame at a time; ignore extra assignments so a
+        # Clients render one chunk at a time; ignore extra assignments so a
         # stale batch cannot build up a queue.
-        frames = message.get("frames") or []
-        if frames and not runtime.get("render_queue"):
-            frame = frames[0]
-            if isinstance(frame, int) and not isinstance(frame, bool):
-                runtime["render_queue"].append((job_id, frame))
+        chunks = message.get("chunks") or []
+        if chunks and not runtime.get("render_queue"):
+            item = chunks[0]
+            if isinstance(item, dict):
+                frame = item.get("frame")
+                tile = item.get("tile", 0)
+                if isinstance(frame, int) and not isinstance(frame, bool):
+                    runtime["render_queue"].append((job_id, frame, int(tile or 0)))
         runtime["render_active"] = True
         runtime["render_job_id"] = job_id
+        runtime["render_tiles_x"] = max(1, min(16, int(message.get("tiles_x", runtime.get("render_tiles_x", 1)) or 1)))
+        runtime["render_tiles_y"] = max(1, min(16, int(message.get("tiles_y", runtime.get("render_tiles_y", 1)) or 1)))
     elif action in {"cancel", "finish"}:
         runtime["render_active"] = False
         runtime["render_queue"] = []
         runtime["render_busy"] = False
         runtime["render_request"] = None
         _push_message(context, "system", "Render finished" if action == "finish" else "Render cancelled")
+
+
+def _composite_frame_tiles(context, job, frame: int) -> str:
+    """Stitch the finished tiles of one frame into the final PNG."""
+    cols = max(1, int(getattr(job, "tiles_x", 1) or 1))
+    rows = max(1, int(getattr(job, "tiles_y", 1) or 1))
+    if cols * rows == 1:
+        chunk = job.chunks.get((int(frame), 0))
+        path = getattr(chunk, "path", "") if chunk is not None else ""
+        if not path or not os.path.exists(path):
+            raise RuntimeError("rendered tile is missing")
+        with open(path, "rb") as reader:
+            data = reader.read()
+        return renderjob.write_frame(job.output_dir, frame, "PNG", data)
+    width = max(1, int(job.width or 0))
+    height = max(1, int(job.height or 0))
+    if not width or not height:
+        raise RuntimeError("frame size is unknown")
+    try:
+        import numpy as np
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("numpy is required to composite tiles") from exc
+    canvas = np.zeros((height, width, 4), dtype=np.float32)
+    canvas[:, :, 3] = 1.0
+    for tile in range(cols * rows):
+        chunk = job.chunks.get((int(frame), tile))
+        if chunk is None or chunk.status != "done" or not chunk.path:
+            raise RuntimeError(f"tile {tile} is missing")
+        x0, y0, x1, y1 = _tile_geometry(width, height, cols, rows, tile)
+        tw = max(1, x1 - x0)
+        th = max(1, y1 - y0)
+        image = bpy.data.images.load(chunk.path, check_existing=False)
+        try:
+            if tuple(image.size) != (tw, th):
+                image.scale(tw, th)
+            buffer = np.empty(tw * th * 4, dtype=np.float32)
+            image.pixels.foreach_get(buffer)
+            canvas[y0:y1, x0:x1, :] = buffer.reshape(th, tw, 4)
+        finally:
+            try:
+                bpy.data.images.remove(image)
+            except Exception:  # noqa: BLE001
+                pass
+    handle, temp = tempfile.mkstemp(suffix=".png")
+    os.close(handle)
+    try:
+        merged = bpy.data.images.new(
+            f"bmp_frame_{job.id}_{frame}",
+            width=width,
+            height=height,
+            alpha=True,
+            float_buffer=True,
+        )
+        try:
+            merged.pixels.foreach_set(canvas.reshape(-1))
+            merged.filepath_raw = temp
+            merged.file_format = "PNG"
+            merged.save()
+        finally:
+            try:
+                bpy.data.images.remove(merged)
+            except Exception:  # noqa: BLE001
+                pass
+        with open(temp, "rb") as reader:
+            data = reader.read()
+        return renderjob.write_frame(job.output_dir, frame, "PNG", data)
+    finally:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
 
 
 def _handle_render_frame(context, event: dict) -> None:
@@ -8977,12 +9068,24 @@ def _handle_render_frame(context, event: dict) -> None:
         return
     if body["job"] != job.id:
         return
+    frame = int(body["frame"])
+    tile = int(body.get("tile", 0) or 0)
+    sender = str(event.get("sender", ""))
     try:
-        path = renderjob.write_frame(job.output_dir, body["frame"], job.format, body["data"])
+        path = renderjob.write_tile(job.output_dir, frame, tile, body["data"])
     except OSError:
         traceback.print_exc()
         return
-    manager.complete(body["frame"], str(event.get("sender", "")), path)
+    if manager.complete(frame, tile, sender, path):
+        try:
+            final = _composite_frame_tiles(context, job, frame)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+            manager.fail_frame(frame, sender, "could not composite tiles")
+        else:
+            chunk = job.chunks.get((frame, tile))
+            if chunk is not None:
+                chunk.path = final
     context.window_manager.bmp.render_progress = _render_progress_text(manager.status())
     _write_status(context, force=True)
 
@@ -9040,7 +9143,21 @@ def _restore_cycles_hybrid(scene, token: dict) -> None:
         pass
 
 
-def _render_session_frame(context, frame: int, width: int = 0, height: int = 0, engine: str = "") -> tuple[bool, str, bytes]:
+def _tile_geometry(fw: int, fh: int, tiles_x: int, tiles_y: int, tile: int) -> tuple[int, int, int, int]:
+    """Pixel bounds of one tile in the full frame (bottom-left origin)."""
+    return renderjob.tile_geometry(fw, fh, tiles_x, tiles_y, tile)
+
+
+def _render_session_frame(
+    context,
+    frame: int,
+    width: int = 0,
+    height: int = 0,
+    engine: str = "",
+    tile: int = 0,
+    tiles_x: int = 1,
+    tiles_y: int = 1,
+) -> tuple[bool, str, bytes]:
     scene = context.scene
     old_frame = scene.frame_current
     old_path = scene.render.filepath
@@ -9051,6 +9168,14 @@ def _render_session_frame(context, frame: int, width: int = 0, height: int = 0, 
     old_threads_mode = scene.render.threads_mode
     old_threads = scene.render.threads
     old_engine = scene.render.engine
+    old_border = (
+        scene.render.use_border,
+        scene.render.use_crop_to_border,
+        scene.render.border_min_x,
+        scene.render.border_max_x,
+        scene.render.border_min_y,
+        scene.render.border_max_y,
+    )
     settings = context.window_manager.bmp
     try:
         percent = int(getattr(settings, "farm_cpu_percent", 80) or 80)
@@ -9059,6 +9184,8 @@ def _render_session_frame(context, frame: int, width: int = 0, height: int = 0, 
     percent = max(10, min(100, percent))
     threads = max(1, int((os.cpu_count() or 4) * (percent / 100.0)))
     requested_engine = str(engine or "").strip()
+    cols = max(1, int(tiles_x or 1))
+    rows = max(1, int(tiles_y or 1))
     handle, path = tempfile.mkstemp(suffix=".png")
     os.close(handle)
     hybrid_token = None
@@ -9081,6 +9208,19 @@ def _render_session_frame(context, frame: int, width: int = 0, height: int = 0, 
             scene.render.resolution_x = int(width)
             scene.render.resolution_y = int(height)
             scene.render.resolution_percentage = 100
+        if cols > 1 or rows > 1:
+            fw = max(1, int(round(scene.render.resolution_x * scene.render.resolution_percentage / 100.0)))
+            fh = max(1, int(round(scene.render.resolution_y * scene.render.resolution_percentage / 100.0)))
+            x0, y0, x1, y1 = _tile_geometry(fw, fh, cols, rows, tile)
+            scene.render.use_border = True
+            scene.render.use_crop_to_border = True
+            scene.render.border_min_x = x0 / fw
+            scene.render.border_max_x = x1 / fw
+            scene.render.border_min_y = y0 / fh
+            scene.render.border_max_y = y1 / fh
+        else:
+            scene.render.use_border = False
+            scene.render.use_crop_to_border = False
         bpy.ops.render.render(write_still=True)
         with open(path, "rb") as reader:
             data = reader.read()
@@ -9095,6 +9235,17 @@ def _render_session_frame(context, frame: int, width: int = 0, height: int = 0, 
         try:
             scene.render.engine = old_engine
         except (TypeError, ValueError):
+            pass
+        try:
+            (
+                scene.render.use_border,
+                scene.render.use_crop_to_border,
+                scene.render.border_min_x,
+                scene.render.border_max_x,
+                scene.render.border_min_y,
+                scene.render.border_max_y,
+            ) = old_border
+        except Exception:  # noqa: BLE001
             pass
         try:
             scene.frame_set(old_frame)
@@ -9170,16 +9321,36 @@ def _pump_session_render(context) -> None:
                 if not job.accepted:
                     _push_message(context, "system", "No peers joined; rendering on the host only")
         if job.started and not job.finished and not runtime.get("render_busy"):
-            frames = manager.claim(settings.name or "host", 1)
-            if frames:
+            claimed = manager.claim(settings.name or "host", 1)
+            if claimed:
+                frame, tile = claimed[0]
+                worker = settings.name or "host"
                 runtime["render_busy"] = True
                 try:
-                    ok, error, data = _render_session_frame(context, frames[0], job.width, job.height, job.engine)
+                    ok, error, data = _render_session_frame(
+                        context,
+                        frame,
+                        job.width,
+                        job.height,
+                        job.engine,
+                        tile,
+                        job.tiles_x,
+                        job.tiles_y,
+                    )
                     if ok:
-                        path = renderjob.write_frame(job.output_dir, frames[0], job.format, data)
-                        manager.complete(frames[0], settings.name or "host", path)
+                        path = renderjob.write_tile(job.output_dir, frame, tile, data)
+                        if manager.complete(frame, tile, worker, path):
+                            try:
+                                final = _composite_frame_tiles(context, job, frame)
+                            except Exception:  # noqa: BLE001
+                                traceback.print_exc()
+                                manager.fail_frame(frame, worker, "could not composite tiles")
+                            else:
+                                chunk = job.chunks.get((frame, tile))
+                                if chunk is not None:
+                                    chunk.path = final
                     else:
-                        manager.fail(frames[0], settings.name or "host", error)
+                        manager.fail(frame, tile, worker, error)
                 finally:
                     runtime["render_busy"] = False
                 settings.render_progress = _render_progress_text(manager.status())
@@ -9188,7 +9359,7 @@ def _pump_session_render(context) -> None:
             if job.notified:
                 return
             job.notified = True
-            failed = sum(1 for chunk in job.frames.values() if chunk.status == "failed")
+            failed = sum(1 for chunk in job.chunks.values() if chunk.status == "failed")
             if job.stopped:
                 session.send_render_control("cancel", {"job": job.id})
                 _push_message(context, "system", "Render stopped; the rendered frames were kept")
@@ -9217,28 +9388,54 @@ def _pump_session_render(context) -> None:
         return
     queue = runtime.get("render_queue") or []
     if queue:
-        job_id, frame = queue.pop(0)
+        item = queue.pop(0)
+        if len(item) == 3:
+            job_id, frame, tile = item
+        else:
+            job_id, frame = item
+            tile = 0
+        tiles_x = max(1, int(runtime.get("render_tiles_x", 1) or 1))
+        tiles_y = max(1, int(runtime.get("render_tiles_y", 1) or 1))
+        width = int(runtime.get("render_width", 0) or 0)
+        height = int(runtime.get("render_height", 0) or 0)
         runtime["render_busy"] = True
         try:
             ok, error, data = _render_session_frame(
                 context,
                 frame,
-                int(runtime.get("render_width", 0) or 0),
-                int(runtime.get("render_height", 0) or 0),
+                width,
+                height,
                 str(runtime.get("render_engine_override", "")),
+                int(tile or 0),
+                tiles_x,
+                tiles_y,
             )
             if ok:
+                scene = context.scene
+                fw = width or max(1, int(round(scene.render.resolution_x * scene.render.resolution_percentage / 100.0)))
+                fh = height or max(1, int(round(scene.render.resolution_y * scene.render.resolution_percentage / 100.0)))
+                x0, y0, x1, y1 = _tile_geometry(fw, fh, tiles_x, tiles_y, int(tile or 0))
                 session.send_render_frame(
                     job_id,
                     frame,
                     "png",
-                    int(runtime.get("render_width", 0) or 0),
-                    int(runtime.get("render_height", 0) or 0),
+                    fw,
+                    fh,
                     data,
+                    tile=int(tile or 0),
+                    tiles_x=tiles_x,
+                    tiles_y=tiles_y,
+                    tile_x=x0,
+                    tile_y=y0,
+                    tile_w=x1 - x0,
+                    tile_h=y1 - y0,
                 )
                 runtime["render_done"] = int(runtime.get("render_done", 0)) + 1
             else:
-                session.send_render_control("fail", {"job": job_id, "frame": frame, "error": error})
+                session.send_render_control(
+                    "fail",
+                    {"job": job_id, "frame": frame, "tile": int(tile or 0), "error": error},
+                )
         finally:
             runtime["render_busy"] = False
         if not queue:
