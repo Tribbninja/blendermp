@@ -74,7 +74,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 11, 16),
+    "version": (0, 11, 17),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -7299,7 +7299,6 @@ def _write_status(context, force: bool = False) -> None:
     render_manager = runtime.get("render_manager")
     render_status = render_manager.status() if render_manager is not None else {"active": False}
     render_status["request"] = runtime.get("render_request")
-    render_status["role"] = "host" if settings.is_host else "client"
     if render_status.get("active") or render_status.get("finished"):
         settings.render_progress = (
             f"{render_status.get('done', 0)}/{render_status.get('total', 0)} frames "
@@ -7321,6 +7320,11 @@ def _write_status(context, force: bool = False) -> None:
         code = getattr(session, "code", None) or code
         is_host = bool(getattr(session, "is_host", is_host))
         name = getattr(session, "name", None) or name
+        # Keep the property group in sync with the live session. Loading a
+        # .blend can reset it, which used to make host-only actions refuse.
+        if settings.is_host != is_host:
+            settings.is_host = is_host
+    render_status["role"] = "host" if is_host else "client"
     local_active = context.active_object.name if context.active_object is not None else ""
     for user in settings.users:
         if user.name == settings.name:
@@ -8772,9 +8776,13 @@ def _render_progress_text(status: dict) -> str:
 def _start_session_render(context, start, end, step, format_hint, output, width=0, height=0) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
-    if session is None or not settings.is_host:
+    # The session is the source of truth. Loading a .blend can reset the
+    # window-manager property group, so settings.is_host may be stale.
+    is_host = bool(getattr(session, "is_host", False)) if session is not None else False
+    if not is_host:
         settings.last_error = "Only the host can start a render"
         return
+    settings.is_host = True
     manager = _render_manager()
     if manager.active():
         settings.last_error = "A render is already running"
@@ -8826,7 +8834,8 @@ def _start_session_render(context, start, end, step, format_hint, output, width=
 
 def _stop_session_render(context) -> None:
     settings = context.window_manager.bmp
-    if not settings.is_host:
+    session: SessionService | None = runtime.get("session")
+    if session is None or not getattr(session, "is_host", False):
         settings.last_error = "Only the host can stop the render"
         return
     manager = _render_manager()
@@ -8839,10 +8848,10 @@ def _stop_session_render(context) -> None:
 
 def _retry_session_render(context) -> None:
     settings = context.window_manager.bmp
-    if not settings.is_host:
+    session: SessionService | None = runtime.get("session")
+    if session is None or not getattr(session, "is_host", False):
         settings.last_error = "Only the host can retry the render"
         return
-    session: SessionService | None = runtime.get("session")
     manager = _render_manager()
     count = manager.retry_failed()
     if not count:
