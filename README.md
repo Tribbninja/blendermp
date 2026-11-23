@@ -14,6 +14,18 @@ surface that cross-process re-parenting causes on some GPUs).
 
 ![Blendermp UI](docs/ui-preview.jpeg)
 
+## Download and update
+
+Friends only need one file:
+**[Blendermp-Updater.exe](https://github.com/Tribbninja/blendermp/releases/latest/download/Blendermp-Updater.exe)**.
+
+Run it once. It asks GitHub for the newest release, downloads the latest
+installer, installs it silently, and launches Blendermp. Run the same file again
+any time to update — it always pulls the latest build, so you never have to send
+a new exe around.
+
+All releases: <https://github.com/Tribbninja/blendermp/releases>
+
 ## What works today
 
 * **Public server browser.** Hosts set a server name, publish it to a directory,

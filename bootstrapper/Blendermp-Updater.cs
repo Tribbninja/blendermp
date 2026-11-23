@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
@@ -10,8 +10,8 @@ using System.Windows.Forms;
 // installs it silently, then starts the app. Friends keep one copy of this exe.
 class UpdaterForm : Form
 {
-    private const string Owner = "__OWNER__";
-    private const string Repo = "__REPO__";
+    private const string RepoOwner = "__OWNER__";
+    private const string RepoName = "__REPO__";
 
     private readonly ProgressBar bar;
     private readonly Label status;
@@ -55,7 +55,7 @@ class UpdaterForm : Form
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
             var client = new WebClient();
             client.Headers.Add("User-Agent", "Blendermp-Updater");
-            var api = string.Format("https://api.github.com/repos/{0}/{1}/releases/latest", Owner, Repo);
+            var api = string.Format("https://api.github.com/repos/{0}/{1}/releases/latest", RepoOwner, RepoName);
             var json = await client.DownloadStringTaskAsync(api);
             var match = Regex.Match(json, "\"browser_download_url\"\\s*:\\s*\"([^\"]*-Setup\\.exe)\"");
             if (!match.Success)
@@ -103,3 +103,4 @@ static class Program
         Application.Run(new UpdaterForm());
     }
 }
+
