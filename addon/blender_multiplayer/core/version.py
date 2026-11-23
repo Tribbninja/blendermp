@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-ADDON_VERSION = "0.11.14"
+ADDON_VERSION = "0.11.15"
 
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 

@@ -25,6 +25,7 @@
     "allow-take-deep-link",
     "allow-open-dashboard",
     "allow-log-client",
+    "allow-ui-ready",
     "allow-export-diagnostics"
   ]
 }
