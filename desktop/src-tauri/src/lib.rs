@@ -44,6 +44,7 @@ struct AppState {
     #[cfg(not(windows))]
     embedded: Mutex<Option<()>>,
     directory: Option<directory::DirectoryHandle>,
+    ui_ready: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Deserialize, Serialize, Clone, Copy)]
@@ -989,6 +990,14 @@ fn log_client(message: String) {
     }
 }
 
+#[tauri::command]
+fn ui_ready(state: State<AppState>) {
+    state
+        .ui_ready
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    log_client("ui_ready".to_string());
+}
+
 fn chrono_stamp() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1476,6 +1485,33 @@ pub fn run() {
             blender_pid: Mutex::new(None),
             embedded: Mutex::new(None),
             directory: directory_server,
+            ui_ready: std::sync::atomic::AtomicBool::new(false),
+        })
+        .setup(|app| {
+            // If the WebView2 surface renders blank (old runtime or a flaky
+            // GPU driver), the HTML never calls ui_ready. Show a native hint
+            // instead of leaving the user with an empty window.
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                let ready = {
+                    let state = handle.state::<AppState>();
+                    state.ui_ready.load(std::sync::atomic::Ordering::Relaxed)
+                };
+                if !ready {
+                    log_client("ui_ready timeout; WebView2 likely did not render".to_string());
+                    #[cfg(windows)]
+                    unsafe {
+                        let _ = windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                            std::ptr::null_mut(),
+                            windows_sys::core::w!("The Blendermp interface did not load.\n\nInstall the latest Microsoft WebView2 Runtime, then reopen the app. If it still fails, update your graphics driver."),
+                            windows_sys::core::w!("Blendermp"),
+                            0x00000030u32,
+                        );
+                    }
+                }
+            });
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             local_directory,
@@ -1495,6 +1531,7 @@ pub fn run() {
             read_settings,
             write_settings,
             log_client,
+            ui_ready,
             startup_flags,
             write_session,
             take_deep_link,
