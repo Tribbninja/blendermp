@@ -692,6 +692,7 @@ def start_host(
     _upsert_user(context, name, tuple(settings.color), host=True)
     _push_message(context, "system", f"Hosting room {code}")
     eventlog.log("info", "HOST_START", "hosting", room=code, relay=bool(relay))
+    _load_render_queue()
     _restore_render_job(context)
     _ensure_timer()
 
@@ -824,6 +825,8 @@ def stop_session(context, publish: bool = True, preserve_render: bool = False) -
                 manager.save(force=True)
             else:
                 manager.cancel()
+                runtime["render_jobs"] = []
+                _save_render_queue()
         except Exception:  # noqa: BLE001
             pass
     runtime["render_manager"] = None
@@ -9904,6 +9907,32 @@ def _pump_renderfarm(context) -> None:
 
 
 # --------------------------------------------------------------------------- session render
+def _render_queue_path() -> Path:
+    return control.data_dir() / "render_queue.json"
+
+
+def _save_render_queue() -> None:
+    path = _render_queue_path()
+    try:
+        temp = path.with_suffix(".tmp")
+        temp.write_text(
+            json.dumps(runtime.get("render_jobs") or [], separators=(",", ":")),
+            encoding="utf-8",
+        )
+        temp.replace(path)
+    except OSError:
+        pass
+
+
+def _load_render_queue() -> None:
+    path = _render_queue_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = []
+    runtime["render_jobs"] = [item for item in data if isinstance(item, dict)][:32] if isinstance(data, list) else []
+
+
 def _render_manager():
     manager = runtime.get("render_manager")
     if manager is None:
@@ -9974,7 +10003,7 @@ def _render_progress_text(status: dict) -> str:
     return text
 
 
-def _start_session_render(context, start, end, step, format_hint, output, width=0, height=0, engine_override="", tiles_x=1, tiles_y=1, queue_job=False) -> None:
+def _start_session_render(context, start, end, step, format_hint, output, width=0, height=0, engine_override="", tiles_x=1, tiles_y=1, queue_job=False, from_queue=False) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
     # The session is the source of truth. Loading a .blend can reset the
@@ -9985,7 +10014,7 @@ def _start_session_render(context, start, end, step, format_hint, output, width=
         return
     settings.is_host = True
     manager = _render_manager()
-    if manager.active() or runtime.get("render_jobs"):
+    if not from_queue and (manager.active() or runtime.get("render_jobs")):
         if not queue_job:
             settings.last_error = "A render is already running or queued"
             return
@@ -10003,6 +10032,7 @@ def _start_session_render(context, start, end, step, format_hint, output, width=
                 "tiles_y": int(tiles_y or 1),
             }
         )
+        _save_render_queue()
         _push_message(context, "system", f"Queued render {int(start)}-{int(end)}")
         _write_status(context, force=True)
         return
@@ -10065,6 +10095,7 @@ def _stop_session_render(context) -> None:
     manager = _render_manager()
     if manager.stop():
         runtime["render_jobs"] = []
+        _save_render_queue()
         _push_message(context, "system", "Stopping the render; the rendered frames are kept")
         _write_status(context, force=True)
     else:
@@ -10593,7 +10624,18 @@ def _pump_session_render(context) -> None:
     if settings.is_host:
         job = manager.job()
         if job is None:
-            return
+            queued = runtime.get("render_jobs") or []
+            if queued:
+                next_job = queued.pop(0)
+                runtime["render_jobs"] = queued
+                _save_render_queue()
+                try:
+                    _start_session_render(context, **next_job, from_queue=True)
+                except Exception:  # noqa: BLE001
+                    traceback.print_exc()
+                job = manager.job()
+            if job is None:
+                return
         if not job.asked and not job.finished:
             peers = session.authenticated_peers()
             if peers:
@@ -10692,8 +10734,9 @@ def _pump_session_render(context) -> None:
                 if queued:
                     next_job = queued.pop(0)
                     runtime["render_jobs"] = queued
+                    _save_render_queue()
                     try:
-                        _start_session_render(context, **next_job)
+                        _start_session_render(context, **next_job, from_queue=True)
                     except Exception:  # noqa: BLE001
                         traceback.print_exc()
             settings.render_progress = _render_progress_text(manager.status())
