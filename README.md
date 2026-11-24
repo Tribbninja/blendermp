@@ -26,6 +26,27 @@ a new exe around.
 
 All releases: <https://github.com/Tribbninja/blendermp/releases>
 
+### Blender-only addon (no desktop app)
+
+If the Windows app is blocked or you only want to stay inside Blender, install
+the addon directly:
+
+1. Download
+   **[blender_multiplayer-standalone-0.11.24.zip](https://github.com/Tribbninja/blendermp/releases/download/v0.11.24/blender_multiplayer-standalone-0.11.24.zip)**.
+2. In Blender: **Edit > Preferences > Add-ons > Install from Disk**, pick the
+   zip, then enable **Blendermp**.
+3. Open the **Blendermp** tab in the 3D Viewport sidebar (press `N`).
+4. To host over the internet, leave the relay URL at its default, give the
+   server a name, and press **Host**. Share the room code.
+5. To join, paste the host's room code and press **Join**.
+
+The addon bundles `cryptography`, `cffi` and `pycparser`, so it needs no
+separate Python setup and it talks to the same Cloudflare relay as the desktop
+app — addon and app users can join each other. It works in Blender 4.2+ (the zip
+carries the C extension for Python 3.11, 3.12 and 3.13). MP4/WebM compilation
+needs `imageio-ffmpeg` installed; PNG frames render without it. Both ends must
+run the same version.
+
 ## What works today
 
 * **Public server browser.** Hosts set a server name, publish it to a directory,

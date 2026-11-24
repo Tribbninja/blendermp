@@ -17,6 +17,11 @@ from pathlib import Path as _Path
 _VENDOR = _Path(os.environ.get("LOCALAPPDATA", _Path.home() / ".local" / "share")) / "Blendermp" / "python"
 if _VENDOR.is_dir() and str(_VENDOR) not in sys.path:
     sys.path.insert(0, str(_VENDOR))
+# A standalone extension zip can carry its own wheels/packages next to this
+# file. Prefer them so the addon works without the desktop shell.
+_LOCAL_VENDOR = _Path(__file__).resolve().parent / "vendor"
+if _LOCAL_VENDOR.is_dir() and str(_LOCAL_VENDOR) not in sys.path:
+    sys.path.insert(0, str(_LOCAL_VENDOR))
 
 import atexit
 import base64
@@ -27,10 +32,13 @@ import math
 import platform
 import queue
 import re
+import secrets
 import socket
 import tempfile
+import threading
 import time
 import traceback
+import urllib.request
 import uuid
 import zipfile
 import zlib
@@ -62,6 +70,7 @@ from .core import undo as undo_log
 from .core import material as material_payload
 from .core import object_payload
 from .core import perf
+from .core import protocol
 from .core import recording
 from .core import renderfarm
 from .core import renderjob
@@ -384,6 +393,18 @@ class BMPState(PropertyGroup):
     use_relay: BoolProperty(name="Use relay", default=False)
     relay_host: StringProperty(name="Relay host", default="")
     relay_port: IntProperty(name="Relay port", default=7100, min=1024, max=65535)
+    worker_relay_url: StringProperty(
+        name="Public relay URL",
+        default="wss://blendermp-hub.tribbeisaac.workers.dev",
+        description="Cloudflare Worker WebSocket relay used for internet sessions",
+    )
+    worker_host_key: StringProperty(
+        name="Host key",
+        default="",
+        description="Optional public-relay host key; generated automatically when hosting if empty",
+    )
+    server_name: StringProperty(name="Server name", default="")
+    public_listing: BoolProperty(name="List publicly", default=True)
     paused: BoolProperty(name="Pause sync", default=False)
     follow_host: BoolProperty(name="Follow host frame", default=False)
     follow_user: StringProperty()
@@ -586,6 +607,209 @@ def _same_lan(host_ip: str) -> bool:
 
 
 # --------------------------------------------------------------------------- session control
+_ANNOUNCE_LOCK = threading.Lock()
+
+
+def _host_key_path() -> Path:
+    return control.data_dir() / "standalone_host_key.txt"
+
+
+def _load_host_key() -> str:
+    """Return the persistent host key so a restart reclaims its relay room.
+
+    The Worker remembers which token owns a room for its TTL. A fresh random
+    key on every launch made an immediate restart fail with
+    "this room is already owned by another host" until the entry expired.
+    """
+    try:
+        value = _host_key_path().read_text(encoding="utf-8").strip()
+        if re.fullmatch(r"[0-9a-f]{64}", value):
+            return value
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _save_host_key(value: str) -> None:
+    try:
+        control.data_dir().mkdir(parents=True, exist_ok=True)
+        _host_key_path().write_text(value, encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _worker_http_url(url: str) -> str:
+    value = str(url or "").strip()
+    if value.startswith("wss://"):
+        return "https://" + value[6:]
+    if value.startswith("ws://"):
+        return "http://" + value[5:]
+    return ""
+
+
+# Cloudflare's browser integrity check answers Python's default urllib agent
+# with "error code: 1010" and never reaches the Worker. Any real-looking agent
+# (the desktop app's WebView sends one too) is accepted, so send the same shape
+# of request the app does.
+_HTTP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Blendermp/0.11.24 Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def _http_headers(url: str) -> dict:
+    origin = ""
+    if url.startswith("https://"):
+        origin = "https://" + url[8:].split("/", 1)[0]
+    elif url.startswith("http://"):
+        origin = "http://" + url[7:].split("/", 1)[0]
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": _HTTP_UA,
+    }
+    if origin:
+        headers["Origin"] = origin
+        headers["Referer"] = origin + "/"
+    return headers
+
+
+def _post_worker_announce(url: str, body: dict) -> None:
+    try:
+        data = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        request = urllib.request.Request(
+            url.rstrip("/") + "/announce",
+            data=data,
+            headers=_http_headers(url),
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=6) as response:
+            response.read(1024)
+        runtime["announce_ok"] = True
+        print("BMP announce ok", url, flush=True)
+    except Exception as exc:  # noqa: BLE001
+        runtime["announce_ok"] = False
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:300]  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            detail = str(exc)
+        print("BMP announce failed", detail, flush=True)
+
+
+def _worker_announce_body(context, session, settings) -> dict | None:
+    descriptor = getattr(session, "identity_descriptor", None)
+    if (
+        not isinstance(descriptor, dict)
+        or not getattr(session, "identity_public", "")
+        or not getattr(session, "identity_signature", "")
+    ):
+        return None
+    server_id = runtime.get("worker_server_id")
+    if not server_id:
+        server_id = secrets.token_hex(8)
+        runtime["worker_server_id"] = server_id
+    return {
+        "id": server_id,
+        "name": (settings.server_name.strip() or f"{settings.name}'s server")[:64],
+        "host": settings.name[:48],
+        "code": settings.code,
+        "players": max(1, len(settings.users)),
+        "max": 64,
+        "password": bool(settings.pin),
+        "relay": True,
+        "relay_url": settings.worker_relay_url.strip(),
+        "host_token": settings.worker_host_key.strip(),
+        "version": ADDON_VERSION,
+        "protocol": protocol.PROTOCOL_VERSION,
+        "caps": protocol.DEFAULT_CAPABILITIES,
+        "min_app": ADDON_VERSION,
+        "identity_public": session.identity_public,
+        "identity_signature": session.identity_signature,
+        "identity_descriptor": descriptor,
+        "direct_code": settings.direct_code,
+        "direct_codes": [code for code in settings.direct_codes.split(",") if code][:4],
+    }
+
+
+def _maybe_announce_worker(context, force: bool = False) -> None:
+    session: SessionService | None = runtime.get("session")
+    settings = context.window_manager.bmp
+    if session is None or not session.is_host or not settings.use_relay:
+        return
+    if not settings.public_listing:
+        return
+    url = _worker_http_url(settings.worker_relay_url)
+    if not url:
+        return
+    now = time.monotonic()
+    # The first announce races the relay's host WebSocket: the Worker only
+    # accepts that socket after the token is stored, so retry quickly until it
+    # lands, then settle into the directory TTL heartbeat.
+    interval = 25.0 if runtime.get("announce_ok") else 2.0
+    if not force and now - runtime.get("last_announce", 0.0) < interval:
+        return
+    body = _worker_announce_body(context, session, settings)
+    if body is None:
+        print("BMP announce skipped: identity not ready", flush=True)
+        return
+    runtime["last_announce"] = now
+    # Two announces can be queued a few milliseconds apart (the first with the
+    # session's identity, the next with the direct LAN codes). They post in
+    # parallel and the slower, older body would overwrite the newer listing.
+    # Keep one sender and let it always post the newest queued body.
+    with _ANNOUNCE_LOCK:
+        runtime["announce_pending"] = (url, body)
+        if runtime.get("announce_busy"):
+            return
+        runtime["announce_busy"] = True
+    threading.Thread(target=_announce_loop, name="bmp-announce", daemon=True).start()
+
+
+def _announce_loop() -> None:
+    try:
+        while True:
+            with _ANNOUNCE_LOCK:
+                pending = runtime.pop("announce_pending", None)
+                if pending is None:
+                    runtime["announce_busy"] = False
+                    return
+            _post_worker_announce(*pending)
+    except Exception:  # noqa: BLE001
+        with _ANNOUNCE_LOCK:
+            runtime["announce_busy"] = False
+
+
+def _post_worker_remove(url: str, server_id: str) -> None:
+    try:
+        data = json.dumps({"id": server_id}, separators=(",", ":")).encode("utf-8")
+        request = urllib.request.Request(
+            url.rstrip("/") + "/remove",
+            data=data,
+            headers=_http_headers(url),
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=6) as response:
+            response.read(1024)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _remove_worker_listing(context) -> None:
+    settings = context.window_manager.bmp
+    server_id = runtime.pop("worker_server_id", "")
+    url = _worker_http_url(settings.worker_relay_url)
+    if not server_id or not url:
+        return
+    threading.Thread(
+        target=_post_worker_remove,
+        args=(url, server_id),
+        name="bmp-unannounce",
+        daemon=True,
+    ).start()
+
+
 def start_host(
     context,
     code: str | None = None,
@@ -607,6 +831,14 @@ def start_host(
         return
     # Keep the previous session's late events out of this one. They used to land
     # in a shared inbox and overwrite the fresh state with "offline".
+    if relay_url:
+        key = (relay_token or settings.worker_host_key).strip() or _load_host_key()
+        if not key:
+            key = secrets.token_hex(32)
+        settings.worker_host_key = key
+        settings.use_relay = True
+        _save_host_key(key)
+        relay_token = key
     stop_session(context, publish=False, preserve_render=True)
     inbox = queue.Queue()
     runtime["inbox"] = inbox
@@ -617,8 +849,13 @@ def start_host(
     bridge = None
     if code is None and settings.use_relay:
         if relay_url:
-            endpoint_port = port or settings.port
-            code = encode_room(_local_ip(), endpoint_port, flags | FLAG_RELAY)
+            # Relay rooms are keyed by the room code. The LAN address/port is
+            # never used on this path, so encode a random port: two hosts behind
+            # the same 192.168.x.x address would otherwise claim the same room
+            # and one would get "already owned by another host". The real LAN
+            # port travels separately in direct_codes for the direct fallback.
+            code_port = 49152 + secrets.randbelow(16000)
+            code = encode_room(_local_ip(), code_port, flags | FLAG_RELAY)
             from .net.worker_relay import WorkerBridge
 
             settings.code = code
@@ -694,6 +931,8 @@ def start_host(
     eventlog.log("info", "HOST_START", "hosting", room=code, relay=bool(relay))
     _load_render_queue()
     _restore_render_job(context)
+    if relay_url:
+        _maybe_announce_worker(context, force=True)
     _ensure_timer()
 
 
@@ -829,6 +1068,8 @@ def stop_session(context, publish: bool = True, preserve_render: bool = False) -
                 _save_render_queue()
         except Exception:  # noqa: BLE001
             pass
+    _remove_worker_listing(context)
+    runtime["announce_ok"] = False
     runtime["render_manager"] = None
     runtime["render_request"] = None
     runtime["render_active"] = False
@@ -939,6 +1180,13 @@ def _handle_event(context, kind: str, body: dict) -> None:
         settings.fingerprint = body.get("fingerprint", "")
         settings.verify_code = body.get("short", "")
         _push_message(context, "system", f"Room {settings.code} ready")
+        # The first announce can race this event and go out without the direct
+        # LAN codes, which makes the desktop app wait a full heartbeat before it
+        # can try the fast path. Publish the finished entry now.
+        try:
+            _maybe_announce_worker(context, force=True)
+        except Exception:  # noqa: BLE001
+            pass
     elif kind == "host_key":
         settings.fingerprint = body.get("fingerprint", "")
         settings.verify_code = body.get("short", "")
@@ -8898,6 +9146,7 @@ def bmp_tick():
             _safe_tick_step("send_presence", lambda: _send_presence(context))
             _safe_tick_step("send_subscription", lambda: _send_subscription(context))
             _safe_tick_step("send_client_stats", lambda: _send_client_stats(context))
+            _safe_tick_step("worker_announce", lambda: _maybe_announce_worker(context))
         _safe_tick_step("journal_capture", lambda: _journal_capture(context))
         _safe_tick_step("auto_checkpoint", lambda: _maybe_auto_checkpoint(context))
         _safe_tick_step("scene_bootstrap", lambda: _pump_scene_bootstrap(context))
@@ -8950,7 +9199,19 @@ class BMP_OT_host(Operator):
     bl_options = {"REGISTER"}
 
     def execute(self, context):
-        start_host(context)
+        settings = context.window_manager.bmp
+        url = settings.worker_relay_url.strip()
+        token = settings.worker_host_key.strip()
+        if url and not token:
+            token = secrets.token_hex(32)
+            settings.worker_host_key = token
+        if url:
+            settings.use_relay = True
+        try:
+            start_host(context, relay_url=url or None, relay_token=token or None)
+        except Exception as exc:  # noqa: BLE001
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
         return {"FINISHED"}
 
 
@@ -8974,8 +9235,10 @@ class BMP_OT_join(Operator):
         if not code:
             self.report({"ERROR"}, "Enter a room code")
             return {"CANCELLED"}
+        settings = context.window_manager.bmp
+        url = settings.worker_relay_url.strip()
         try:
-            start_join(context, code)
+            start_join(context, code, relay_url=url or None)
         except Exception as exc:  # noqa: BLE001
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}

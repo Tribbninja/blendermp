@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .coverage
 bench/results.json
+build/
 
 # Bootstrap toolchain
 .tools/

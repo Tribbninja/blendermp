@@ -85,10 +85,21 @@ class BMP_PT_main(bpy.types.Panel):
             if settings.lease_info:
                 box.label(text=settings.lease_info[:80], icon="LOCKED")
 
-        row = layout.row(align=True)
         if settings.state == "offline":
-            row.label(text="Host or browse public servers in the desktop app", icon="INFO")
+            box = layout.box()
+            box.label(text="Session", icon="PLAY")
+            box.prop(settings, "name")
+            box.prop(settings, "server_name")
+            box.prop(settings, "worker_relay_url")
+            box.prop(settings, "worker_host_key")
+            box.prop(settings, "public_listing")
+            row = box.row(align=True)
+            row.operator("bmp.host", text="Host", icon="PLAY")
+            row.operator("bmp.join", text="Join", icon="LINKED")
+            box.prop(settings, "join_code")
+            box.label(text="Leave the relay URL blank for LAN/direct hosting.", icon="INFO")
         else:
+            row = layout.row(align=True)
             row.operator("bmp.leave", text="Leave", icon="PANEL_CLOSE")
             if settings.state == "connected":
                 row.operator("bmp.ping", text="Ping", icon="SORTTIME")
@@ -378,6 +389,10 @@ class BMP_PT_main(bpy.types.Panel):
         box.prop(settings, "port")
         box.prop(settings, "pin")
         box.prop(settings, "name")
+        box.prop(settings, "server_name")
+        box.prop(settings, "worker_relay_url")
+        box.prop(settings, "worker_host_key")
+        box.prop(settings, "public_listing")
         box.prop(settings, "use_relay")
         if settings.use_relay:
             box.prop(settings, "relay_host")
