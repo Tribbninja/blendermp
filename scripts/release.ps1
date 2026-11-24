@@ -25,6 +25,7 @@ $assets = @(
     (Join-Path $dist "Blendermp-$Version-Setup.exe"),
     (Join-Path $dist "blendermp-windows-x64-$Version.zip"),
     (Join-Path $dist "blender_multiplayer-$Version.zip"),
+    (Join-Path $dist "blender_multiplayer-standalone-$Version.zip"),
     (Join-Path $dist "Blendermp-Updater.exe")
 )
 foreach ($asset in $assets) {

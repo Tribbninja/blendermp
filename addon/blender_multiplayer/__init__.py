@@ -83,7 +83,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 11, 24),
+    "version": (0, 11, 25),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -653,7 +653,7 @@ def _worker_http_url(url: str) -> str:
 # of request the app does.
 _HTTP_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Blendermp/0.11.24 Chrome/120.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Blendermp/" + ADDON_VERSION + " Chrome/120.0.0.0 Safari/537.36"
 )
 
 

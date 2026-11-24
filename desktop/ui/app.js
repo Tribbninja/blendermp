@@ -26,6 +26,18 @@ async function invoke(command, args = {}) {
   return mockInvoke(command, args);
 }
 
+// A native call that never resolves (a wedged target window, a slow disk) used
+// to hold its await forever. The window stayed painted but every later step
+// waited behind it, which looked like a freeze. Bound the wait instead.
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error(`${label || "call"} timed out`)), ms);
+    }),
+  ]);
+}
+
 function log(message) {
   if (!isTauri) return;
   try {
@@ -140,7 +152,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.11.24";
+const APP_VERSION = "0.11.25";
 const PROTOCOL_VERSION = 3;
 const CAPABILITIES = 1 | (1 << 10) | (1 << 11) | (1 << 12); // presence, bookmarks, bundles, chunks
 const settings = {
@@ -589,6 +601,7 @@ function setPanel(name) {
     refreshServerBrowser();
     setTimeout(() => $("serverSearch").focus(), 30);
   }
+  if (name === "session") refreshRenderPreview();
   if (name === "settings") {
     $("setName").value = settings.name;
     $("setPort").value = settings.port;
@@ -630,14 +643,18 @@ async function updateBounds() {
   state.boundsKey = key;
   boundsBusy = true;
   try {
-    await invoke("set_embed_bounds", {
-      xPx: Math.round(box.x),
-      yPx: Math.round(box.y),
-      widthPx: Math.round(box.width),
-      heightPx: Math.round(box.height),
-      viewportW: Math.round(box.viewportW),
-      viewportH: Math.round(box.viewportH),
-    });
+    await withTimeout(
+      invoke("set_embed_bounds", {
+        xPx: Math.round(box.x),
+        yPx: Math.round(box.y),
+        widthPx: Math.round(box.width),
+        heightPx: Math.round(box.height),
+        viewportW: Math.round(box.viewportW),
+        viewportH: Math.round(box.viewportH),
+      }),
+      4000,
+      "set_embed_bounds",
+    );
   } catch (error) {
     state.boundsKey = "";
     log(`bounds failed: ${error}`);
@@ -1404,14 +1421,24 @@ function welcomeStart() {
 
 async function refreshRenderPreview() {
   if (!isTauri) return;
+  // Only the session panel shows the preview, and a hidden window has no reason
+  // to pull multi-megabyte data URLs. Base64 PNGs are decoded on the UI thread,
+  // so a 2 s poll of six 1080p frames was enough to make weaker machines hitch.
+  if (state.panel !== "session" || document.visibilityState === "hidden") return;
   try {
-    const preview = await invoke("render_preview");
+    const preview = await invoke("render_preview", { max: 4 });
     const wrap = $("renderPreviewWrap");
     if (!preview || !Array.isArray(preview.frames) || preview.frames.length === 0) {
+      state.previewSignature = "";
       wrap.hidden = true;
       return;
     }
     wrap.hidden = false;
+    const signature = `${preview.count}:${preview.frames
+      .map((frame) => `${frame.name}@${frame.size || 0}`)
+      .join("|")}`;
+    if (signature === state.previewSignature) return;
+    state.previewSignature = signature;
     $("renderPreviewMain").src = preview.frames[0].data;
     $("renderPreviewCount").textContent = `${preview.count} frame(s)`;
     const sheet = $("renderContactSheet");
@@ -1870,20 +1897,25 @@ function removeServer() {
 
 async function embedNow() {
   state.dockEnabled = true;
+  store.set("dock", "1");
   try {
     const box = insets();
     if (box.width < 80 || box.height < 60) {
       toast("The viewport is not ready yet", "error");
       return;
     }
-    await invoke("embed_blender", {
-      xPx: box.x,
-      yPx: box.y,
-      widthPx: box.width,
-      heightPx: box.height,
-      viewportW: box.viewportW,
-      viewportH: box.viewportH,
-    });
+    await withTimeout(
+      invoke("embed_blender", {
+        xPx: box.x,
+        yPx: box.y,
+        widthPx: box.width,
+        heightPx: box.height,
+        viewportW: box.viewportW,
+        viewportH: box.viewportH,
+      }),
+      6000,
+      "embed_blender",
+    );
     state.embedded = true;
     state.embedError = "";
     state.verifyAt = Date.now() + 4000;
@@ -1898,6 +1930,9 @@ async function embedNow() {
 
 async function detachNow() {
   state.dockEnabled = false;
+  // Remember the choice: auto-docking a Blender window on the next launch was
+  // the difference between "usable" and "frozen" on some machines.
+  store.set("dock", "0");
   try {
     await invoke("detach_blender");
   } catch {
@@ -1998,16 +2033,20 @@ async function embedLoop() {
       if (state.verifyAt && Date.now() >= state.verifyAt) await verifyDock();
       return;
     }
-    const found = await invoke("find_blender_window").catch(() => null);
+    const found = await withTimeout(invoke("find_blender_window"), 3000, "find_blender_window").catch(() => null);
     if (!found) return;
-    await invoke("embed_blender", {
-      xPx: box.x,
-      yPx: box.y,
-      widthPx: box.width,
-      heightPx: box.height,
-      viewportW: box.viewportW,
-      viewportH: box.viewportH,
-    });
+    await withTimeout(
+      invoke("embed_blender", {
+        xPx: box.x,
+        yPx: box.y,
+        widthPx: box.width,
+        heightPx: box.height,
+        viewportW: box.viewportW,
+        viewportH: box.viewportH,
+      }),
+      6000,
+      "embed_blender",
+    );
     state.embedded = true;
     state.embedError = "";
     state.verifyAt = Date.now() + 4000;
@@ -2145,6 +2184,7 @@ async function boot() {
   invoke("ui_ready").catch((error) => log(`ui_ready failed: ${error}`));
   await loadSettings();
   applyStoredSettings();
+  state.dockEnabled = store.get("dock", "1") !== "0";
   window.BMPA11y?.apply();
   wire();
   window.BMPLayout?.init({
@@ -2187,18 +2227,30 @@ async function boot() {
     return;
   }
 
-  await detectBlender();
-  showWelcomeIfNeeded();
-  await poll();
-  renderRecent();
+  // Startup used to await detection and the first poll before it started the
+  // loops, so a slow registry scan or a wedged IPC call left the window looking
+  // frozen on first launch. Paint and start polling first; fill in the rest as
+  // the answers arrive.
+  log("boot: shell ready");
   setInterval(poll, 750);
   setInterval(pollDeepLink, 1000);
   setInterval(embedLoop, 1200);
-  setInterval(refreshRenderPreview, 2000);
+  setInterval(refreshRenderPreview, 4000);
   setInterval(announceServer, 15000);
   setInterval(() => {
     if (state.panel === "servers") loadServers();
   }, 8000);
+
+  renderRecent();
+  detectBlender()
+    .catch((error) => log(`detect failed: ${error}`))
+    .finally(() => {
+      log("boot: blender detection done");
+      showWelcomeIfNeeded();
+    });
+  poll()
+    .catch((error) => log(`poll failed: ${error}`))
+    .finally(() => log("boot: first status read done"));
 
   try {
     const flags = await invoke("startup_flags");

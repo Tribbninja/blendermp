@@ -32,7 +32,7 @@ If the Windows app is blocked or you only want to stay inside Blender, install
 the addon directly:
 
 1. Download
-   **[blender_multiplayer-standalone-0.11.24.zip](https://github.com/Tribbninja/blendermp/releases/download/v0.11.24/blender_multiplayer-standalone-0.11.24.zip)**.
+   **[blender_multiplayer-standalone-0.11.25.zip](https://github.com/Tribbninja/blendermp/releases/download/v0.11.25/blender_multiplayer-standalone-0.11.25.zip)**.
 2. In Blender: **Edit > Preferences > Add-ons > Install from Disk**, pick the
    zip, then enable **Blendermp**.
 3. Open the **Blendermp** tab in the 3D Viewport sidebar (press `N`).
@@ -631,6 +631,21 @@ If Blender does not start or the session stays offline, check
 `%LOCALAPPDATA%\Blendermp\blender.log` (Blender and addon output) and
 `%LOCALAPPDATA%\Blendermp\ui.log` (desktop app). Blendermp requires Blender 4.2 LTS or newer;
 on a PC without it, the installer offers to install Blender 5.3 automatically.
+
+### Windows Defender or SmartScreen blocks the app
+
+The desktop build is unsigned, so a PC that has never seen it can show
+"Windows protected your PC" or "This content is blocked for your protection".
+See [docs/DEFENDER.md](docs/DEFENDER.md) for the one-minute fix (unblock the
+file, or add an exclusion), and remember that the Blender-only addon needs no
+exe and is not affected.
+
+### The app window looks frozen on another PC
+
+Send `%LOCALAPPDATA%\Blendermp\ui.log` and `boot.log` from that PC. If the
+window paints but never reacts, undock Blender with the viewport's **Detach**
+button, or use the Blender-only addon, which has no WebView or native window
+docking at all.
 
 ## Security
 

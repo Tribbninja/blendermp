@@ -51,6 +51,13 @@ $extension = Join-Path $dist "blender_multiplayer-$Version.zip"
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $extension -CompressionLevel Optimal
 Remove-Item $stage -Recurse -Force
 
+# --- Standalone extension (vendored crypto, no desktop app) -----------------
+Write-Host 'Packing standalone Blender extension...' -ForegroundColor Cyan
+Write-Progress -Id 1 -Activity 'Blendermp build' -Status 'packing standalone extension' -PercentComplete 14
+& (Join-Path $PSScriptRoot 'package_addon_standalone.ps1') -Version $Version | Out-Host
+$standalone = Join-Path $dist "blender_multiplayer-standalone-$Version.zip"
+if (-not (Test-Path $standalone)) { throw 'standalone extension was not produced' }
+
 # --- Release app ------------------------------------------------------------
 Write-Host 'Building release desktop app (this takes a few minutes)...' -ForegroundColor Cyan
 $manifest = Join-Path $root 'desktop\src-tauri\Cargo.toml'
@@ -147,10 +154,21 @@ if ($makensisPath) {
 } else {
     Write-Host 'NSIS not found; skipping installer (winget install NSIS.NSIS)' -ForegroundColor Yellow
 }
+
+# --- Updater ----------------------------------------------------------------
+$updater = Join-Path $dist 'Blendermp-Updater.exe'
+if (-not (Test-Path $updater)) {
+    $origin = (& git -C $root remote get-url origin 2>$null)
+    if ($origin -match 'github\.com[:/](?<repo>[^/]+/[^/.]+)') {
+        $owner, $name = $matches['repo'].Split('/')
+        & (Join-Path $root 'bootstrapper\build.ps1') -Owner $owner -Repo $name -Out $updater | Out-Host
+    }
+}
 Write-Progress -Id 1 -Activity 'Blendermp build' -Completed
 
 Write-Host ''
 Write-Host "Extension: $extension" -ForegroundColor Green
+Write-Host "Standalone: $standalone" -ForegroundColor Green
 Write-Host "Desktop:   $appZip" -ForegroundColor Green
 if (Test-Path $setup) { Write-Host "Installer: $setup" -ForegroundColor Green }
 Write-Host ''

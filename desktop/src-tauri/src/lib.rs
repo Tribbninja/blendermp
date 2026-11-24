@@ -941,7 +941,8 @@ fn base64_encode(data: &[u8]) -> String {
 }
 
 #[tauri::command]
-fn render_preview() -> Option<serde_json::Value> {
+fn render_preview(max: Option<usize>) -> Option<serde_json::Value> {
+    let limit = max.unwrap_or(1).clamp(1, 8);
     let directory = data_dir();
     let status = fs::read_to_string(directory.join("status.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&status).ok()?;
@@ -974,12 +975,13 @@ fn render_preview() -> Option<serde_json::Value> {
     let images = frames
         .iter()
         .rev()
-        .take(6)
+        .take(limit)
         .filter_map(|path| {
             let data = fs::read(path).ok()?;
             let name = path.file_name()?.to_string_lossy().to_string();
             Some(serde_json::json!({
                 "name": name,
+                "size": data.len(),
                 "data": format!("data:image/png;base64,{}", base64_encode(&data)),
             }))
         })
