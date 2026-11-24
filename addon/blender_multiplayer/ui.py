@@ -91,12 +91,11 @@ class BMP_PT_main(bpy.types.Panel):
             box.prop(settings, "name")
             box.prop(settings, "server_name")
             box.prop(settings, "worker_relay_url")
-            box.prop(settings, "worker_host_key")
             box.prop(settings, "public_listing")
             row = box.row(align=True)
             row.operator("bmp.host", text="Host", icon="PLAY")
-            row.operator("bmp.join", text="Join", icon="LINKED")
             box.prop(settings, "join_code")
+            box.operator("bmp.join", text="Join with code", icon="LINKED")
             box.label(text="Leave the relay URL blank for LAN/direct hosting.", icon="INFO")
         else:
             row = layout.row(align=True)
