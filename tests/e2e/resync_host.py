@@ -43,6 +43,17 @@ cube.data.materials.append(material)
 
 group = bpy.data.node_groups.new("ResyncGeo", "GeometryNodeTree")
 group.interface.new_socket("Value", in_out="INPUT", socket_type="NodeSocketFloat")
+group.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+group.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+geo_input = group.nodes.new("NodeGroupInput")
+set_position = group.nodes.new("GeometryNodeSetPosition")
+geo_output = group.nodes.new("NodeGroupOutput")
+try:
+    group.links.new(geo_input.outputs["Geometry"], set_position.inputs["Geometry"])
+    group.links.new(set_position.outputs["Geometry"], geo_output.inputs["Geometry"])
+    set_position.inputs["Offset"].default_value = (0.0, 0.0, 0.25)
+except Exception:  # noqa: BLE001
+    pass
 geo = cube.modifiers.new("Geo", "NODES")
 geo.node_group = group
 try:
@@ -50,17 +61,48 @@ try:
 except Exception:  # noqa: BLE001
     pass
 cube["ResyncProp"] = 0.5
+cube["ResyncDict"] = {"a": 1, "b": [1, 2, 3]}
+limit = cube.constraints.new("LIMIT_DISTANCE")
+limit.name = "ResyncLimit"
+limit.distance = 2.0
+
+comp = bpy.data.node_groups.new("ResyncComp", "CompositorNodeTree")
+comp.interface.new_socket("Image", in_out="OUTPUT", socket_type="NodeSocketColor")
+comp_layers = comp.nodes.new("CompositorNodeRLayers")
+comp_glare = comp.nodes.new("CompositorNodeGlare")
+comp_output = comp.nodes.new("NodeGroupOutput")
+try:
+    comp.links.new(comp_layers.outputs["Image"], comp_glare.inputs["Image"])
+    comp.links.new(comp_glare.outputs["Image"], comp_output.inputs["Image"])
+except Exception:  # noqa: BLE001
+    pass
+try:
+    comp_glare.inputs["Threshold"].default_value = 0.75
+except Exception:  # noqa: BLE001
+    pass
+context.scene.compositing_node_group = comp
 
 bpy.ops.object.camera_add(location=(5.0, -5.0, 5.0))
 camera = context.active_object
 camera.name = "ResyncCamera"
 camera.data.lens = 50.0
+camera.data.shift_x = 0.1
 context.scene.camera = camera
 
 bpy.ops.object.light_add(type="POINT", location=(3.0, 3.0, 3.0))
 light = context.active_object
 light.name = "ResyncLight"
 light.data.energy = 100.0
+light.data.use_shadow = False
+
+bpy.ops.object.armature_add(location=(2.0, 0.0, 0.0))
+rig = context.active_object
+rig.name = "ResyncRig"
+bpy.ops.object.mode_set(mode="EDIT")
+root = rig.data.edit_bones[0]
+root.name = "Root"
+root.tail = (0.0, 0.0, 2.0)
+bpy.ops.object.mode_set(mode="OBJECT")
 
 context.scene.render.resolution_x = 64
 context.scene.render.resolution_y = 64

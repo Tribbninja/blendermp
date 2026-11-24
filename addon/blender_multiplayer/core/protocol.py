@@ -114,6 +114,7 @@ class MessageType(IntEnum):
     LASER = 27
     ROLE = 38
     RESUME = 39
+    ARMATURE = 40
     POSE = 33
     ACTION = 34
     SHAPE_KEYS = 35

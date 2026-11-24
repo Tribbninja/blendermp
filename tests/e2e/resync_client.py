@@ -42,14 +42,74 @@ def finish(reason):
     cube = bpy.data.objects.get("ResyncCube")
     camera = bpy.data.objects.get("ResyncCamera")
     light = bpy.data.objects.get("ResyncLight")
+
+    def jsonable(value):
+        if hasattr(value, "to_dict"):
+            value = value.to_dict()
+        elif hasattr(value, "to_list"):
+            value = value.to_list()
+        if isinstance(value, dict):
+            return {str(key): jsonable(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [jsonable(item) for item in value]
+        return value
     geo_value = None
     if cube is not None:
         geo = cube.modifiers.get("Geo")
         if geo is not None:
             try:
-                geo_value = round(float(geo.properties.inputs.Socket_0.value), 3)
+                for prop in geo.properties.inputs.bl_rna.properties:
+                    if prop.identifier == "rna_type":
+                        continue
+                    item = getattr(geo.properties.inputs, prop.identifier)
+                    if hasattr(item, "value"):
+                        geo_value = round(float(item.value), 3)
+                        break
             except Exception:  # noqa: BLE001
                 geo_value = None
+    geo_group = bpy.data.node_groups.get("ResyncGeo")
+    comp = getattr(context.scene, "compositing_node_group", None)
+    comp_glare = None
+    if comp is not None:
+        for node in comp.nodes:
+            if getattr(node, "bl_idname", "") == "CompositorNodeGlare":
+                try:
+                    comp_glare = round(float(node.inputs["Threshold"].default_value), 3)
+                except Exception:  # noqa: BLE001
+                    comp_glare = None
+                break
+    constraint_distance = None
+    if cube is not None:
+        limit = cube.constraints.get("ResyncLimit")
+        if limit is not None:
+            try:
+                constraint_distance = round(float(limit.distance), 3)
+            except Exception:  # noqa: BLE001
+                constraint_distance = None
+    dict_prop = jsonable(cube.get("ResyncDict")) if cube is not None else None
+    camera = bpy.data.objects.get("ResyncCamera")
+    camera_shift = None
+    if camera is not None:
+        try:
+            camera_shift = round(float(camera.data.shift_x), 3)
+        except Exception:  # noqa: BLE001
+            camera_shift = None
+    light = bpy.data.objects.get("ResyncLight")
+    light_shadow = None
+    if light is not None:
+        try:
+            light_shadow = bool(light.data.use_shadow)
+        except Exception:  # noqa: BLE001
+            light_shadow = None
+    bone_tail = None
+    rig = bpy.data.objects.get("ResyncRig")
+    if rig is not None:
+        bone = rig.data.bones.get("Root")
+        if bone is not None:
+            try:
+                bone_tail = round(float(bone.tail_local[2]), 3)
+            except Exception:  # noqa: BLE001
+                bone_tail = None
     world = context.scene.world
     background = None
     if world is not None and world.use_nodes and world.node_tree is not None:
@@ -72,6 +132,14 @@ def finish(reason):
         "camera_lens": round(float(camera.data.lens), 3) if camera is not None else None,
         "light_energy": round(float(light.data.energy), 3) if light is not None else None,
         "geo_value": geo_value,
+        "geo_nodes": len(geo_group.nodes) if geo_group is not None else 0,
+        "geo_links": len(geo_group.links) if geo_group is not None else 0,
+        "comp_glare": comp_glare,
+        "constraint_distance": constraint_distance,
+        "dict_prop": dict_prop,
+        "camera_shift": camera_shift,
+        "light_shadow": light_shadow,
+        "bone_tail": bone_tail,
         "prop_value": cube.get("ResyncProp") if cube is not None else None,
         "messages": [message.text for message in wm.bmp.messages][-20:],
     }
@@ -101,10 +169,58 @@ def tick():
         geo = cube.modifiers.get("Geo") or cube.modifiers.new("Geo", "NODES")
         try:
             geo.node_group = group
-            geo.properties.inputs.Socket_0.value = 0.1
+            for prop in geo.properties.inputs.bl_rna.properties:
+                if prop.identifier == "rna_type":
+                    continue
+                item = getattr(geo.properties.inputs, prop.identifier)
+                if hasattr(item, "value"):
+                    try:
+                        item.value = 0.1
+                    except (AttributeError, TypeError, ValueError):
+                        pass
+                    break
         except Exception:  # noqa: BLE001
             pass
         cube["ResyncProp"] = 9.0
+        cube["ResyncDict"] = {"a": 9}
+        limit = cube.constraints.get("ResyncLimit")
+        if limit is not None:
+            try:
+                limit.distance = 9.0
+            except Exception:  # noqa: BLE001
+                pass
+        camera = bpy.data.objects.get("ResyncCamera")
+        if camera is not None:
+            try:
+                camera.data.shift_x = 0.4
+            except Exception:  # noqa: BLE001
+                pass
+        light = bpy.data.objects.get("ResyncLight")
+        if light is not None:
+            try:
+                light.data.use_shadow = True
+            except Exception:  # noqa: BLE001
+                pass
+        rig = bpy.data.objects.get("ResyncRig")
+        if rig is not None:
+            try:
+                context.view_layer.objects.active = rig
+                bpy.ops.object.mode_set(mode="EDIT")
+                root = rig.data.edit_bones.get("Root")
+                if root is not None:
+                    root.tail = (0.0, 0.0, 5.0)
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception:  # noqa: BLE001
+                try:
+                    bpy.ops.object.mode_set(mode="OBJECT")
+                except Exception:  # noqa: BLE001
+                    pass
+        geo_group = bpy.data.node_groups.get("ResyncGeo")
+        if geo_group is not None:
+            geo_group.nodes.clear()
+        comp = getattr(context.scene, "compositing_node_group", None)
+        if comp is not None:
+            comp.nodes.clear()
         bpy.data.objects.remove(cube, do_unlink=True)
         context.scene.render.resolution_x = 32
         world = context.scene.world

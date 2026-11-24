@@ -5,7 +5,7 @@ Blender and **docks the live window over the app viewport** (a native owned
 window, not video capture, so it keeps full GPU performance and avoids the black
 surface that cross-process re-parenting causes on some GPUs).
 
-> **Status: 0.11.23 collaboration foundation.** Hosting, the public server
+> **Status: 0.11.24 collaboration foundation.** Hosting, the public server
 > browser, TLS pinning, presence, chat, object transforms, mesh streaming, live
 > Edit Mode topology, animation, sculpt, materials/textures, asset bundles,
 > roles, checkpoints, an Ollama copilot, session recording/replay, a live
@@ -70,7 +70,9 @@ All releases: <https://github.com/Tribbninja/blendermp/releases>
   LAN-only, token-protected, and rendering blocks Blender while a frame runs.
   Fluid caches stay local; frame rendering is the distributed part. Jobs are
   saved to disk, so a host that restarts resumes the remaining frames instead of
-  starting over, and compiled videos include the scene's sequencer audio.
+  starting over, and compiled videos include the scene's sequencer audio. The
+  desktop app adds saved presets, a render queue, and a latest-frame/contact-sheet
+  preview.
 * **AI copilot (local Ollama)**: a chat panel proposes structured edits
   (transforms, primitives, materials, modifiers, booleans, scene settings) with
   a scene snapshot for context. Nothing is applied until you confirm; failed
@@ -533,8 +535,11 @@ See `docs/PLAN.md` for the full architecture, performance targets and roadmap.
   material graph still applies. World background, render settings, active
   camera, camera lens/clip, light energy/colour, geometry-node modifier input
   values and safe object custom properties are refreshed live by auto-resync.
-  Geometry-node group graphs themselves, compositor nodes, simulations and
-  linked libraries are not replicated yet.
+  Geometry-node graphs and compositor graphs are replicated as well (nodes,
+  links, interface and modifier input values), along with armature edit bones,
+  constraint properties, nested object custom properties, and camera/light data.
+  Script, import/export and file-output nodes are skipped for safety.
+  Simulations and linked libraries are not replicated yet.
 * Action sync covers the active action plus NLA tracks/strips and their actions.
   Shape-key values and coordinates sync. Object-transform drivers are replicated
   only when their expression is a safe arithmetic/math subset; other drivers are

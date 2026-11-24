@@ -15,6 +15,7 @@ fn main() {
                 "focus_blender",
                 "set_blender_visible",
                 "read_status",
+                "render_preview",
                 "read_settings",
                 "write_settings",
                 "startup_flags",

@@ -143,6 +143,18 @@
           </div>
           <div id="renderHostControls">
             <div class="render-range">
+              <label>Preset
+                <select id="renderPreset">
+                  <option value="">Custom</option>
+                </select>
+              </label>
+              <label>Name
+                <input id="renderPresetName" class="preset-name" maxlength="32" placeholder="Preset name" />
+              </label>
+              <button class="btn ghost" id="renderPresetSave">Save preset</button>
+              <button class="btn ghost" id="renderPresetDelete">Delete</button>
+            </div>
+            <div class="render-range">
               <label>Frames <input id="renderStart" type="number" value="1" min="0" /></label>
               <label>to <input id="renderEnd" type="number" value="250" min="0" /></label>
               <label>step <input id="renderStep" type="number" value="1" min="1" /></label>
@@ -176,6 +188,7 @@
                 </select>
               </label>
               <button class="btn primary" id="renderStartBtn">Custom render</button>
+              <button class="btn ghost" id="renderQueueBtn">Queue render</button>
             </div>
             <p class="fine">Width/height 0 uses the scene resolution. Tiles split each frame across workers; the host stitches them together.</p>
           </div>
@@ -187,6 +200,11 @@
               <button class="btn ghost danger" id="renderStopBtn">Stop render</button>
               <button class="btn ghost" id="renderRetryBtn" hidden>Retry failed</button>
             </div>
+          </div>
+          <div id="renderPreviewWrap" hidden>
+            <div class="section-head"><span>Latest frames</span><span class="live" id="renderPreviewCount"></span></div>
+            <img id="renderPreviewMain" class="render-preview" alt="Latest rendered frame" />
+            <div id="renderContactSheet" class="render-contact"></div>
           </div>
         </section>
 
@@ -357,7 +375,7 @@
         <span id="statusLeft">Ready</span>
         <span class="grow"></span>
         <span id="statusMid"></span>
-        <span id="statusRight">v0.11.23</span>
+        <span id="statusRight">v0.11.24</span>
       </div>
     </main>
     </section>
@@ -408,5 +426,17 @@
   <script src="a11y.js"></script>
   <script src="app.js"></script>
   <script src="dashboard.js"></script>
+  <div class="modal-overlay" id="welcomeOverlay" hidden>
+    <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="welcomeTitle">
+      <h2 id="welcomeTitle">Welcome to Blendermp</h2>
+      <p>Pick a display name and point at Blender 5.x. You can change both later in Settings.</p>
+      <label class="field"><span>Display name</span><input id="welcomeName" maxlength="48" /></label>
+      <label class="field"><span>Blender executable</span><input id="welcomeBlender" spellcheck="false" /></label>
+      <div class="actions">
+        <button class="btn ghost" id="welcomeDetect">Detect Blender</button>
+        <button class="btn primary" id="welcomeStart">Get started</button>
+      </div>
+    </div>
+  </div>
 </body>
 </html>

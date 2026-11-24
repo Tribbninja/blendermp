@@ -311,6 +311,39 @@ def test_status_keeps_render_engine(appdir):
     assert body["render"]["fps"] == 24
 
 
+def test_render_request_accepts_queue(appdir):
+    write_session(
+        appdir,
+        {
+            "action": "render",
+            "nonce": "r" * 16,
+            "start": 1,
+            "end": 5,
+            "step": 1,
+            "format": "MP4",
+            "queue": True,
+        },
+    )
+    request = control.read_session()
+    assert request["queue"] is True
+
+
+def test_invalid_render_queue_is_ignored(appdir):
+    write_session(
+        appdir,
+        {
+            "action": "render",
+            "nonce": "r" * 16,
+            "start": 1,
+            "end": 5,
+            "step": 1,
+            "format": "MP4",
+            "queue": "yes",
+        },
+    )
+    assert control.read_session() is None
+
+
 def test_render_request_accepts_tiles(appdir):
     write_session(
         appdir,

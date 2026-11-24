@@ -140,7 +140,7 @@ async function loadSettings() {
 }
 
 const DEFAULT_HUB = "https://blendermp-hub.tribbeisaac.workers.dev";
-const APP_VERSION = "0.11.23";
+const APP_VERSION = "0.11.24";
 const PROTOCOL_VERSION = 3;
 const CAPABILITIES = 1 | (1 << 10) | (1 << 11) | (1 << 12); // presence, bookmarks, bundles, chunks
 const settings = {
@@ -809,7 +809,9 @@ function renderFarm(status) {
     const eta = Number(render.eta_seconds || 0);
     const etaText = running && eta > 0 ? ` · about ${formatEta(eta)} left` : "";
     const tileText = tileCount > 1 ? ` · ${tileCount} tiles per frame` : "";
-    $("renderProgressText").textContent = `${framesDone}/${framesTotal} frames (${percent.toFixed(0)}%)${tileText}${failed ? `, ${failed} failed` : ""}${etaText}`;
+    const queued = Number(render.queued || 0);
+    const queueText = queued > 0 ? ` · ${queued} queued` : "";
+    $("renderProgressText").textContent = `${framesDone}/${framesTotal} frames (${percent.toFixed(0)}%)${tileText}${queueText}${failed ? `, ${failed} failed` : ""}${etaText}`;
     const detail = render.worker_detail && typeof render.worker_detail === "object" ? render.worker_detail : {};
     const parts = Object.keys(detail)
       .sort()
@@ -1234,7 +1236,7 @@ async function request(request) {
   }
 }
 
-async function startRender() {
+async function startRender(queue = false) {
   const start = Math.max(0, Number($("renderStart").value) || 0);
   const end = Math.max(start, Number($("renderEnd").value) || start);
   const step = Math.max(1, Number($("renderStep").value) || 1);
@@ -1257,8 +1259,9 @@ async function startRender() {
       format,
       tiles_x: tilesX,
       tiles_y: tilesY,
+      queue: Boolean(queue),
     });
-    toast("Render requested", "ok");
+    toast(queue ? "Render queued" : "Render requested", "ok");
   } catch (error) {
     toast(String(error), "error");
   }
@@ -1279,6 +1282,149 @@ async function retryRender() {
     toast("Retrying failed frames", "ok");
   } catch (error) {
     toast(String(error), "error");
+  }
+}
+
+const RENDER_PRESET_KEY = "renderPresets";
+
+function readRenderPresets() {
+  try {
+    const raw = localStorage.getItem(RENDER_PRESET_KEY);
+    const value = raw ? JSON.parse(raw) : {};
+    return value && typeof value === "object" ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeRenderPresets(presets) {
+  try {
+    localStorage.setItem(RENDER_PRESET_KEY, JSON.stringify(presets));
+  } catch {
+    /* ignore storage errors */
+  }
+}
+
+function loadRenderPresets() {
+  const select = $("renderPreset");
+  if (!select) return;
+  const presets = readRenderPresets();
+  const current = select.value;
+  select.innerHTML = '<option value="">Custom</option>';
+  for (const name of Object.keys(presets).sort()) {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name;
+    select.appendChild(option);
+  }
+  if (current && presets[current]) select.value = current;
+}
+
+function applyRenderPreset(name) {
+  const preset = readRenderPresets()[name];
+  if (!preset) return;
+  const set = (id, value) => {
+    if (value !== undefined && $(id)) $(id).value = value;
+  };
+  set("renderStart", preset.start);
+  set("renderEnd", preset.end);
+  set("renderStep", preset.step);
+  set("renderWidth", preset.width);
+  set("renderHeight", preset.height);
+  set("renderEngine", preset.engine);
+  set("renderFormat", preset.format);
+  set("renderTiles", preset.tiles);
+}
+
+function saveRenderPreset() {
+  const name =
+    ($("renderPresetName").value || "").trim() ||
+    `Preset ${Object.keys(readRenderPresets()).length + 1}`;
+  const presets = readRenderPresets();
+  presets[name] = {
+    start: $("renderStart").value,
+    end: $("renderEnd").value,
+    step: $("renderStep").value,
+    width: $("renderWidth").value,
+    height: $("renderHeight").value,
+    engine: $("renderEngine").value,
+    format: $("renderFormat").value,
+    tiles: $("renderTiles").value,
+  };
+  writeRenderPresets(presets);
+  loadRenderPresets();
+  $("renderPreset").value = name;
+  $("renderPresetName").value = "";
+  toast(`Saved preset ${name}`, "ok");
+}
+
+function deleteRenderPreset() {
+  const name = $("renderPreset").value;
+  if (!name) return;
+  const presets = readRenderPresets();
+  delete presets[name];
+  writeRenderPresets(presets);
+  loadRenderPresets();
+  toast(`Deleted preset ${name}`, "warn");
+}
+
+function showWelcomeIfNeeded() {
+  if (store.get("onboarded", "0") === "1" || settings.blender) return;
+  $("welcomeName").value = settings.name;
+  $("welcomeBlender").value = settings.blender;
+  $("welcomeOverlay").hidden = false;
+}
+
+async function welcomeDetect() {
+  try {
+    const path = await invoke("detect_blender");
+    if (path) {
+      $("welcomeBlender").value = path;
+      toast("Blender found", "ok");
+    } else {
+      toast("Blender 5.x not found", "error");
+    }
+  } catch (error) {
+    toast(String(error), "error");
+  }
+}
+
+function welcomeStart() {
+  settings.name = $("welcomeName").value.trim() || settings.name;
+  settings.blender = $("welcomeBlender").value.trim();
+  store.set("name", settings.name);
+  store.set("blender", settings.blender);
+  store.set("onboarded", "1");
+  $("setName").value = settings.name;
+  $("setBlender").value = settings.blender;
+  $("meAvatar").textContent = initials(settings.name);
+  $("welcomeOverlay").hidden = true;
+  toast("Welcome aboard", "ok");
+}
+
+async function refreshRenderPreview() {
+  if (!isTauri) return;
+  try {
+    const preview = await invoke("render_preview");
+    const wrap = $("renderPreviewWrap");
+    if (!preview || !Array.isArray(preview.frames) || preview.frames.length === 0) {
+      wrap.hidden = true;
+      return;
+    }
+    wrap.hidden = false;
+    $("renderPreviewMain").src = preview.frames[0].data;
+    $("renderPreviewCount").textContent = `${preview.count} frame(s)`;
+    const sheet = $("renderContactSheet");
+    sheet.innerHTML = "";
+    for (const frame of preview.frames.slice(1)) {
+      const image = document.createElement("img");
+      image.src = frame.data;
+      image.title = frame.name;
+      image.alt = frame.name;
+      sheet.appendChild(image);
+    }
+  } catch (error) {
+    log(`render preview failed: ${error}`);
   }
 }
 
@@ -1778,7 +1924,13 @@ async function sendChat(event) {
 async function poll() {
   try {
     const status = await invoke("read_status");
-    if (status) applyStatus(status);
+    if (status) {
+      applyStatus(status);
+    } else {
+      // read_status returns null when Blender is gone or the PID changed.
+      // Clear the stale "hosting"/"connected" view instead of keeping it.
+      applyStatus({ state: "offline", is_host: false, users: [], messages: [], render: { active: false } });
+    }
     return status;
   } catch {
     /* ignore transient read errors */
@@ -1973,7 +2125,14 @@ function wire() {
     settings.port = Math.max(1024, Math.min(65535, Number($("setPort").value) || 51999));
   });
 
-  $("renderStartBtn")?.addEventListener("click", startRender);
+  $("renderStartBtn")?.addEventListener("click", () => startRender(false));
+  $("renderQueueBtn")?.addEventListener("click", () => startRender(true));
+  $("welcomeDetect")?.addEventListener("click", welcomeDetect);
+  $("welcomeStart")?.addEventListener("click", welcomeStart);
+  $("renderPreset")?.addEventListener("change", (event) => applyRenderPreset(event.target.value));
+  $("renderPresetSave")?.addEventListener("click", saveRenderPreset);
+  $("renderPresetDelete")?.addEventListener("click", deleteRenderPreset);
+  loadRenderPresets();
   $("renderStopBtn")?.addEventListener("click", stopRender);
   $("renderRetryBtn")?.addEventListener("click", retryRender);
   $("renderAccept")?.addEventListener("click", () => replyRender(true));
@@ -2029,11 +2188,13 @@ async function boot() {
   }
 
   await detectBlender();
+  showWelcomeIfNeeded();
   await poll();
   renderRecent();
   setInterval(poll, 750);
   setInterval(pollDeepLink, 1000);
   setInterval(embedLoop, 1200);
+  setInterval(refreshRenderPreview, 2000);
   setInterval(announceServer, 15000);
   setInterval(() => {
     if (state.panel === "servers") loadServers();

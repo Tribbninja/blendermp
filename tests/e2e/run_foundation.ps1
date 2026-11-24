@@ -19,6 +19,9 @@ New-Item -ItemType Directory -Force -Path $data | Out-Null
 $env:BMP_VENDOR = Join-Path $env:LOCALAPPDATA 'Blendermp\python'
 $env:BMP_ADDON = Join-Path $root 'addon'
 $env:BMP_TEST_DATA = $data
+# Keep heartbeats, status and control files inside this suite's temp dir so a
+# running desktop app or a previous suite cannot leak a stale crash record.
+$env:LOCALAPPDATA = $data
 
 $args = @(
     '--background',

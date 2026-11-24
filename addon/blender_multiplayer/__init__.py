@@ -74,7 +74,7 @@ from .sync.mesh import EditMirror, MeshMirror, snapshot_bmesh
 bl_info = {
     "name": "Blendermp",
     "author": "Blendermp",
-    "version": (0, 11, 23),
+    "version": (0, 11, 24),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Blendermp",
     "description": "Low-latency collaborative Blender sessions",
@@ -185,6 +185,8 @@ runtime: dict = {
     "ai_pending_edits": [],
     "overlay_scale": 1.0,
     "last_transform": 0.0,
+    "last_armature": 0.0,
+    "armature_shadow": {},
     "auto_resync_interval": 5.0,
     "deep_resync_interval": 120.0,
     "last_auto_resync": 0.0,
@@ -192,6 +194,7 @@ runtime: dict = {
     "resync_queue": [],
     "resync_deep": False,
     "resync_notice_at": 0.0,
+    "pending_modifier_inputs": [],
     "mesh_payload_hash": {},
     "fast_mode": True,
     "transform_interval": 1.0 / 60.0,
@@ -301,6 +304,7 @@ runtime: dict = {
     "render_busy": False,
     "render_last_poll": 0.0,
     "render_job_id": "",
+    "render_jobs": [],
     "render_output": "",
     "render_format": "MP4",
     "render_error": "",
@@ -1018,6 +1022,8 @@ def _handle_event(context, kind: str, body: dict) -> None:
         _upsert_user(context, name, body.get("color", (1, 1, 1, 1)))
         _push_message(context, "system", f"{name} joined")
         if settings.is_host:
+            _ask_render_peer(context, name)
+        if settings.is_host:
             # A late joiner missed any image assets sent before it arrived.
             # Re-queue them with the scene bootstrap.
             runtime["shared_images"].clear()
@@ -1035,6 +1041,9 @@ def _handle_event(context, kind: str, body: dict) -> None:
         if body.get("settings_only"):
             _apply_scene_settings(context, body)
             return
+        if body.get("graphs_only"):
+            _apply_scene_graphs(context, body)
+            return
         target = body.get("target")
         if target and target != settings.name:
             return
@@ -1042,6 +1051,10 @@ def _handle_event(context, kind: str, body: dict) -> None:
     elif kind == "peer_leave":
         name = body.get("name", "?")
         _remove_user(context, name)
+        try:
+            _render_manager().release(name)
+        except Exception:  # noqa: BLE001
+            pass
         # A peer that leaves (or crashes) must not leave phantom locks in the
         # local mirror, even if a lease-release frame was missed.
         for uid, owner in list(runtime["lease_owners"].items()):
@@ -1333,6 +1346,15 @@ def _handle_event(context, kind: str, body: dict) -> None:
         _apply_material(context, body)
     elif kind == "pose":
         _apply_pose(context, body)
+    elif kind == "armature":
+        uid = body.get("uuid")
+        obj = obj_sync.find(uid)
+        bones = body.get("bones")
+        if obj is not None:
+            _apply_armature_bones(context, obj, bones)
+            snapshot = armature_snapshot(obj)
+            if snapshot is not None:
+                runtime.setdefault("armature_shadow", {})[uid] = _armature_signature(snapshot)
     elif kind == "shape_keys":
         _apply_shape_keys(context, body)
     elif kind == "action":
@@ -1376,6 +1398,18 @@ def _handle_event(context, kind: str, body: dict) -> None:
         settings.last_error_code = str(body.get("code", ""))[:48]
     elif kind == "disconnected":
         settings.state = "offline"
+        if not settings.is_host:
+            had_render = bool(
+                runtime.get("render_active")
+                or runtime.get("render_queue")
+                or runtime.get("render_busy")
+            )
+            runtime["render_active"] = False
+            runtime["render_queue"] = []
+            runtime["render_busy"] = False
+            runtime["render_job_id"] = ""
+            if had_render:
+                _push_message(context, "system", "Render stopped: host disconnected")
         _push_message(context, "system", f"Disconnected: {body.get('reason', 'unknown')}")
 
 
@@ -1630,6 +1664,22 @@ def _socket_default(value):
 
 def _node_input_id(socket) -> str:
     return (getattr(socket, "identifier", None) or getattr(socket, "name", ""))[:64]
+
+
+def _graph_socket_id(node, socket) -> str:
+    """Group input/output sockets use interface names; other nodes use ids."""
+    if str(getattr(node, "bl_idname", "")) in {"NodeGroupInput", "NodeGroupOutput"}:
+        return str(getattr(socket, "name", ""))[:64]
+    return _node_input_id(socket)
+
+
+def _socket_by_graph_id(node, sockets, key):
+    if str(getattr(node, "bl_idname", "")) in {"NodeGroupInput", "NodeGroupOutput"}:
+        for socket in sockets:
+            if str(getattr(socket, "name", "")) == key:
+                return socket
+        return None
+    return _socket_by_id(sockets, key)
 
 
 def _socket_by_id(sockets, key):
@@ -1911,6 +1961,592 @@ def _apply_material_graph(material, data: dict) -> bool:
     return True
 
 
+# --------------------------------------------------------------------------- node graphs
+MAX_GRAPH_NODES = 256
+MAX_GRAPH_LINKS = 1024
+MAX_GRAPH_INTERFACE = 128
+MAX_GRAPH_PROPS = 48
+MAX_GRAPHS = 16
+MAX_GRAPH_BYTES = 2 * 1024 * 1024
+GRAPH_SKIP_TOKENS = ("Script", "OSL", "Import", "Export", "OutputFile")
+GRAPH_SKIP_PROPS = {
+    "rna_type",
+    "name",
+    "label",
+    "location",
+    "width",
+    "height",
+    "color",
+    "select",
+    "show_options",
+    "show_preview",
+    "hide",
+    "mute",
+    "show_texture",
+    "use_custom_color",
+    "parent",
+    "inputs",
+    "outputs",
+    "internal_links",
+    "dimensions",
+    "type",
+    "bl_idname",
+    "bl_label",
+    "bl_description",
+    "bl_icon",
+    "bl_static_type",
+    "filepath",
+    "script",
+    "script_file",
+    "module",
+    "node_tree",
+}
+
+
+def _graph_value(value):
+    """Return a JSON-safe node value, or None when it is not portable."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value[:512]
+    if isinstance(value, int):
+        return max(-1_000_000_000, min(1_000_000_000, value))
+    if isinstance(value, float):
+        if not math.isfinite(value) or abs(value) > 1.0e12:
+            return None
+        return value
+    if isinstance(value, (list, tuple)) and 1 <= len(value) <= 4:
+        result = []
+        for item in value:
+            if isinstance(item, bool) or not isinstance(item, (int, float)):
+                return None
+            if isinstance(item, float) and (not math.isfinite(item) or abs(item) > 1.0e12):
+                return None
+            result.append(item)
+        return result
+    return None
+
+
+def _safe_custom_value(value, depth: int = 0):
+    if depth > 2:
+        return None
+    if hasattr(value, "to_dict"):
+        try:
+            value = value.to_dict()
+        except Exception:  # noqa: BLE001
+            return None
+    elif hasattr(value, "to_list"):
+        try:
+            value = value.to_list()
+        except Exception:  # noqa: BLE001
+            return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value[:512]
+    if isinstance(value, int):
+        return max(-1_000_000_000, min(1_000_000_000, value))
+    if isinstance(value, float):
+        if not math.isfinite(value) or abs(value) > 1.0e12:
+            return None
+        return value
+    if isinstance(value, (list, tuple)) and len(value) <= 32:
+        result = [_safe_custom_value(item, depth + 1) for item in value]
+        return result if all(item is not None for item in result) else None
+    if isinstance(value, dict) and len(value) <= 16:
+        result = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not key or len(key) > 64:
+                return None
+            safe = _safe_custom_value(item, depth + 1)
+            if safe is None:
+                return None
+            result[key] = safe
+        return result
+    return None
+
+
+DATA_SKIP_PROPS = {
+    "rna_type",
+    "name",
+    "type",
+    "animation_data",
+    "library",
+    "override_library",
+    "preview",
+    "users",
+    "use_fake_user",
+    "is_evaluated",
+    "original",
+    "session_uid",
+    "tag",
+    "is_linked_packed",
+    "is_missing",
+    "is_runtime_data",
+    "is_editable",
+    "is_library_indirect",
+    "library_weak_reference",
+    "asset_data",
+}
+
+
+def _safe_data_props(data, extra_skip: set | None = None) -> dict:
+    props = {}
+    skip = DATA_SKIP_PROPS | (extra_skip or set())
+    for prop in data.bl_rna.properties:
+        identifier = prop.identifier
+        if identifier in skip or prop.type not in {"BOOLEAN", "INT", "FLOAT", "STRING", "ENUM"}:
+            continue
+        if getattr(prop, "is_readonly", False):
+            continue
+        try:
+            value = getattr(data, identifier)
+        except Exception:  # noqa: BLE001
+            continue
+        safe = _graph_value(value)
+        if safe is not None:
+            props[identifier] = safe
+        if len(props) >= 32:
+            break
+    return props
+
+
+def _node_prop_values(node) -> dict:
+    props = {}
+    for prop in node.bl_rna.properties:
+        identifier = prop.identifier
+        if identifier in GRAPH_SKIP_PROPS:
+            continue
+        if prop.type not in {"BOOLEAN", "INT", "FLOAT", "STRING", "ENUM"}:
+            continue
+        if getattr(prop, "is_readonly", False):
+            continue
+        try:
+            value = getattr(node, identifier)
+        except Exception:  # noqa: BLE001
+            continue
+        safe = _graph_value(value)
+        if safe is not None:
+            props[identifier] = safe
+        if len(props) >= MAX_GRAPH_PROPS:
+            break
+    return props
+
+
+def _node_tree_interface(tree) -> list:
+    items = []
+    try:
+        for item in tree.interface.items_tree:
+            if getattr(item, "item_type", "SOCKET") != "SOCKET":
+                continue
+            spec = {
+                "name": str(getattr(item, "name", ""))[:64],
+                "in_out": str(getattr(item, "in_out", "INPUT"))[:8],
+                "socket_type": str(getattr(item, "socket_type", "NodeSocketFloat"))[:64],
+            }
+            description = getattr(item, "description", "")
+            if description:
+                spec["description"] = str(description)[:128]
+            for key in ("default_value", "min_value", "max_value"):
+                value = _graph_value(getattr(item, key, None))
+                if value is not None:
+                    spec[key] = value
+            for key in ("subtype", "default_input", "attribute_domain", "structure_type"):
+                value = getattr(item, key, None)
+                if isinstance(value, str) and value:
+                    spec[key] = value[:32]
+            for key in ("hide_value", "hide_in_modifier", "force_non_field", "is_panel_toggle"):
+                value = getattr(item, key, None)
+                if isinstance(value, bool):
+                    spec[key] = value
+            items.append(spec)
+            if len(items) >= MAX_GRAPH_INTERFACE:
+                break
+    except Exception:  # noqa: BLE001
+        pass
+    return items
+
+
+def _serialize_node_tree(tree) -> dict:
+    nodes = []
+    index = {}
+    for node in list(tree.nodes)[:MAX_GRAPH_NODES]:
+        identifier = str(getattr(node, "bl_idname", ""))
+        if not identifier or any(token in identifier for token in GRAPH_SKIP_TOKENS):
+            continue
+        spec = {
+            "bl_idname": identifier[:64],
+            "name": str(getattr(node, "name", ""))[:64],
+        }
+        try:
+            spec["location"] = [round(float(value), 3) for value in node.location[:2]]
+        except (AttributeError, TypeError, ValueError):
+            pass
+        label = getattr(node, "label", "")
+        if label:
+            spec["label"] = str(label)[:64]
+        for key in ("width", "height"):
+            value = getattr(node, key, None)
+            if isinstance(value, (int, float)):
+                spec[key] = round(float(value), 2)
+        for key in ("mute", "hide", "show_options", "show_preview", "show_texture", "use_custom_color"):
+            value = getattr(node, key, None)
+            if isinstance(value, bool):
+                spec[key] = value
+        inputs = {}
+        for socket in getattr(node, "inputs", []):
+            try:
+                if socket.is_linked:
+                    continue
+                value = _graph_value(socket.default_value)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if value is not None:
+                inputs[_graph_socket_id(node, socket)] = value
+        if inputs:
+            spec["inputs"] = inputs
+        props = _node_prop_values(node)
+        if props:
+            spec["props"] = props
+        nested = getattr(node, "node_tree", None)
+        if nested is not None:
+            spec["node_tree"] = str(getattr(nested, "name", ""))[:64]
+        image = getattr(node, "image", None)
+        if image is not None:
+            spec["image"] = str(getattr(image, "name", ""))[:64]
+            _queue_image(image)
+        index[str(getattr(node, "name", ""))] = len(nodes)
+        nodes.append(spec)
+    links = []
+    for link in tree.links:
+        source = index.get(str(getattr(link.from_node, "name", "")))
+        target = index.get(str(getattr(link.to_node, "name", "")))
+        if source is None or target is None or source == target:
+            continue
+        from_socket = _graph_socket_id(link.from_node, link.from_socket)
+        to_socket = _graph_socket_id(link.to_node, link.to_socket)
+        if not from_socket or not to_socket:
+            continue
+        links.append([source, from_socket, target, to_socket])
+        if len(links) >= MAX_GRAPH_LINKS:
+            break
+    return {
+        "name": str(getattr(tree, "name", ""))[:64],
+        "type": str(getattr(tree, "bl_idname", ""))[:32],
+        "interface": _node_tree_interface(tree),
+        "nodes": nodes,
+        "links": links,
+    }
+
+
+def _collect_node_graph(tree, out: list, seen: set, depth: int) -> None:
+    if tree is None or depth > 2 or len(out) >= MAX_GRAPHS:
+        return
+    name = str(getattr(tree, "name", ""))
+    kind = str(getattr(tree, "bl_idname", ""))
+    if not name or name in seen or kind not in {"GeometryNodeTree", "CompositorNodeTree"}:
+        return
+    seen.add(name)
+    for node in list(tree.nodes)[:MAX_GRAPH_NODES]:
+        nested = getattr(node, "node_tree", None)
+        if nested is not None and nested is not tree:
+            _collect_node_graph(nested, out, seen, depth + 1)
+    out.append(_serialize_node_tree(tree))
+
+
+def _scene_graphs(context) -> dict:
+    graphs: list = []
+    seen: set = set()
+    modifier_inputs = []
+    for obj in context.scene.objects:
+        uid = obj.get("bmp_uuid")
+        for mod in getattr(obj, "modifiers", []):
+            if getattr(mod, "type", "") != "NODES":
+                continue
+            _collect_node_graph(getattr(mod, "node_group", None), graphs, seen, 0)
+            if not uid:
+                continue
+            values = _modifier_input_values(mod)
+            if values:
+                modifier_inputs.append(
+                    {"uid": uid, "modifier": str(mod.name)[:64], "inputs": values}
+                )
+            if len(modifier_inputs) >= 256:
+                break
+    tree = getattr(context.scene, "compositing_node_group", None)
+    if tree is None:
+        tree = getattr(context.scene, "node_tree", None)
+    _collect_node_graph(tree, graphs, seen, 0)
+    return {"graphs": graphs, "modifier_inputs": modifier_inputs[:256]}
+
+
+def _graph_signature(body: dict) -> str:
+    try:
+        return hashlib.blake2b(
+            json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+            digest_size=8,
+        ).hexdigest()
+    except (TypeError, ValueError):
+        return ""
+
+
+def _apply_node_tree(tree, data: dict) -> bool:
+    if not isinstance(data, dict):
+        return False
+    if not getattr(tree, "is_editable", True):
+        return False
+    try:
+        tree.nodes.clear()
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        clear = getattr(tree.interface, "clear", None)
+        if clear is not None:
+            clear()
+        else:
+            for item in list(tree.interface.items_tree):
+                try:
+                    tree.interface.remove(item)
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception:  # noqa: BLE001
+        pass
+    for spec in data.get("interface", [])[:MAX_GRAPH_INTERFACE]:
+        if not isinstance(spec, dict):
+            continue
+        name = str(spec.get("name", ""))[:64]
+        in_out = str(spec.get("in_out", "INPUT"))[:8]
+        socket_type = str(spec.get("socket_type", "NodeSocketFloat"))[:64]
+        if not name or in_out not in {"INPUT", "OUTPUT"}:
+            continue
+        try:
+            item = tree.interface.new_socket(name, in_out=in_out, socket_type=socket_type)
+        except Exception:  # noqa: BLE001
+            continue
+        for key in ("default_value", "min_value", "max_value"):
+            if key in spec:
+                try:
+                    setattr(item, key, spec[key])
+                except (AttributeError, TypeError, ValueError):
+                    pass
+        for key in ("subtype", "default_input", "attribute_domain", "structure_type"):
+            if key in spec:
+                try:
+                    setattr(item, key, spec[key])
+                except (AttributeError, TypeError, ValueError):
+                    pass
+        for key in ("hide_value", "hide_in_modifier", "force_non_field", "is_panel_toggle"):
+            if key in spec:
+                try:
+                    setattr(item, key, bool(spec[key]))
+                except (AttributeError, TypeError, ValueError):
+                    pass
+    created = []
+    for spec in data.get("nodes", [])[:MAX_GRAPH_NODES]:
+        if not isinstance(spec, dict):
+            created.append(None)
+            continue
+        identifier = str(spec.get("bl_idname", ""))[:64]
+        if not identifier or any(token in identifier for token in GRAPH_SKIP_TOKENS):
+            created.append(None)
+            continue
+        try:
+            node = tree.nodes.new(identifier)
+        except Exception:  # noqa: BLE001
+            created.append(None)
+            continue
+        name = str(spec.get("name", ""))[:64]
+        if name:
+            node.name = name
+        label = spec.get("label")
+        if isinstance(label, str):
+            try:
+                node.label = label[:64]
+            except (AttributeError, TypeError):
+                pass
+        location = spec.get("location")
+        if isinstance(location, list) and len(location) == 2:
+            try:
+                node.location = (float(location[0]), float(location[1]))
+            except (TypeError, ValueError):
+                pass
+        for key in ("width", "height"):
+            value = spec.get(key)
+            if isinstance(value, (int, float)):
+                try:
+                    setattr(node, key, float(value))
+                except (AttributeError, TypeError, ValueError):
+                    pass
+        for key in ("mute", "hide", "show_options", "show_preview", "show_texture", "use_custom_color"):
+            if key in spec:
+                try:
+                    setattr(node, key, bool(spec[key]))
+                except (AttributeError, TypeError, ValueError):
+                    pass
+        for socket_id, value in (spec.get("inputs") or {}).items():
+            socket = _socket_by_graph_id(node, node.inputs, str(socket_id))
+            if socket is None:
+                continue
+            try:
+                socket.default_value = value
+            except (AttributeError, TypeError, ValueError):
+                pass
+        for key, value in (spec.get("props") or {}).items():
+            if key in GRAPH_SKIP_PROPS:
+                continue
+            try:
+                setattr(node, key, value)
+            except (AttributeError, TypeError, ValueError):
+                pass
+        nested = spec.get("node_tree")
+        if isinstance(nested, str):
+            group = bpy.data.node_groups.get(nested)
+            if group is not None:
+                try:
+                    node.node_tree = group
+                except (AttributeError, TypeError):
+                    pass
+        image_name = spec.get("image")
+        if isinstance(image_name, str):
+            image = bpy.data.images.get(image_name)
+            if image is not None:
+                try:
+                    node.image = image
+                except (AttributeError, TypeError):
+                    pass
+        created.append(node)
+    for link in data.get("links", [])[:MAX_GRAPH_LINKS]:
+        if not isinstance(link, list) or len(link) != 4:
+            continue
+        try:
+            source, source_key, target, target_key = link
+            source = int(source)
+            target = int(target)
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= source < len(created) or not 0 <= target < len(created):
+            continue
+        from_node = created[source]
+        to_node = created[target]
+        if from_node is None or to_node is None:
+            continue
+        from_socket = _socket_by_graph_id(from_node, from_node.outputs, str(source_key))
+        to_socket = _socket_by_graph_id(to_node, to_node.inputs, str(target_key))
+        if from_socket is None or to_socket is None:
+            continue
+        try:
+            tree.links.new(from_socket, to_socket)
+        except (AttributeError, RuntimeError):
+            pass
+    for node in created:
+        if node is None:
+            continue
+        if getattr(node, "bl_idname", "") in {"NodeGroupOutput", "CompositorNodeComposite"}:
+            try:
+                if hasattr(node, "is_active_output"):
+                    node.is_active_output = True
+                tree.nodes.active = node
+            except (AttributeError, RuntimeError):
+                pass
+            break
+    return True
+
+
+def _apply_pending_modifier_inputs(context) -> None:
+    pending = runtime.get("pending_modifier_inputs") or []
+    if not pending:
+        return
+    now = time.monotonic()
+    keep = []
+    for entry in pending[:256]:
+        if not isinstance(entry, dict) or float(entry.get("expires", 0.0)) < now:
+            continue
+        obj = obj_sync.find(entry.get("uid"))
+        if obj is None:
+            keep.append(entry)
+            continue
+        mod = obj.modifiers.get(str(entry.get("modifier", "")))
+        if mod is None or getattr(mod, "type", "") != "NODES":
+            continue
+        try:
+            bpy.context.view_layer.update()
+        except Exception:  # noqa: BLE001
+            pass
+        if not _apply_modifier_input_values(mod, entry.get("inputs")):
+            keep.append(entry)
+    runtime["pending_modifier_inputs"] = keep
+
+
+def _apply_scene_graphs(context, body: dict) -> None:
+    graphs = body.get("graphs")
+    if not isinstance(graphs, list):
+        return
+    force = bool(body.get("force"))
+    hashes = runtime.setdefault("graph_hashes", {})
+    for item in graphs[:MAX_GRAPHS]:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", ""))[:64]
+        kind = str(item.get("type", ""))[:32]
+        if not name or kind not in {"GeometryNodeTree", "CompositorNodeTree"}:
+            continue
+        digest = _graph_signature(item)
+        if not force and digest and hashes.get(name) == digest:
+            continue
+        tree = bpy.data.node_groups.get(name)
+        if tree is None:
+            try:
+                tree = bpy.data.node_groups.new(name, kind)
+            except Exception:  # noqa: BLE001
+                continue
+        elif getattr(tree, "bl_idname", "") != kind:
+            continue
+        if not _apply_node_tree(tree, item):
+            continue
+        if kind == "CompositorNodeTree":
+            if hasattr(context.scene, "compositing_node_group"):
+                try:
+                    context.scene.compositing_node_group = tree
+                except (AttributeError, TypeError):
+                    pass
+            elif hasattr(context.scene, "node_tree"):
+                try:
+                    context.scene.node_tree = tree
+                except (AttributeError, TypeError):
+                    pass
+        hashes[name] = digest
+    try:
+        bpy.context.view_layer.update()
+    except Exception:  # noqa: BLE001
+        pass
+    for entry in body.get("modifier_inputs", [])[:256]:
+        if not isinstance(entry, dict):
+            continue
+        obj = obj_sync.find(entry.get("uid"))
+        if obj is None:
+            continue
+        mod = obj.modifiers.get(str(entry.get("modifier", "")))
+        if mod is None or getattr(mod, "type", "") != "NODES":
+            continue
+        if _apply_modifier_input_values(mod, entry.get("inputs")):
+            continue
+        pending = runtime.setdefault("pending_modifier_inputs", [])
+        key = (entry.get("uid"), entry.get("modifier"))
+        if not any(
+            isinstance(pending_entry, dict)
+            and (pending_entry.get("uid"), pending_entry.get("modifier")) == key
+            for pending_entry in pending
+        ):
+            pending.append(
+                {
+                    "uid": entry.get("uid"),
+                    "modifier": entry.get("modifier"),
+                    "inputs": entry.get("inputs"),
+                    "expires": time.monotonic() + 10.0,
+                }
+            )
+
+
 def _action_fcurves(action) -> list:
     try:
         if hasattr(action, "fcurves"):
@@ -1998,6 +2634,39 @@ def _action_snapshot(obj) -> dict | None:
     animation = getattr(obj, "animation_data", None)
     action = getattr(animation, "action", None) if animation is not None else None
     return _action_data(action)
+
+
+def _sync_armatures(context) -> None:
+    session: SessionService | None = runtime.get("session")
+    settings = context.window_manager.bmp
+    if session is None or settings.paused or runtime.get("bootstrapping") or runtime.get("replaying"):
+        return
+    if not settings.is_host and session.state != "connected":
+        return
+    now = time.monotonic()
+    if now - runtime.get("last_armature", 0.0) < 0.5:
+        return
+    runtime["last_armature"] = now
+    shadow = runtime.setdefault("armature_shadow", {})
+    for obj in context.scene.objects:
+        if obj.type != "ARMATURE":
+            continue
+        uid = obj.get("bmp_uuid")
+        if not uid:
+            continue
+        owner = runtime["lease_owners"].get(uid)
+        if owner not in (None, settings.name):
+            continue
+        if not settings.is_host and owner is None and uid not in runtime["owned_leases"]:
+            continue
+        bones = armature_snapshot(obj)
+        if bones is None:
+            continue
+        signature = _armature_signature(bones)
+        if shadow.get(uid) == signature:
+            continue
+        shadow[uid] = signature
+        session.send_armature(uid, bones)
 
 
 def _sync_pose(context) -> None:
@@ -2462,6 +3131,60 @@ MODIFIER_PROPS = {
 }
 
 
+def _modifier_input_items(mod) -> list:
+    items = []
+    try:
+        inputs = mod.properties.inputs
+        for prop in inputs.bl_rna.properties:
+            if prop.identifier == "rna_type":
+                continue
+            item = getattr(inputs, prop.identifier)
+            if hasattr(item, "bl_rna"):
+                items.append(item)
+    except Exception:  # noqa: BLE001
+        pass
+    return items
+
+
+def _modifier_input_values(mod) -> dict:
+    values = {}
+    for index, item in enumerate(_modifier_input_items(mod)):
+        try:
+            value = item.value
+        except AttributeError:
+            continue
+        if isinstance(value, (bool, int, float, str)):
+            values[str(index)] = value
+    return values
+
+
+def _apply_modifier_input_values(mod, values) -> bool:
+    if not isinstance(values, dict):
+        return False
+    items = _modifier_input_items(mod)
+    applied = False
+    for key, value in values.items():
+        if not isinstance(value, (bool, int, float, str)):
+            continue
+        target = None
+        if isinstance(key, str) and key.isdigit():
+            index = int(key)
+            if 0 <= index < len(items):
+                target = items[index]
+        else:
+            try:
+                target = getattr(mod.properties.inputs, str(key), None)
+            except Exception:  # noqa: BLE001
+                target = None
+        if target is not None:
+            try:
+                target.value = value
+                applied = True
+            except (AttributeError, TypeError, ValueError):
+                pass
+    return applied
+
+
 def modifier_snapshot(obj) -> list:
     snapshot = []
     for mod in list(obj.modifiers)[:32]:
@@ -2480,28 +3203,9 @@ def modifier_snapshot(obj) -> list:
                 props["node_group"] = mod.node_group.name if mod.node_group else ""
             except AttributeError:
                 props["node_group"] = ""
-            try:
-                inputs = mod.properties.inputs
-                node_inputs = {}
-                for prop in inputs.bl_rna.properties:
-                    if prop.identifier == "rna_type":
-                        continue
-                    try:
-                        item = getattr(inputs, prop.identifier)
-                    except AttributeError:
-                        continue
-                    if not hasattr(item, "bl_rna"):
-                        continue
-                    try:
-                        value = item.value
-                    except AttributeError:
-                        continue
-                    if isinstance(value, (bool, int, float, str)):
-                        node_inputs[prop.identifier] = value
-                if node_inputs:
-                    props["node_inputs"] = node_inputs
-            except Exception:  # noqa: BLE001
-                pass
+            values = _modifier_input_values(mod)
+            if values:
+                props["node_inputs"] = values
         if mod.type in {"ARMATURE", "LATTICE", "CURVE", "HOOK", "SURFACE_DEFORM", "MESH_DEFORM", "BOOLEAN"}:
             target = getattr(mod, "object", None)
             if target is not None and target.get("bmp_uuid"):
@@ -2516,6 +3220,41 @@ def modifier_snapshot(obj) -> list:
             }
         )
     return snapshot
+
+
+def armature_snapshot(obj) -> list | None:
+    if getattr(obj, "type", "") != "ARMATURE" or getattr(obj, "data", None) is None:
+        return None
+    bones = []
+    try:
+        for bone in list(obj.data.bones)[:256]:
+            try:
+                roll = float(bone.matrix_local.to_euler("XYZ").y)
+            except Exception:  # noqa: BLE001
+                roll = 0.0
+            bones.append(
+                {
+                    "name": str(bone.name)[:64],
+                    "parent": str(bone.parent.name)[:64] if bone.parent else "",
+                    "head": [round(float(value), 4) for value in bone.head_local[:3]],
+                    "tail": [round(float(value), 4) for value in bone.tail_local[:3]],
+                    "roll": round(roll, 4),
+                    "deform": bool(bone.use_deform),
+                }
+            )
+    except Exception:  # noqa: BLE001
+        return None
+    return bones
+
+
+def _armature_signature(bones) -> str:
+    try:
+        return hashlib.blake2b(
+            json.dumps(bones, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+            digest_size=8,
+        ).hexdigest()
+    except (TypeError, ValueError):
+        return ""
 
 
 def object_details(obj) -> dict:
@@ -2565,6 +3304,24 @@ def object_details(obj) -> dict:
         if subtarget:
             item["subtarget"] = str(subtarget)[:64]
         constraints.append(item)
+        props = _safe_data_props(
+            constraint,
+            {
+                "rna_type",
+                "name",
+                "type",
+                "target",
+                "subtarget",
+                "influence",
+                "mute",
+                "space_object",
+                "space_subtarget",
+                "owner_space",
+                "target_space",
+            },
+        )
+        if props:
+            item["props"] = props
     if constraints:
         details["constraints"] = constraints
     custom = {}
@@ -2572,14 +3329,9 @@ def object_details(obj) -> dict:
         for key in list(obj.keys())[:64]:
             if not isinstance(key, str) or not key or key.startswith("bmp_"):
                 continue
-            value = obj[key]
-            if isinstance(value, (bool, int, float, str)):
-                custom[key[:64]] = value
-            elif isinstance(value, (list, tuple)) and len(value) <= 4 and all(
-                isinstance(item, (int, float)) and not isinstance(item, bool)
-                for item in value
-            ):
-                custom[key[:64]] = list(value)
+            safe = _safe_custom_value(obj[key])
+            if safe is not None:
+                custom[key[:64]] = safe
             if len(custom) >= 32:
                 break
     except Exception:  # noqa: BLE001
@@ -2766,6 +3518,13 @@ def _apply_object_details(obj, details) -> None:
                 subtarget = item.get("subtarget")
                 if isinstance(subtarget, str) and subtarget:
                     constraint.subtarget = subtarget
+                for key, value in (item.get("props") or {}).items():
+                    if key in {"type", "name", "target", "subtarget", "influence", "mute"}:
+                        continue
+                    try:
+                        setattr(constraint, key, value)
+                    except (AttributeError, TypeError, ValueError):
+                        pass
             except (AttributeError, TypeError, ValueError, RuntimeError):
                 pass
     custom = details.get("custom_props")
@@ -2773,14 +3532,11 @@ def _apply_object_details(obj, details) -> None:
         for key, value in list(custom.items())[:32]:
             if not isinstance(key, str) or not key or key.startswith("bmp_"):
                 continue
+            safe = _safe_custom_value(value)
+            if safe is None:
+                continue
             try:
-                if isinstance(value, (bool, int, float, str)):
-                    obj[key] = value
-                elif isinstance(value, list) and len(value) <= 4 and all(
-                    isinstance(item, (int, float)) and not isinstance(item, bool)
-                    for item in value
-                ):
-                    obj[key] = value
+                obj[key] = safe
             except (TypeError, ValueError, RuntimeError):
                 pass
 
@@ -2826,6 +3582,7 @@ def _apply_modifier_stack(context, body: dict) -> None:
                 if group is not None:
                     try:
                         mod.node_group = group
+                        bpy.context.view_layer.update()
                     except Exception:  # noqa: BLE001
                         pass
                 continue
@@ -2837,20 +3594,8 @@ def _apply_modifier_stack(context, body: dict) -> None:
                     except Exception:  # noqa: BLE001
                         pass
                 continue
-            if key == "node_inputs" and isinstance(value, dict):
-                try:
-                    inputs = mod.properties.inputs
-                    for identifier, input_value in value.items():
-                        if not isinstance(input_value, (bool, int, float, str)):
-                            continue
-                        target = getattr(inputs, str(identifier), None)
-                        if target is not None:
-                            try:
-                                target.value = input_value
-                            except (AttributeError, TypeError, ValueError):
-                                pass
-                except Exception:  # noqa: BLE001
-                    pass
+            if key == "node_inputs":
+                _apply_modifier_input_values(mod, value)
                 continue
             try:
                 setattr(mod, key, value)
@@ -3203,6 +3948,7 @@ def _poll_control(context) -> None:
                 request.get("engine", ""),
                 request.get("tiles_x", 1),
                 request.get("tiles_y", 1),
+                bool(request.get("queue", False)),
             )
         elif action == "render_stop":
             _stop_session_render(context)
@@ -3558,11 +4304,41 @@ def _resolve_conflict(context, keep_mine: bool) -> None:
         _push_message(context, "system", "Offline journal resolved")
 
 
+def _ask_render_peer(context, name: str) -> None:
+    session: SessionService | None = runtime.get("session")
+    if session is None or not session.is_host:
+        return
+    manager = _render_manager()
+    job = manager.job()
+    if job is None or job.finished:
+        return
+    manager.ask(name)
+    session.send_render_control_to(
+        name,
+        "request",
+        {
+            "action": "request",
+            "job": job.id,
+            "name": job.name,
+            "start": job.start,
+            "end": job.end,
+            "step": job.step,
+            "width": job.width,
+            "height": job.height,
+            "format": job.format,
+            "engine": job.engine,
+            "tiles_x": job.tiles_x,
+            "tiles_y": job.tiles_y,
+        },
+    )
+
+
 def _resume_peer(context, name: str) -> None:
     """Resend authoritative state to a client that reconnected."""
     session: SessionService | None = runtime.get("session")
     if session is None or not session.is_host:
         return
+    _ask_render_peer(context, name)
     objects = [obj for obj in context.scene.objects if not obj.get("bmp_ping")]
     uids = [obj.get("bmp_uuid") for obj in objects if obj.get("bmp_uuid")]
     session.send_resume(uids)
@@ -3665,8 +4441,26 @@ def _apply_scene_settings(context, body: dict) -> None:
                 color = item.get("color")
                 if isinstance(color, list) and len(color) >= 3:
                     obj.data.color = tuple(float(value) for value in color[:3])
+            for key, value in (item.get("props") or {}).items():
+                if key in {"rna_type", "name", "type", "library", "animation_data"}:
+                    continue
+                try:
+                    setattr(obj.data, key, value)
+                except (AttributeError, TypeError, ValueError):
+                    pass
         except (AttributeError, TypeError, ValueError):
             continue
+    for entry in body.get("armatures", [])[:32]:
+        if not isinstance(entry, dict):
+            continue
+        uid = entry.get("uid")
+        obj = obj_sync.find(uid)
+        if obj is None:
+            continue
+        _apply_armature_bones(context, obj, entry.get("bones"))
+        snapshot = armature_snapshot(obj)
+        if snapshot is not None:
+            runtime.setdefault("armature_shadow", {})[uid] = _armature_signature(snapshot)
 
 
 def _checkpoint_scene(context) -> dict:
@@ -3843,8 +4637,18 @@ def _scene_settings_payload(context) -> dict:
         camera_uid = camera.get("bmp_uuid") or str(uuid.uuid4())
         camera["bmp_uuid"] = camera_uid
     objects = []
+    armatures = []
     for obj in scene.objects:
         if obj.get("bmp_ping"):
+            continue
+        if obj.type == "ARMATURE":
+            uid = obj.get("bmp_uuid") or str(uuid.uuid4())
+            obj["bmp_uuid"] = uid
+            bones = armature_snapshot(obj)
+            if bones:
+                armatures.append({"uid": uid, "bones": bones})
+            if len(armatures) >= 32:
+                break
             continue
         if obj.type not in {"CAMERA", "LIGHT"}:
             continue
@@ -3857,6 +4661,9 @@ def _scene_settings_payload(context) -> dict:
                     item[key] = float(getattr(obj.data, key))
                 except (AttributeError, TypeError, ValueError):
                     pass
+            props = _safe_data_props(obj.data)
+            if props:
+                item["props"] = props
             objects.append(item)
         else:
             item = {"uid": uid, "kind": "light"}
@@ -3869,14 +4676,17 @@ def _scene_settings_payload(context) -> dict:
                 item["color"] = [float(value) for value in obj.data.color[:3]]
             except (AttributeError, TypeError, ValueError):
                 pass
+            props = _safe_data_props(obj.data)
+            if props:
+                item["props"] = props
             objects.append(item)
         if len(objects) >= 256:
             break
-    return {
-        "world": _world_values(scene.world),
+    return {        "world": _world_values(scene.world),
         "render": _render_snapshot(context),
         "camera": camera_uid,
         "objects": objects,
+        "armatures": armatures,
     }
 
 
@@ -3968,6 +4778,9 @@ def _pump_auto_resync(context) -> None:
     queue = runtime.get("resync_queue") or []
     if not queue:
         interval = max(0.25, float(runtime.get("auto_resync_interval", 5.0)))
+        count = len(context.scene.objects)
+        if count > 50:
+            interval *= min(4.0, count / 50.0)
         if now - runtime.get("last_auto_resync", 0.0) < interval:
             return
         peers = session.authenticated_peers()
@@ -4006,6 +4819,14 @@ def _pump_auto_resync(context) -> None:
             if deep or signature != runtime.get("scene_settings_sig"):
                 runtime["scene_settings_sig"] = signature
                 session.send_scene_settings(settings_body)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        try:
+            graphs = _scene_graphs(context)
+            graph_sig = _graph_signature(graphs)
+            if deep or graph_sig != runtime.get("scene_graph_sig"):
+                runtime["scene_graph_sig"] = graph_sig
+                session.send_scene_graphs(graphs, force=deep)
         except Exception:  # noqa: BLE001
             traceback.print_exc()
         runtime["resync_queue"] = [
@@ -4701,6 +5522,10 @@ def _send_object_create(session: SessionService, obj, include_geometry: bool = T
 def _apply_armature_bones(context, obj, bones) -> None:
     if not isinstance(bones, list) or not bones:
         return
+    if obj is None or getattr(obj, "type", "") != "ARMATURE":
+        return
+    if context.active_object is obj and context.mode in {"EDIT_ARMATURE", "POSE"}:
+        return
     previous = context.view_layer.objects.active
     previous_mode = context.mode
     selected = [item for item in context.selected_objects]
@@ -4716,14 +5541,16 @@ def _apply_armature_bones(context, obj, bones) -> None:
             remaining = []
             for item in pending:
                 name = str(item.get("name", ""))[:64]
-                if not name or name in edit_bones:
+                if not name:
                     continue
                 parent = str(item.get("parent", ""))[:64]
                 if parent and parent not in edit_bones:
                     remaining.append(item)
                     continue
                 try:
-                    bone = edit_bones.new(name)
+                    bone = edit_bones.get(name)
+                    if bone is None:
+                        bone = edit_bones.new(name)
                     bone.head = [float(value) for value in item.get("head", (0.0, 0.0, 0.0))][:3]
                     bone.tail = [float(value) for value in item.get("tail", (0.0, 0.0, 1.0))][:3]
                     bone.roll = float(item.get("roll", 0.0))
@@ -7642,6 +8469,7 @@ def _write_status(context, force: bool = False) -> None:
         if settings.is_host != is_host:
             settings.is_host = is_host
     render_status["role"] = "host" if is_host else "client"
+    render_status["queued"] = len(runtime.get("render_jobs") or [])
     local_active = context.active_object.name if context.active_object is not None else ""
     for user in settings.users:
         if user.name == settings.name:
@@ -7740,6 +8568,7 @@ def _write_status(context, force: bool = False) -> None:
             "blender": bpy.app.version_string,
             "addon": ADDON_VERSION,
             "pid": os.getpid(),
+            "heartbeat": int(time.time()),
         }
     )
 
@@ -8055,7 +8884,9 @@ def bmp_tick():
             _safe_tick_step("sync_materials", lambda: _sync_materials(context))
             _safe_tick_step("sync_modifiers", lambda: _sync_modifiers(context))
             _safe_tick_step("auto_resync", lambda: _pump_auto_resync(context))
+            _safe_tick_step("pending_modifier_inputs", lambda: _apply_pending_modifier_inputs(context))
             _safe_tick_step("sync_pose", lambda: _sync_pose(context))
+            _safe_tick_step("sync_armatures", lambda: _sync_armatures(context))
             _safe_tick_step("sync_shape_keys", lambda: _sync_shape_keys(context))
             _safe_tick_step("sync_actions", lambda: _sync_actions(context))
             _safe_tick_step("scan_images", lambda: _scan_images(context))
@@ -9143,7 +9974,7 @@ def _render_progress_text(status: dict) -> str:
     return text
 
 
-def _start_session_render(context, start, end, step, format_hint, output, width=0, height=0, engine_override="", tiles_x=1, tiles_y=1) -> None:
+def _start_session_render(context, start, end, step, format_hint, output, width=0, height=0, engine_override="", tiles_x=1, tiles_y=1, queue_job=False) -> None:
     session: SessionService | None = runtime.get("session")
     settings = context.window_manager.bmp
     # The session is the source of truth. Loading a .blend can reset the
@@ -9154,8 +9985,26 @@ def _start_session_render(context, start, end, step, format_hint, output, width=
         return
     settings.is_host = True
     manager = _render_manager()
-    if manager.active():
-        settings.last_error = "A render is already running"
+    if manager.active() or runtime.get("render_jobs"):
+        if not queue_job:
+            settings.last_error = "A render is already running or queued"
+            return
+        runtime.setdefault("render_jobs", []).append(
+            {
+                "start": int(start),
+                "end": int(end),
+                "step": int(step or 1),
+                "format_hint": str(format_hint or "MP4")[:8].upper(),
+                "output": str(output or ""),
+                "width": int(width or 0),
+                "height": int(height or 0),
+                "engine_override": str(engine_override or "")[:32],
+                "tiles_x": int(tiles_x or 1),
+                "tiles_y": int(tiles_y or 1),
+            }
+        )
+        _push_message(context, "system", f"Queued render {int(start)}-{int(end)}")
+        _write_status(context, force=True)
         return
     scene = context.scene
     out_dir = output or str(control.data_dir() / "render")
@@ -9215,6 +10064,7 @@ def _stop_session_render(context) -> None:
         return
     manager = _render_manager()
     if manager.stop():
+        runtime["render_jobs"] = []
         _push_message(context, "system", "Stopping the render; the rendered frames are kept")
         _write_status(context, force=True)
     else:
@@ -9838,6 +10688,14 @@ def _pump_session_render(context) -> None:
                         settings.last_error = job.error
                 session.send_render_control("finish", {"job": job.id})
                 manager.clear()
+                queued = runtime.get("render_jobs") or []
+                if queued:
+                    next_job = queued.pop(0)
+                    runtime["render_jobs"] = queued
+                    try:
+                        _start_session_render(context, **next_job)
+                    except Exception:  # noqa: BLE001
+                        traceback.print_exc()
             settings.render_progress = _render_progress_text(manager.status())
             _write_status(context, force=True)
             runtime["render_job_id"] = ""

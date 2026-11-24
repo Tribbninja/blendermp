@@ -302,6 +302,11 @@ def read_session() -> dict[str, Any] | None:
             if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 16:
                 return None
             result[key] = value
+        queue = body.get("queue")
+        if queue is not None:
+            if not isinstance(queue, bool):
+                return None
+            result["queue"] = queue
         output = body.get("output")
         if output is not None:
             if not isinstance(output, str) or len(output) > 512 or any(ord(ch) < 32 for ch in output):
@@ -379,6 +384,7 @@ def write_status(data: dict[str, Any]) -> None:
             "tiles_y": max(1, min(int(render.get("tiles_y", 1) or 1), 16)),
             "frames": max(0, min(int(render.get("frames", 0) or 0), 1 << 31)),
             "frames_done": max(0, min(int(render.get("frames_done", 0) or 0), 1 << 31)),
+            "queued": max(0, min(int(render.get("queued", 0) or 0), 1 << 31)),
             "total": max(0, min(int(render.get("total", 0) or 0), 1 << 31)),
             "done": max(0, min(int(render.get("done", 0) or 0), 1 << 31)),
             "failed": max(0, min(int(render.get("failed", 0) or 0), 1 << 31)),
@@ -430,7 +436,7 @@ def write_status(data: dict[str, Any]) -> None:
     rtt = data.get("rtt_ms")
     if isinstance(rtt, (int, float)) and not isinstance(rtt, bool):
         safe["rtt_ms"] = round(max(0.0, min(5000.0, float(rtt))), 1)
-    for key in ("bytes_in", "bytes_out", "pid", "uptime", "total_bytes", "bridge_clients", "farm_workers"):
+    for key in ("bytes_in", "bytes_out", "pid", "uptime", "heartbeat", "total_bytes", "bridge_clients", "farm_workers"):
         value = data.get(key)
         if isinstance(value, int) and not isinstance(value, bool):
             safe[key] = max(-1, min(value, 1 << 62))

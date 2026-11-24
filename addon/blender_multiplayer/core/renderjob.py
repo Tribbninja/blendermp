@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 MAX_BATCH = 5
-CLAIM_TIMEOUT = 180.0
+CLAIM_TIMEOUT = 60.0
 CONSENT_TIMEOUT = 45.0
 MAX_TILES = 16
 

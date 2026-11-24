@@ -59,6 +59,14 @@ Check ($null -ne $client.world_color -and [math]::Abs([double]$client.world_colo
 Check ($null -ne $client.camera_lens -and [math]::Abs([double]$client.camera_lens - 50.0) -le 0.1) "camera lens was $($client.camera_lens)"
 Check ($null -ne $client.light_energy -and [math]::Abs([double]$client.light_energy - 100.0) -le 0.1) "light energy was $($client.light_energy)"
 Check ($null -ne $client.geo_value -and [math]::Abs([double]$client.geo_value - 0.75) -le 0.01) "geometry node input was $($client.geo_value)"
+Check ([int]$client.geo_nodes -ge 3) "geometry graph had $($client.geo_nodes) node(s)"
+Check ([int]$client.geo_links -ge 2) "geometry graph had $($client.geo_links) link(s)"
+Check ($null -ne $client.comp_glare -and [math]::Abs([double]$client.comp_glare - 0.75) -le 0.01) "compositor glare threshold was $($client.comp_glare)"
+Check ($null -ne $client.constraint_distance -and [math]::Abs([double]$client.constraint_distance - 2.0) -le 0.01) "constraint distance was $($client.constraint_distance)"
+Check ($null -ne $client.dict_prop -and [int]$client.dict_prop.a -eq 1 -and ($client.dict_prop.b -join ',') -eq '1,2,3') "custom dict was $($client.dict_prop | ConvertTo-Json -Compress)"
+Check ($null -ne $client.camera_shift -and [math]::Abs([double]$client.camera_shift - 0.1) -le 0.01) "camera shift was $($client.camera_shift)"
+Check ($client.light_shadow -eq $false) "light shadow was $($client.light_shadow)"
+Check ($null -ne $client.bone_tail -and [math]::Abs([double]$client.bone_tail - 2.0) -le 0.01) "bone tail was $($client.bone_tail)"
 Check ($null -ne $client.prop_value -and [math]::Abs([double]$client.prop_value - 0.5) -le 0.001) "custom property was $($client.prop_value)"
 if ($null -ne $hostResult) {
     Check ([bool]$hostResult.auto_resync) 'auto resync was disabled on the host'

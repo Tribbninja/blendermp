@@ -1199,6 +1199,55 @@ class SessionService:
             self._emit("pose", message)
             return
 
+        if frame.type == MessageType.ARMATURE:
+            body = self._json(frame, 256 * 1024)
+            try:
+                uid = str(uuidlib.UUID(str(body.get("uuid"))))
+            except ValueError as exc:
+                raise Violation("invalid armature id") from exc
+            bones = body.get("bones")
+            if not isinstance(bones, list) or len(bones) > 256:
+                raise Violation("invalid armature payload")
+            clean = []
+            for item in bones:
+                if not isinstance(item, dict):
+                    raise Violation("invalid armature bone")
+                name = clean_text(item.get("name"), 64)
+                head = item.get("head")
+                tail = item.get("tail")
+                if (
+                    not name
+                    or not isinstance(head, list)
+                    or not isinstance(tail, list)
+                    or len(head) != 3
+                    or len(tail) != 3
+                ):
+                    raise Violation("invalid armature bone")
+                try:
+                    values = [float(value) for value in (*head, *tail)]
+                    roll = float(item.get("roll", 0.0))
+                except (TypeError, ValueError) as exc:
+                    raise Violation("invalid armature bone") from exc
+                if not all(math.isfinite(value) and abs(value) < 1e6 for value in (*values, roll)):
+                    raise Violation("armature value is invalid")
+                clean.append(
+                    {
+                        "name": name,
+                        "parent": clean_text(item.get("parent"), 64) or "",
+                        "head": values[:3],
+                        "tail": values[3:6],
+                        "roll": roll,
+                        "deform": bool(item.get("deform", True)),
+                    }
+                )
+            if not self._may_edit(peer, uid, now):
+                return
+            self.bump_rev(uid)
+            message = {"uuid": uid, "bones": clean}
+            self._broadcast(protocol.json_frame(MessageType.ARMATURE, message), exclude=peer.peer_id)
+            self._emit("armature", message)
+            return
+
         if frame.type == MessageType.SHAPE_KEYS:
             body = self._json(frame, 128 * 1024)
             try:
@@ -2609,6 +2658,11 @@ class SessionService:
             self._emit("pose", body)
             return
 
+        if frame.type == MessageType.ARMATURE:
+            body = self._json(frame, 256 * 1024)
+            self._emit("armature", body)
+            return
+
         if frame.type == MessageType.SHAPE_KEYS:
             body = self._json(frame, 128 * 1024)
             self._emit("shape_keys", body)
@@ -2808,7 +2862,7 @@ class SessionService:
             return
 
         if frame.type in (MessageType.SCENE_RESET, MessageType.SCENE_READY):
-            body = self._json(frame, 256 * 1024)
+            body = self._json(frame, 4 * 1024 * 1024)
             self._emit("scene_reset" if frame.type == MessageType.SCENE_RESET else "scene_ready", body)
             return
 
@@ -3017,6 +3071,16 @@ class SessionService:
             body.update(extra)
         self._enqueue(protocol.json_frame(MessageType.SCENE_READY, body))
 
+    def send_scene_graphs(self, extra: dict | None = None, force: bool = False) -> None:
+        """Broadcast geometry-node and compositor node graphs."""
+        body = {"graphs_only": True, "force": bool(force)}
+        if isinstance(extra, dict):
+            body.update(extra)
+        frame = protocol.json_frame(MessageType.SCENE_READY, body)
+        if len(frame.payload) > 4 * 1024 * 1024:
+            return
+        self._enqueue(frame)
+
     def send_resume(self, uids) -> None:
         objects = [str(uid) for uid in list(uids)[:100000]]
         self._enqueue(protocol.json_frame(MessageType.RESUME, {"objects": objects}))
@@ -3178,6 +3242,16 @@ class SessionService:
             return
         self._enqueue(Frame(type=MessageType.POSE, channel=Channel.TRANSFORM, payload=body.payload))
         self._tap("pose", {"uuid": uid, "bones": bones})
+
+    def send_armature(self, uid: str, bones: list) -> None:
+        try:
+            frame = protocol.json_frame(
+                MessageType.ARMATURE, {"uuid": uid, "bones": bones[:256]}
+            )
+        except Exception:  # noqa: BLE001
+            return
+        self._enqueue(Frame(type=MessageType.ARMATURE, channel=Channel.TRANSFORM, payload=frame.payload))
+        self._tap("armature", {"uuid": uid, "bones": bones[:256]})
 
     def send_shape_keys(self, uid: str, values: dict) -> None:
         try:

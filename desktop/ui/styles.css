@@ -798,6 +798,10 @@ body.resizing { user-select: none; }
 .render-range input, .render-range select { width: 76px; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel-soft); color: var(--text); font-size: 12px; }
 .render-range select { width: auto; }
 .render-range .btn { margin-left: auto; }
+.render-range input.preset-name { width: 132px; }
+.render-preview { display: block; width: 100%; max-height: 240px; object-fit: contain; border-radius: 10px; border: 1px solid var(--line); background: #0b0b0d; margin: 6px 0; }
+.render-contact { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.render-contact img { width: 100%; border-radius: 8px; border: 1px solid var(--line); background: #0b0b0d; }
 .progress { height: 6px; border-radius: 999px; background: var(--line-soft); overflow: hidden; margin: 10px 0 6px; }
 .progress-bar { height: 100%; width: 0; background: var(--accent); transition: width .3s ease; }
 

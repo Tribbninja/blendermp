@@ -103,6 +103,7 @@ pub(crate) struct SessionRequest {
     height: Option<u32>,
     tiles_x: Option<u32>,
     tiles_y: Option<u32>,
+    queue: Option<bool>,
     engine: Option<String>,
     format: Option<String>,
     job: Option<String>,
@@ -915,6 +916,82 @@ fn focus_blender(state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let first = chunk[0] as u32;
+        let second = *chunk.get(1).unwrap_or(&0) as u32;
+        let third = *chunk.get(2).unwrap_or(&0) as u32;
+        let value = (first << 16) | (second << 8) | third;
+        output.push(TABLE[((value >> 18) & 63) as usize] as char);
+        output.push(TABLE[((value >> 12) & 63) as usize] as char);
+        output.push(if chunk.len() > 1 {
+            TABLE[((value >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            TABLE[(value & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    output
+}
+
+#[tauri::command]
+fn render_preview() -> Option<serde_json::Value> {
+    let directory = data_dir();
+    let status = fs::read_to_string(directory.join("status.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&status).ok()?;
+    let output = value
+        .get("render")
+        .and_then(|render| render.get("output_dir"))
+        .and_then(|item| item.as_str())
+        .unwrap_or("");
+    let output = if output.is_empty() {
+        directory.join("render")
+    } else {
+        PathBuf::from(output)
+    };
+    let mut frames: Vec<PathBuf> = fs::read_dir(&output)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("frame_") && name.ends_with(".png"))
+                .unwrap_or(false)
+        })
+        .collect();
+    if frames.is_empty() {
+        return None;
+    }
+    frames.sort();
+    let total = frames.len();
+    let images = frames
+        .iter()
+        .rev()
+        .take(6)
+        .filter_map(|path| {
+            let data = fs::read(path).ok()?;
+            let name = path.file_name()?.to_string_lossy().to_string();
+            Some(serde_json::json!({
+                "name": name,
+                "data": format!("data:image/png;base64,{}", base64_encode(&data)),
+            }))
+        })
+        .collect::<Vec<_>>();
+    if images.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!({"frames": images, "count": total}))
+    }
+}
+
+#[tauri::command]
 fn read_status(state: State<AppState>) -> Option<serde_json::Value> {
     let path = data_dir().join("status.json");
     let metadata = fs::metadata(&path).ok()?;
@@ -923,6 +1000,22 @@ fn read_status(state: State<AppState>) -> Option<serde_json::Value> {
     }
     let body = read_text_shared(&path)?;
     let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+
+    if let Some(heartbeat) = value.get("heartbeat").and_then(|item| item.as_u64()) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        if now.saturating_sub(heartbeat) > 60 {
+            return Some(serde_json::json!({
+                "state": "offline",
+                "is_host": false,
+                "users": [],
+                "messages": [],
+                "render": {"active": false}
+            }));
+        }
+    }
 
     // Ignore a status left behind by a different Blender process. On the first
     // poll after an app restart, adopt a visible Blender so joining reuses it
@@ -1557,6 +1650,7 @@ fn write_session(request: SessionRequest) -> Result<(), String> {
         "height": request.height,
         "tiles_x": request.tiles_x,
         "tiles_y": request.tiles_y,
+        "queue": request.queue,
         "engine": request.engine,
         "format": request.format,
         "job": request.job,
@@ -1683,6 +1777,7 @@ pub fn run() {
             set_blender_visible,
             focus_blender,
             read_status,
+            render_preview,
             read_settings,
             write_settings,
             log_client,
@@ -1803,6 +1898,15 @@ mod tests {
         assert_eq!(percent_decode("hello%20world"), "hello world");
         assert_eq!(percent_decode("a+b"), "a b");
         assert_eq!(percent_decode("%zz"), "%zz");
+    }
+
+    #[test]
+    fn base64_matches_known_values() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
     }
 
     #[test]
